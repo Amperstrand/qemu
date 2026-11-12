@@ -98,6 +98,14 @@ void helper_sleep(CPUSH4State *env)
 
 void helper_trapa(CPUSH4State *env, uint32_t tra)
 {
+{
+    static int trace_on = -1;
+    if (trace_on < 0) trace_on = getenv("MMCS_TRACE_TRAPA") != NULL;
+    if (trace_on) {
+        static int trapa_count;
+        fprintf(stderr, "TRAPA pc=%08x imm=%02x n=%d\n", env->pc, tra, ++trapa_count);
+    }
+}
     env->tra = tra << 2;
     raise_exception(env, 0x160, 0);
 }

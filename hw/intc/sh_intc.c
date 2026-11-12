@@ -67,6 +67,14 @@ void sh_intc_toggle_source(struct intc_source *source,
 
 static void sh_intc_set_irq(void *opaque, int n, int level)
 {
+    {
+        static int trace_on = -1;
+        if (trace_on < 0) trace_on = getenv("MMCS_TRACE_IRQ") != NULL;
+        if (trace_on && level) {
+            static int irq_count;
+            fprintf(stderr, "IRQ n=%d level=%d c=%d\n", n, level, ++irq_count);
+        }
+    }
     struct intc_desc *desc = opaque;
     struct intc_source *source = &desc->sources[n];
 
@@ -211,8 +219,13 @@ static uint64_t sh_intc_read(void *opaque, hwaddr offset, unsigned size)
 }
 
 static void sh_intc_write(void *opaque, hwaddr offset,
-                          uint64_t value, unsigned size)
+                                uint64_t value, unsigned size)
 {
+    {
+        static int trace_on = -1;
+        if (trace_on < 0) trace_on = getenv("MMCS_TRACE_IRQ") != NULL;
+        if (trace_on) fprintf(stderr, "INTC-W off=%03x val=%08x\n", (unsigned)offset, (unsigned)value);
+    }
     struct intc_desc *desc = opaque;
     intc_enum *enum_ids;
     unsigned int first;
