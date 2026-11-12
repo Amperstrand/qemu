@@ -72,6 +72,14 @@ static void mmcs_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), MMCS_SDRAM_BASE, sdram);
 
+    /* second RAM window: the kernel probes phys 0x04000000-0x047FFFFF during
+     * RAM discovery (write/read test at 0x47FFFF8 seen in boot traces) */
+    {
+        MemoryRegion *ram2 = g_new(MemoryRegion, 1);
+        memory_region_init_ram(ram2, NULL, "mmcs.ram2", 8 * MiB, &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0x04000000, ram2);
+    }
+
     /* XIP flash window at 0x10800000: -pflash/-device loader fills it, or a
      * raw file via firmware property; default: load machine->firmware if set */
     flash = g_new(MemoryRegion, 1);

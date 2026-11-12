@@ -92,6 +92,11 @@ void superh_cpu_do_interrupt(CPUState *cs)
 
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
         const char *expname;
+        if (cs->exception_index == 0x040 || cs->exception_index == 0x060 ||
+            cs->exception_index == 0x0a0) {
+            fprintf(stderr, "SH4-MMU: excp=%03x pc=%08x tea=%08x pteh=%08x\n",
+                    cs->exception_index, env->pc, env->tea, env->pteh);
+        }
         switch (cs->exception_index) {
         case 0x0e0:
             expname = "addr_error";
