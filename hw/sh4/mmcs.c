@@ -87,6 +87,26 @@ static const MemoryRegionOps mmcs_syscon_c080_ops = {
     .valid.min_access_size = 4, .valid.max_access_size = 4,
 };
 
+/* deterministic post-boot RAM dump (env MMCS_DUMP=<seconds>):
+ * writes the ROMHDR copy-entry destinations + RAMStart to /tmp for
+ * verifying kernel-side ROM→RAM copies. */
+static void mmcs_dump_ram(void *opaque)
+{
+    static const struct { hwaddr pa; const char *fn; } dumps[] = {
+        { 0x08602000, "/tmp/copy0.bin" },
+        { 0x0862c000, "/tmp/copy1.bin" },
+        { 0x0867a000, "/tmp/copy2.bin" },
+        { 0x08600000, "/tmp/ramstart.bin" },
+    };
+    uint8_t buf[0x1000];
+    for (unsigned i = 0; i < ARRAY_SIZE(dumps); i++) {
+        cpu_physical_memory_read(dumps[i].pa, buf, sizeof buf);
+        FILE *f = fopen(dumps[i].fn, "wb");
+        if (f) { fwrite(buf, 1, sizeof buf, f); fclose(f); }
+    }
+    fprintf(stderr, "MMCS: RAM dump written\n");
+}
+
 static void mmcs_init(MachineState *machine)
 {
     SuperHCPU *cpu;
@@ -191,6 +211,15 @@ static void mmcs_init(MachineState *machine)
     boot_stub[6] = 0x80; boot_stub[7] = 0x90;
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
+
+    /* optional deterministic RAM dump after MMCS_DUMP seconds */
+    {
+        const char *ds = getenv("MMCS_DUMP");
+        if (ds) {
+            QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dump_ram, NULL);
+            timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + atoi(ds) * 1000);
+        }
+    }
 }
 
 static void mmcs_machine_init(MachineClass *mc)
