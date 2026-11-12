@@ -99,6 +99,14 @@ static void mmcs_dump_ram(void *opaque)
         { 0x08600000, "/tmp/ramstart.bin" },
     };
     uint8_t buf[0x1000];
+    if (getenv("MMCS_MLD")) {
+        cpu_physical_memory_read(0x0B000000, buf, 16);
+        FILE *g = fopen("/tmp/mldresult.bin", "wb");
+        if (g) { fwrite(buf, 1, 16, g); fclose(g); }
+        fprintf(stderr, "MMCS: MLD result word = 0x%08x\n",
+                (unsigned)(buf[0] | buf[1] << 8 | buf[2] << 16 | buf[3] << 24));
+        return;
+    }
     for (unsigned i = 0; i < ARRAY_SIZE(dumps); i++) {
         cpu_physical_memory_read(dumps[i].pa, buf, sizeof buf);
         FILE *f = fopen(dumps[i].fn, "wb");
@@ -127,6 +135,54 @@ static void mmcs_init(MachineState *machine)
         MemoryRegion *ram2 = g_new(MemoryRegion, 1);
         memory_region_init_ram(ram2, NULL, "mmcs.ram2", 8 * MiB, &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0x04000000, ram2);
+    }
+
+    /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —
+     * map the loader RAM image, our payload, and the test stub at phys 0.
+     * MMCS_PAYLOAD = container file (mapped at phys 0x0A000000),
+     * MMCS_STUB    = assembled stub binary (mapped at phys 0, is the boot). */
+    if (getenv("MMCS_MLD")) {
+        MemoryRegion *mr;
+        const char *pay = getenv("MMCS_PAYLOAD") ?: "/dev/null";
+        const char *stub = getenv("MMCS_STUB") ?: "/dev/null";
+        mr = g_new(MemoryRegion, 1);
+        memory_region_init_ram(mr, NULL, "mld.loader", 0x100000, &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0x08900000, mr);
+        if (load_image_targphys("/tmp/mld-mem.bin", 0x08900000, 0x100000) < 0) {
+            error_report("MMCS_MLD: cannot load /tmp/mld-mem.bin");
+            exit(1);
+        }
+        mr = g_new(MemoryRegion, 1);
+        memory_region_init_ram(mr, NULL, "mld.payload", 0x100000, &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0x0A000000, mr);
+        load_image_targphys(pay, 0x0A000000, 0x100000);
+        mr = g_new(MemoryRegion, 1);
+        memory_region_init_ram(mr, NULL, "mld.stub", 0x1000, &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0, mr);
+        if (load_image_targphys(stub, 0, 0x1000) < 0) {
+            error_report("MMCS_MLD: cannot load stub %s", stub);
+            exit(1);
+        }
+        memory_region_set_readonly(mr, true);
+        /* debug SCIF below still wires; skip kernel flash/bootrom path */
+        sh7750_init(cpu, get_system_memory());
+        {
+            DeviceState *dev = qdev_new(TYPE_SH_SERIAL);
+            SysBusDevice *sb = SYS_BUS_DEVICE(dev);
+            dev->id = g_strdup("mmcs-dbg-scif");
+            qdev_prop_set_chr(dev, "chardev", serial_hd(2));
+            qdev_prop_set_uint8(dev, "features", SH_SERIAL_FEAT_SCIF);
+            sysbus_realize_and_unref(sb, &error_fatal);
+            sysbus_mmio_map(sb, 0, 0xffe40000);
+        }
+        {
+            const char *ds = getenv("MMCS_DUMP");
+            if (ds) {
+                QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dump_ram, NULL);
+                timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + atoi(ds) * 1000);
+            }
+        }
+        return;
     }
 
     /* XIP flash window at 0x10800000: -pflash/-device loader fills it, or a
