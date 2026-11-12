@@ -1,3 +1,10 @@
+config MMCS
+    bool
+    default y
+    depends on SH4
+    select SH7750
+    select UNIMP
+
 config R2D
     bool
     imply PCI_DEVICES
