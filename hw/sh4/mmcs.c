@@ -31,7 +31,7 @@
 #include "hw/misc/unimp.h"
 
 #define MMCS_SDRAM_BASE 0x08000000
-#define MMCS_SDRAM_SIZE (128 * MiB)
+#define MMCS_SDRAM_SIZE 0x8800000  /* 0x08000000..0x10800000: kernel RAM 0x88600000-0x90700000 (ROMHDR) + margin */
 #define MMCS_FLASH_BASE 0x10800000
 #define MMCS_FLASH_SIZE (128 * MiB)
 #define MMCS_ENTRY      0x908066b0   /* kernel entry from image first record */
