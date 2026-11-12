@@ -58,6 +58,56 @@ static const struct { hwaddr base; const char *name; } mmcs_unimpl[] = {
     { 0xA9D80000, "unit-ext2" },
 };
 
+/* MMCS syscon: two polled regions the OAL hits during boot.
+ * 0xFFC08000: counter block — reads return written values EXCEPT +0xF4,
+ *             a free-running up-counter (64Hz-ish) so delay/poll loops
+ *             complete instead of timing out forever.
+ * 0xFA00000:  status block — plain read-back storage. */
+static uint32_t syscon_c080[64];
+static uint32_t syscon_fa0[16];
+
+static uint64_t mmcs_syscon_c080_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == 0xf4) {
+        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 16000000; /* ~62.5 Hz tick */
+    }
+    if (addr / 4 < 64) {
+        return syscon_c080[addr / 4];
+    }
+    return 0;
+}
+static void mmcs_syscon_c080_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    if (addr / 4 < 64) {
+        syscon_c080[addr / 4] = val;
+    }
+}
+static uint64_t mmcs_syscon_fa0_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr / 4 < 16) {
+        return syscon_fa0[addr / 4];
+    }
+    return 0;
+}
+static void mmcs_syscon_fa0_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    if (addr / 4 < 16) {
+        syscon_fa0[addr / 4] = val;
+    }
+}
+static const MemoryRegionOps mmcs_syscon_c080_ops = {
+    .read = mmcs_syscon_c080_read,
+    .write = mmcs_syscon_c080_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4, .valid.max_access_size = 4,
+};
+static const MemoryRegionOps mmcs_syscon_fa0_ops = {
+    .read = mmcs_syscon_fa0_read,
+    .write = mmcs_syscon_fa0_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4, .valid.max_access_size = 4,
+};
+
 static void mmcs_init(MachineState *machine)
 {
     SuperHCPU *cpu;
@@ -113,10 +163,22 @@ static void mmcs_init(MachineState *machine)
         sysbus_mmio_map(sb, 0, 0xffe40000);
     }
 
-    /* Census regions as logged stubs */
+    /* census regions as logged stubs */
     for (unsigned i = 0; i < ARRAY_SIZE(mmcs_unimpl); i++) {
         create_unimplemented_device(mmcs_unimpl[i].name,
                                     mmcs_unimpl[i].base, 0x10000);
+    }
+
+    /* polled syscon regions (see ops above) */
+    {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+        memory_region_init_io(mr, NULL, &mmcs_syscon_c080_ops, NULL,
+                              "mmcs.syscon-c080", 0x1000);
+        memory_region_add_subregion(get_system_memory(), 0xFFC08000, mr);
+        mr = g_new(MemoryRegion, 1);
+        memory_region_init_io(mr, NULL, &mmcs_syscon_fa0_ops, NULL,
+                              "mmcs.syscon-fa0", 0x1000);
+        memory_region_add_subregion(get_system_memory(), 0xFA0000, mr);
     }
 
     /* Boot ROM stub at physical 0: mask-ROM role, jumps to the OS entry.
