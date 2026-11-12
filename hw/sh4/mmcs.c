@@ -64,8 +64,6 @@ static const struct { hwaddr base; const char *name; } mmcs_unimpl[] = {
  *             complete instead of timing out forever.
  * 0xFA00000:  status block — plain read-back storage. */
 static uint32_t syscon_c080[64];
-static uint32_t syscon_fa0[16];
-
 static uint64_t mmcs_syscon_c080_read(void *opaque, hwaddr addr, unsigned size)
 {
     if (addr == 0xf4) {
@@ -82,28 +80,9 @@ static void mmcs_syscon_c080_write(void *opaque, hwaddr addr, uint64_t val, unsi
         syscon_c080[addr / 4] = val;
     }
 }
-static uint64_t mmcs_syscon_fa0_read(void *opaque, hwaddr addr, unsigned size)
-{
-    if (addr / 4 < 16) {
-        return syscon_fa0[addr / 4];
-    }
-    return 0;
-}
-static void mmcs_syscon_fa0_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
-{
-    if (addr / 4 < 16) {
-        syscon_fa0[addr / 4] = val;
-    }
-}
 static const MemoryRegionOps mmcs_syscon_c080_ops = {
     .read = mmcs_syscon_c080_read,
     .write = mmcs_syscon_c080_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid.min_access_size = 4, .valid.max_access_size = 4,
-};
-static const MemoryRegionOps mmcs_syscon_fa0_ops = {
-    .read = mmcs_syscon_fa0_read,
-    .write = mmcs_syscon_fa0_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid.min_access_size = 4, .valid.max_access_size = 4,
 };
@@ -169,16 +148,35 @@ static void mmcs_init(MachineState *machine)
                                     mmcs_unimpl[i].base, 0x10000);
     }
 
+    /* OAL channel structs: the walker at 0x9080db40 validates a signature
+     * struct at each channel base (0xF40000..0xFC0000): value/~value pairs
+     * at +48/+52 and +56/+60, and +92 == ~(sum of dwords [+0..+88]).
+     * Defaults = valid signature, entry[0] = -1 ("no device"). */
+    {
+        static const hwaddr chan_bases[5] = { 0xF40000, 0xF60000, 0xF80000,
+                                              0xFA0000, 0xFC0000 };
+        for (unsigned c = 0; c < 5; c++) {
+            MemoryRegion *mr = g_new(MemoryRegion, 1);
+            uint32_t *m;
+            memory_region_init_ram(mr, NULL, g_strdup_printf("mmcs.chan%d", c), 0x1000, &error_fatal);
+            m = memory_region_get_ram_ptr(mr);
+            memset(m, 0, 0x1000);
+            m[0] = 0xffffffff;          /* entry[0] = -1: no device */
+            m[12] = 0;                  /* +48 */
+            m[13] = 0xffffffff;         /* +52 = ~m[12] */
+            m[14] = 0;                  /* +56 */
+            m[15] = 0xffffffff;         /* +60 = ~m[14] */
+            m[23] = 0;                  /* +92 = ~(sum m[0..22]) = ~0xffffffff = 0 */
+            memory_region_add_subregion(get_system_memory(), chan_bases[c], mr);
+        }
+    }
+
     /* polled syscon regions (see ops above) */
     {
         MemoryRegion *mr = g_new(MemoryRegion, 1);
         memory_region_init_io(mr, NULL, &mmcs_syscon_c080_ops, NULL,
                               "mmcs.syscon-c080", 0x1000);
         memory_region_add_subregion(get_system_memory(), 0xFFC08000, mr);
-        mr = g_new(MemoryRegion, 1);
-        memory_region_init_io(mr, NULL, &mmcs_syscon_fa0_ops, NULL,
-                              "mmcs.syscon-fa0", 0x1000);
-        memory_region_add_subregion(get_system_memory(), 0xFA0000, mr);
     }
 
     /* Boot ROM stub at physical 0: mask-ROM role, jumps to the OS entry.
