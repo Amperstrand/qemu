@@ -110,6 +110,34 @@ static void mmcs_dump_ram(void *opaque)
         { 0x08600000, "/tmp/kdata0.bin" },
     };
     static uint8_t buf[0x10000];
+    /* MMCS_FB=<file.ppm>: dump the unit framebuffer (phys 0x08B00000,
+     * 800x480 RGB565) as a PPM — makes screen output visible (MLD payloads
+     * draw here; the OS GUI target will too). Works in both boot modes. */
+    {
+        const char *fb = getenv("MMCS_FB");
+        if (fb) {
+            const int FW = 800, FH = 480;
+            static uint8_t rgb565[800 * 480 * 2];
+            static uint8_t ppm[800 * 480 * 3 + 64];
+            cpu_physical_memory_read(0x08B00000, rgb565, sizeof rgb565);
+            int n = snprintf((char *)ppm, sizeof ppm,
+                             "P6\n%d %d\n255\n", FW, FH);
+            for (int i = 0; i < FW * FH; i++) {
+                uint16_t p = rgb565[2 * i] | rgb565[2 * i + 1] << 8;
+                ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13);
+                ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9);
+                ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2);
+            }
+            FILE *fp = fopen(fb, "wb");
+            if (fp) {
+                fwrite(ppm, 1, n + FW * FH * 3, fp);
+                fclose(fp);
+                fprintf(stderr, "MMCS: framebuffer dumped to %s\n", fb);
+            } else {
+                fprintf(stderr, "MMCS: cannot write %s\n", fb);
+            }
+        }
+    }
     if (getenv("MMCS_MLD")) {
         cpu_physical_memory_read(0x0B000000, buf, 16);
         FILE *g = fopen("/tmp/mldresult.bin", "wb");
