@@ -104,6 +104,8 @@ static void mmcs_dump_ram(void *opaque)
         { 0x081C0000, "/tmp/srd1.bin" },
         { 0x081C2800, "/tmp/srd2.bin" },
         { 0x08602000, "/tmp/kdata64k.bin" },
+        { 0x10800000, "/tmp/imgpage1.bin" },
+        { 0x10801240, "/tmp/extarea.bin" },
         { 0x0867a000, "/tmp/kdata2.bin" },
         { 0x08600000, "/tmp/kdata0.bin" },
     };
