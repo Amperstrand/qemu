@@ -13,6 +13,7 @@
  *                    stubs so guest accesses are logged, µEmu-style)
  */
 #include "qemu/osdep.h"
+#include <stdlib.h>
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -209,6 +210,21 @@ static void mmcs_init(MachineState *machine)
         MemoryRegion *ram2 = g_new(MemoryRegion, 1);
         memory_region_init_ram(ram2, NULL, "mmcs.ram2", 8 * MiB, &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0x04000000, ram2);
+    }
+    /* kernel-stack arena window: the kernel runs thread stacks at VA
+     * 0xD0xxxxxx; if treated as P1-1:1 the backing phys is 0x10xxxxxx —
+     * back it with RAM (16 MB, env-tunable MMCS_RAM3_MB; 0 disables).
+     * Without this, dtlb_miss_write cascades kill every kernel thread
+     * (2026-11-13 trace: pc=0xc003c9e0 tea=0xd006fe8c loop). */
+    {
+        const char *mb = getenv("MMCS_RAM3_MB");
+        unsigned n = mb ? (unsigned)atoi(mb) : 16;
+        if (n) {
+            MemoryRegion *ram3 = g_new(MemoryRegion, 1);
+            memory_region_init_ram(ram3, NULL, "mmcs.ram3", (uint64_t)n * MiB,
+                                   &error_fatal);
+            memory_region_add_subregion(get_system_memory(), 0x10000000, ram3);
+        }
     }
 
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —
