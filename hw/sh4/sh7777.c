@@ -18,6 +18,7 @@
  * sequence teaches us the real protocol.
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qemu/timer.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
@@ -226,5 +227,86 @@ void sh7777_init(qemu_irq cpu_irq)
          * its bank offset inside one window covering all four */
         memory_region_add_subregion(get_system_memory(),
                                     SH7777_INTC_BASE + b * SH7777_INTC_STRIDE, mr);
+    }
+}
+
+/* ---- Channel flash blocks (0xF40000..0xFCFFFF) ----
+ * 5 x 128KB AMD-family NOR. Observed protocol (logged): 16-bit
+ *   0x30 @ block base = erase confirm (short AMD form, no unlock cycles)
+ *   0x90 @ +0xAAA     = autoselect (reads: +0 maker, +2 device)
+ *   0xF0 @ anywhere   = reset to read mode
+ *   anything else     = program (bit-and)
+ * Erase fills 0xFFFFFFFF instantly (driver polls for stable data). */
+#define CHAN_N 5
+#define CHAN_SZ (128 * 1024)
+static uint8_t chan_flash[CHAN_N][CHAN_SZ];
+static int chan_autoselect[CHAN_N];
+static const hwaddr chan_base_table[CHAN_N] = {
+    0xF40000, 0xF60000, 0xF80000, 0xFA0000, 0xFC0000
+};
+
+static uint64_t chanflash_read(void *opaque, hwaddr off, unsigned size)
+{
+    int c = (int)(intptr_t)opaque;
+    uint64_t v = 0;
+    if (chan_autoselect[c]) {
+        if (size == 2) {
+            if (off == 0) return 0x0001;        /* AMD maker */
+            if (off == 2) return 0x227e;        /* device (mirror r2d ids) */
+            if (off == 4) return 0;             /* block protect */
+        }
+    }
+    if (off + size <= CHAN_SZ) memcpy(&v, chan_flash[c] + off, size);
+    return v;
+}
+
+static void chanflash_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    int c = (int)(intptr_t)opaque;
+    if (sh7777_trace()) {
+        fprintf(stderr, "SH7777-CHFL-W c=%d off=%05x val=%04llx\n",
+                c, (unsigned)off, (unsigned long long)val);
+    }
+    if (size == 2) {
+        uint16_t v16 = val;
+        if (v16 == 0x30 && off == 0) {           /* erase confirm at block base */
+            memset(chan_flash[c], 0xff, CHAN_SZ);
+            chan_autoselect[c] = 0;
+            if (sh7777_trace()) fprintf(stderr, "SH7777-CHFL c=%d ERASED\n", c);
+            return;
+        }
+        if (v16 == 0x90) { chan_autoselect[c] = 1; return; }   /* autoselect */
+        if (v16 == 0xf0) { chan_autoselect[c] = 0; return; }   /* reset */
+    }
+    if (off + size > CHAN_SZ) return;
+    /* program: AND into existing (NOR can only clear bits) */
+    for (unsigned b = 0; b < size && off + b < CHAN_SZ; b++) {
+        chan_flash[c][off + b] &= ((uint8_t *)&val)[b];
+    }
+}
+
+static const MemoryRegionOps chanflash_ops = {
+    .read = chanflash_read,
+    .write = chanflash_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+
+void mmcs_chanflash_init(void)
+{
+    for (int c = 0; c < CHAN_N; c++) {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+        uint32_t *m = (uint32_t *)chan_flash[c];
+        memset(chan_flash[c], 0xff, CHAN_SZ);
+        /* loader-written signature struct at +0 (programmed 0s) */
+        memset(chan_flash[c], 0x00, 0x100);
+        m[0] = 0xffffffff;
+        m[12] = 0; m[13] = 0xffffffff;
+        m[14] = 0; m[15] = 0xffffffff;
+        m[23] = 0;
+        memory_region_init_io(mr, NULL, &chanflash_ops, (void *)(intptr_t)c,
+                              g_strdup_printf("mmcs.chan%d", c), CHAN_SZ);
+        memory_region_add_subregion(get_system_memory(),
+                                    chan_base_table[c], mr);
     }
 }

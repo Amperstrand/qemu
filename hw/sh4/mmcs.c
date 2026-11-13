@@ -101,6 +101,8 @@ static void mmcs_dump_ram(void *opaque)
         { 0x08602848, "/tmp/waittable.bin" },
         { 0x08602800, "/tmp/waitctx.bin" },
         { 0x0867b200, "/tmp/apiset.bin" },
+        { 0x081C0000, "/tmp/srd1.bin" },
+        { 0x081C2800, "/tmp/srd2.bin" },
         { 0x08602000, "/tmp/kdata64k.bin" },
         { 0x0867a000, "/tmp/kdata2.bin" },
         { 0x08600000, "/tmp/kdata0.bin" },
@@ -269,27 +271,14 @@ static void mmcs_init(MachineState *machine)
                                     mmcs_unimpl[i].base, 0x10000);
     }
 
-    /* OAL channel structs: the walker at 0x9080db40 validates a signature
-     * struct at each channel base (0xF40000..0xFC0000): value/~value pairs
-     * at +48/+52 and +56/+60, and +92 == ~(sum of dwords [+0..+88]).
-     * Defaults = valid signature, entry[0] = -1 ("no device"). */
+    /* Channel flash blocks (0xF40000..0xFCFFFF, 5 x 128KB): these are the
+     * unit's flash regions — boot-time signature structs at +0 (validated by
+     * the OAL walker), later used by the kernel's exception-backup flash
+     * driver, which ERASES them (expecting all-0xFFFFFFFF reads after).
+     * Model: RAM holding the sigstruct initially; a write of 0xFFFFFFFF to
+     * +0x100.. region triggers full-erase semantics; writes logged. */
     {
-        static const hwaddr chan_bases[5] = { 0xF40000, 0xF60000, 0xF80000,
-                                              0xFA0000, 0xFC0000 };
-        for (unsigned c = 0; c < 5; c++) {
-            MemoryRegion *mr = g_new(MemoryRegion, 1);
-            uint32_t *m;
-            memory_region_init_ram(mr, NULL, g_strdup_printf("mmcs.chan%d", c), 0x1000, &error_fatal);
-            m = memory_region_get_ram_ptr(mr);
-            memset(m, 0, 0x1000);
-            m[0] = 0xffffffff;          /* entry[0] = -1: no device (experiment 1 made no difference) */
-            m[12] = 0;                  /* +48 */
-            m[13] = 0xffffffff;         /* +52 = ~m[12] */
-            m[14] = 0;                  /* +56 */
-            m[15] = 0xffffffff;         /* +60 = ~m[14] */
-            m[23] = 0;                  /* +92 = ~(sum m[0..22]) = ~0xffffffff = 0 */
-            memory_region_add_subregion(get_system_memory(), chan_bases[c], mr);
-        }
+        mmcs_chanflash_init();
     }
 
     /* polled syscon regions (see ops above) */
