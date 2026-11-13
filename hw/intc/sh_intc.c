@@ -404,6 +404,13 @@ int sh_intc_init(MemoryRegion *sysmem,
 
     desc->pending = 0;
     desc->nr_sources = nr_sources;
+    if (getenv("MMCS_INTR_DEFAULT")) {
+        /* bring-up: start every source at top priority so the OAL's
+         * SH7777-style enable path isn't required for delivery */
+        for (unsigned pi = 0; pi < nr_prio_regs; pi++) {
+            prio_regs[pi].value = (1u << prio_regs[pi].reg_width) - 1;
+        }
+    }
     desc->mask_regs = mask_regs;
     desc->nr_mask_regs = nr_mask_regs;
     desc->prio_regs = prio_regs;

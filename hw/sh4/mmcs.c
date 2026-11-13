@@ -98,6 +98,9 @@ static void mmcs_dump_ram(void *opaque)
         { 0x0862c000, "/tmp/copy1.bin" },
         { 0x0867a000, "/tmp/copy2.bin" },
         { 0x08600000, "/tmp/ramstart.bin" },
+        { 0x08602848, "/tmp/waittable.bin" },
+        { 0x08602800, "/tmp/waitctx.bin" },
+        { 0x0867b200, "/tmp/apiset.bin" },
     };
     uint8_t buf[0x1000];
     if (getenv("MMCS_MLD")) {
@@ -264,7 +267,7 @@ static void mmcs_init(MachineState *machine)
             memory_region_init_ram(mr, NULL, g_strdup_printf("mmcs.chan%d", c), 0x1000, &error_fatal);
             m = memory_region_get_ram_ptr(mr);
             memset(m, 0, 0x1000);
-            m[0] = 0xffffffff;          /* entry[0] = -1: no device */
+            m[0] = 0xffffffff;          /* entry[0] = -1: no device (experiment 1 made no difference) */
             m[12] = 0;                  /* +48 */
             m[13] = 0xffffffff;         /* +52 = ~m[12] */
             m[14] = 0;                  /* +56 */
