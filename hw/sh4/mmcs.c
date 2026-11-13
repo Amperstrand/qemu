@@ -101,8 +101,11 @@ static void mmcs_dump_ram(void *opaque)
         { 0x08602848, "/tmp/waittable.bin" },
         { 0x08602800, "/tmp/waitctx.bin" },
         { 0x0867b200, "/tmp/apiset.bin" },
+        { 0x08602000, "/tmp/kdata64k.bin" },
+        { 0x0867a000, "/tmp/kdata2.bin" },
+        { 0x08600000, "/tmp/kdata0.bin" },
     };
-    uint8_t buf[0x1000];
+    static uint8_t buf[0x10000];
     if (getenv("MMCS_MLD")) {
         cpu_physical_memory_read(0x0B000000, buf, 16);
         FILE *g = fopen("/tmp/mldresult.bin", "wb");
@@ -115,6 +118,18 @@ static void mmcs_dump_ram(void *opaque)
         cpu_physical_memory_read(dumps[i].pa, buf, sizeof buf);
         FILE *f = fopen(dumps[i].fn, "wb");
         if (f) { fwrite(buf, 1, sizeof buf, f); fclose(f); }
+    }
+    {
+        const char *pk = getenv("MMCS_POKE");
+        while (pk && *pk) {
+            hwaddr a = strtoull(pk, NULL, 16);
+            const char *eq = strchr(pk, '=');
+            uint32_t v = eq ? strtoul(eq + 1, NULL, 16) : 0;
+            cpu_physical_memory_write(a, &v, 4);
+            fprintf(stderr, "MMCS: poked %08x = %08x\n", (unsigned)a, v);
+            const char *semi = strchr(pk, ';');
+            pk = semi ? semi + 1 : NULL;
+        }
     }
     fprintf(stderr, "MMCS: RAM dump written\n");
 }
