@@ -19,6 +19,7 @@
 #include "cpu.h"
 #include "hw/sysbus.h"
 #include "hw/sh4/sh.h"
+#include "hw/sh4/sh7777.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/sysemu.h"
@@ -26,6 +27,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
+#include "exec/address-spaces.h"
 #include "hw/char/serial.h"
 #include "qemu/datadir.h"
 #include "hw/misc/unimp.h"
@@ -46,7 +48,6 @@ static const struct { hwaddr base; const char *name; } mmcs_unimpl[] = {
     { 0xFF700000, "sh7777-ffb" },
     { 0xFFB00000, "sh7777-usb" },
     { 0xFFC70000, "sh7777-rtc" },
-    { 0xFFD00000, "sh7777-intc" },
     { 0xFFDF0000, "sh7777-tmu-extra" },
     { 0xFFE10000, "sh7777-pfc" },
     { 0xFFE20000, "sh7777-port" },
@@ -204,6 +205,32 @@ static void mmcs_init(MachineState *machine)
 
     /* Classic SH4 on-chip devices: INTC, TMU, RTC, SCIF serial, DMAC, CPG */
     sh7750_init(cpu, get_system_memory());
+
+    /* SH7777 devices: CMT/DMA block, INTC banks, CPG (PLL lock) */
+    {
+        sh7777_init(NULL);   /* cpu_irq wired later if needed */
+    }
+
+    /* The kernel addresses on-chip regs P4-style (0xFFxxxxxx). qemu's INTC
+     * IPRs already live there; the TMU/RTC only exist at 0x1Fxxxxxx physical
+     * — alias them to their P4 addresses or the kernel's writes vanish. */
+    {
+        struct { hwaddr p4, phys; const char *name; } p4map[] = {
+            { 0xFFD80000, 0x1FD80000, "mmcs.tmu-p4" },
+            { 0xFFC80000, 0x1FC80000, "mmcs.rtc-p4" },
+        };
+        for (unsigned i = 0; i < ARRAY_SIZE(p4map); i++) {
+            MemoryRegionSection sec = memory_region_find(get_system_memory(),
+                                                         p4map[i].phys, 4);
+            if (sec.mr && sec.mr != get_system_memory()) {
+                MemoryRegion *al = g_new(MemoryRegion, 1);
+                memory_region_init_alias(al, NULL, p4map[i].name, sec.mr, 0,
+                                         0x100);
+                memory_region_add_subregion_overlap(get_system_memory(),
+                                                    p4map[i].p4, al, 0);
+            }
+        }
+    }
 
     /* MMCS debug SCIF: the kernel's OAL emits its banner on the SCIF channel
      * at 0xFFE40000 (SCFSR poll at +0x10 — identified from the boot trace and
