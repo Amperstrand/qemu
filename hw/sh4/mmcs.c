@@ -110,6 +110,29 @@ static void mmcs_dump_ram(void *opaque)
         { 0x08600000, "/tmp/kdata0.bin" },
     };
     static uint8_t buf[0x10000];
+    /* MMCS_TLBDUMP=1: print all valid UTLB/ITLB VA->PA mappings of the
+     * boot CPU — decodes the kernel's runtime memory layout (kernel-side
+     * module pools at 0xC0xxxxxx etc.). */
+    {
+        if (getenv("MMCS_TLBDUMP")) {
+            SuperHCPU *sc = SUPERH_CPU(first_cpu);
+            for (int i = 0; i < UTLB_SIZE; i++) {
+                tlb_t *t = &sc->env.utlb[i];
+                if (t->v) {
+                    fprintf(stderr, "MMCS: UTLB[%2d] va=%08x pa=%08x "
+                            "sz=%d pr=%d d=%d sh=%d\n", i,
+                            t->vpn, t->ppn, t->size, t->pr, t->d, t->sh);
+                }
+            }
+            for (int i = 0; i < ITLB_SIZE; i++) {
+                tlb_t *t = &sc->env.itlb[i];
+                if (t->v) {
+                    fprintf(stderr, "MMCS: ITLB[%2d] va=%08x pa=%08x sz=%d\n",
+                            i, t->vpn, t->ppn, t->size);
+                }
+            }
+        }
+    }
     /* MMCS_FB=<file.ppm>: dump the unit framebuffer (phys 0x08B00000,
      * 800x480 RGB565) as a PPM — makes screen output visible (MLD payloads
      * draw here; the OS GUI target will too). Works in both boot modes. */
