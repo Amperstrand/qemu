@@ -560,6 +560,19 @@ static void mmcs_init(MachineState *machine)
             }
             g_free(sbuf);
         }
+        if (getenv("MMCS_REGFIX")) {
+            cpu->env.mmcs_regfix_active = 1;
+            /* Phase-0 bootstrap: patch the ordinal-461 stub (RegQueryValueExW
+             * in filesys's API set) at 0xC00C9FF4 with 'trapa #0x71' so the
+             * fork can synthesize success returns for the boot-registry
+             * queries (System\ObjectStore etc) that the unreadable fdf
+             * would answer on real HW. See helper.c trapa hook. */
+            uint16_t trapa71 = 0xC771;
+            /* filesys .text ROM dataptr = 0x90942000, VA base 0xC00B1000 */
+            hwaddr off = (0x90942000 - 0x90800000) + (0xC00C9FF4 - 0xC00B1000);
+            cpu_physical_memory_write(MMCS_FLASH_BASE + off, &trapa71, 2);
+            fprintf(stderr, "MMCS: REGFIX trapa hook @0xC00C9FF4\n");
+        }
         if (getenv("MMCS_LOCALEFIX")) {
             uint32_t safe = 0x90809f3c;   /* kernel rts stub (S65-verified) */
             hwaddr slot_pa = 0x108F7B04; /* flash base + (0x908F7B04-0x90800000) */

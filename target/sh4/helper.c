@@ -82,6 +82,17 @@ void superh_cpu_do_interrupt(CPUState *cs)
     }
     env->in_sleep = 0;
 
+    /* MMCS fork: REGFIX trapa hook — synthesize RegQueryValueExW success
+     * for the boot-registry bootstrap (the fdf circular-read break). */
+    if (cs->exception_index == 0x160 &&
+        env->mmcs_regfix_active && env->tra == 0x71) {
+        env->gregs[0] = 0;              /* ERROR_SUCCESS */
+        /* env->pc already points past the trapa (translate advanced it);
+         * just swallow the exception and resume. */
+        cs->exception_index = -1;
+        return;
+    }
+
     if (do_irq) {
         if (env->mmcs_evt_inject) {          /* MMCS fork: vendor-INTC event */
             irq_vector = env->intevt;
