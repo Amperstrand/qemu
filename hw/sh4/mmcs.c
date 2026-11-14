@@ -139,30 +139,43 @@ static void mmcs_dump_ram(void *opaque)
         }
     }
     /* MMCS_FB=<file.ppm>: dump the unit framebuffer (phys 0x08B00000,
-     * 800x480 RGB565) as a PPM — makes screen output visible (MLD payloads
-     * draw here; the OS GUI target will too). Works in both boot modes. */
+     * 800x480 RGB565) as a PPM - makes screen output visible (MLD payloads
+     * draw here; the OS GUI target will too). Works in both boot modes.
+     * MMCS_FB_INTERVAL=<n>: emit n sequenced frames (<base>-%03d.ppm) at
+     * MMCS_DUMP-multiples so host tooling can stream screen evolution. */
     {
         const char *fb = getenv("MMCS_FB");
         if (fb) {
-            const int FW = 800, FH = 480;
-            static uint8_t rgb565[800 * 480 * 2];
-            static uint8_t ppm[800 * 480 * 3 + 64];
-            cpu_physical_memory_read(0x08B00000, rgb565, sizeof rgb565);
-            int n = snprintf((char *)ppm, sizeof ppm,
-                             "P6\n%d %d\n255\n", FW, FH);
-            for (int i = 0; i < FW * FH; i++) {
-                uint16_t p = rgb565[2 * i] | rgb565[2 * i + 1] << 8;
-                ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13);
-                ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9);
-                ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2);
-            }
-            FILE *fp = fopen(fb, "wb");
-            if (fp) {
-                fwrite(ppm, 1, n + FW * FH * 3, fp);
-                fclose(fp);
-                fprintf(stderr, "MMCS: framebuffer dumped to %s\n", fb);
-            } else {
-                fprintf(stderr, "MMCS: cannot write %s\n", fb);
+            const char *iv = getenv("MMCS_FB_INTERVAL");
+            int total = iv ? atoi(iv) : 1;
+            if (total < 1) total = 1;
+            for (int seq = 0; seq < total; seq++) {
+                const int FW = 800, FH = 480;
+                static uint8_t rgb565[800 * 480 * 2];
+                static uint8_t ppm[800 * 480 * 3 + 64];
+                cpu_physical_memory_read(0x08B00000, rgb565, sizeof rgb565);
+                int n = snprintf((char *)ppm, sizeof ppm,
+                                 "P6\n%d %d\n255\n", FW, FH);
+                for (int i = 0; i < FW * FH; i++) {
+                    uint16_t p = rgb565[2 * i] | rgb565[2 * i + 1] << 8;
+                    ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13);
+                    ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9);
+                    ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2);
+                }
+                char fn[512];
+                if (total > 1)
+                    snprintf(fn, sizeof fn, "%s-%03d.ppm", fb, seq);
+                else
+                    snprintf(fn, sizeof fn, "%s", fb);
+                FILE *fp = fopen(fn, "wb");
+                if (fp) {
+                    fwrite(ppm, 1, n + FW * FH * 3, fp);
+                    fclose(fp);
+                    fprintf(stderr, "MMCS: framebuffer dumped to %s\n", fn);
+                } else {
+                    fprintf(stderr, "MMCS: cannot write %s\n", fn);
+                    break;
+                }
             }
         }
     }
