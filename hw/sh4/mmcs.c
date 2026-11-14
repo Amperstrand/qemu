@@ -92,6 +92,8 @@ static const MemoryRegionOps mmcs_syscon_c080_ops = {
 /* deterministic post-boot RAM dump (env MMCS_DUMP=<seconds>):
  * writes the ROMHDR copy-entry destinations + RAMStart to /tmp for
  * verifying kernel-side ROM→RAM copies. */
+static int mmcs_fb_only_rearm = 0;  /* set by self-rearm: skip RAM sweep */
+
 static void mmcs_dump_ram(void *opaque)
 {
     static const struct { hwaddr pa; const char *fn; } dumps[] = {
@@ -186,6 +188,7 @@ static void mmcs_dump_ram(void *opaque)
                     fb_seq_left = atoi(iv2) - 1;
                 if (fb_seq_left > 0) {
                     fb_seq_left--;
+                    mmcs_fb_only_rearm = 1;
                     QEMUTimer *t2 = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                                  mmcs_dump_ram, NULL);
                     timer_mod(t2, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
@@ -202,7 +205,7 @@ static void mmcs_dump_ram(void *opaque)
                 (unsigned)(buf[0] | buf[1] << 8 | buf[2] << 16 | buf[3] << 24));
         return;
     }
-    for (unsigned i = 0; i < ARRAY_SIZE(dumps); i++) {
+    for (unsigned i = 0; !mmcs_fb_only_rearm && i < ARRAY_SIZE(dumps); i++) {
         cpu_physical_memory_read(dumps[i].pa, buf, sizeof buf);
         FILE *f = fopen(dumps[i].fn, "wb");
         if (f) { fwrite(buf, 1, sizeof buf, f); fclose(f); }
