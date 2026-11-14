@@ -194,48 +194,6 @@ static void mmcs_dump_ram(void *opaque)
 
 
 
-/* ---- XIP fixup-marker sweeper (bring-up shim) ----
- * The kernel's demand pager decompresses XIP module pages but never
- * applies their fixups: shipped pools still hold marker 0xffff54e9
- * (jsr target in k.coredll @0xc004cab4 -> Illegal Instruction, killing
- * the filesys launch thread every retry). Sweep RAM for the marker and
- * patch it to kernel fn 0x90809f3c (rts; mov #1,r0 — call sites ignore
- * the return). MMCS_FIXUP_SWEEP=0 disables. */
-static void mmcs_fixup_sweep(void *opaque)
-{
-    static const struct { uint32_t marker; uint32_t safe; } fixes[] = {
-        { 0xffff54e9, 0x90809f3c },   /* InitLocale late-bound call */
-        { 0xfffffbed, 0x90808394 },   /* error-printer walker (OEMWriteDebugString) */
-    };
-    static const struct { hwaddr base; uint64_t size; } rams[] = {
-        { 0x08000000, 128ull << 20 },
-        { 0x10000000, 16ull << 20 },
-        { 0x10800000, 8ull << 20 },   /* kernel XIP flash (first 8MB: pools live low) */
-    };
-    int patched = 0;
-    for (unsigned r = 0; r < ARRAY_SIZE(rams); r++) {
-        for (hwaddr a = rams[r].base; a + 4 <= rams[r].base + rams[r].size; a += 4) {
-            uint32_t v;
-            cpu_physical_memory_read(a, &v, 4);
-            for (unsigned f = 0; f < ARRAY_SIZE(fixes); f++) {
-                if (v == fixes[f].marker) {
-                    cpu_physical_memory_write(a, &fixes[f].safe, 4);
-                    patched++;
-                    fprintf(stderr, "MMCS-FIXUP marker %08x @phys %08llx -> %08x\n",
-                            fixes[f].marker, (unsigned long long)a, fixes[f].safe);
-                }
-            }
-        }
-    }
-    if (patched) {
-        fprintf(stderr, "MMCS-FIXUP sweep: %d sites patched\n", patched);
-    }
-    /* re-run every 250ms while booting (pages appear on demand) */
-    if (!getenv("MMCS_FIXUP_SWEEP") || atoi(getenv("MMCS_FIXUP_SWEEP"))) {
-        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_fixup_sweep, NULL);
-        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
-    }
-}
 
 /* ---- Vendor INTC page @0xF4000000 (status/mask regs; protocol unknown)
  * ---- plus periodic timer-IRQ injection experiment. The kernel's VBR+0x600
@@ -368,6 +326,21 @@ static void mmcs_init(MachineState *machine)
         }
         g_free(fn);
     }
+    /* InitLocale late-bound pools ship marker 0xffff54e9 (config loader
+     * that would fill them never runs against our boot); patch at load
+     * time to the kernel's rts;mov #1,r0 fn. Physical writes to the ROM
+     * region don't stick, so this must precede set_readonly. */
+    {
+        uint32_t *fw = (uint32_t *)((uint8_t *)memory_region_get_ram_ptr(flash)
+                                    + 0x7ed04);
+        static const hwaddr offs[2] = { 0x7ed04, 0xf7b04 };
+        uint8_t *base = memory_region_get_ram_ptr(flash);
+        for (unsigned i = 0; i < 2; i++) {
+            uint32_t *p = (uint32_t *)(base + offs[i]);
+            if (*p == 0xffff54e9) { *p = 0x90809f3c; }
+        }
+        (void)fw;
+    }
     memory_region_set_readonly(flash, true);   /* RO after load */
     memory_region_add_subregion(get_system_memory(), MMCS_FLASH_BASE, flash);
 
@@ -456,10 +429,6 @@ static void mmcs_init(MachineState *machine)
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
 
-    {
-        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_fixup_sweep, NULL);
-        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-    }
 
     /* optional deterministic RAM dump after MMCS_DUMP seconds */
     {
