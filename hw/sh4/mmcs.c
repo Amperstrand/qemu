@@ -467,8 +467,13 @@ static void mmcs_init(MachineState *machine)
 
 
     {
-        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dllfix_sweep, NULL);
-        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        /* symptom patch, OFF by default: the marker is written at RUNTIME by
+         * a failed init (error-code-as-fn-ptr); enable only after the root
+         * cause is understood (MMCS_DLLFIX=1). */
+        if (getenv("MMCS_DLLFIX")) {
+            QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dllfix_sweep, NULL);
+            timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        }
     }
 
     /* optional deterministic RAM dump after MMCS_DUMP seconds */
