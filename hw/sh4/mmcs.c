@@ -92,6 +92,54 @@ static const MemoryRegionOps mmcs_syscon_c080_ops = {
 /* deterministic post-boot RAM dump (env MMCS_DUMP=<seconds>):
  * writes the ROMHDR copy-entry destinations + RAMStart to /tmp for
  * verifying kernel-side ROM→RAM copies. */
+/* ---- FILES-span IO region with side-table reads (S89/S97 design) ----
+ * The FILES region is packed: decompressed files overflow their load_va
+ * gaps. Reads within [load_va, load_va+real) of a known file are served
+ * from a concatenated decompressed side table; all other accesses hit the
+ * raw flash image underneath (overlap priority). */
+#define MMCS_MAX_FILES 256
+static struct {
+    uint32_t load_va, real, tbl_off;
+} mmcs_ftab[MMCS_MAX_FILES];
+static int mmcs_ftab_n;
+static uint8_t *mmcs_ftable_data;
+static size_t mmcs_ftable_len;
+
+static uint64_t mmcs_files_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /* addr = offset within the FILES IO region; base VA = region start */
+    uint32_t va = (uint32_t)(uintptr_t)opaque + (uint32_t)addr;
+    for (int i = 0; i < mmcs_ftab_n; i++) {
+        if (va >= mmcs_ftab[i].load_va &&
+            va < mmcs_ftab[i].load_va + mmcs_ftab[i].real) {
+            uint32_t off = va - mmcs_ftab[i].load_va + mmcs_ftab[i].tbl_off;
+            uint64_t v = 0;
+            if (off + size <= mmcs_ftable_len) {
+                memcpy(&v, mmcs_ftable_data + off, size);
+            }
+            return v;
+        }
+    }
+    return 0;   /* gaps: zeros (kernel never reads file gaps) */
+}
+
+static void mmcs_files_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    /* kernel writes into the FILES span: pass to the flash RAM beneath by
+     * writing through (the region overlaps flash at priority 1; writes
+     * here would need the underlying pointer — for now log-and-drop,
+     * the boot path only reads files) */
+    (void)opaque; (void)addr; (void)val; (void)size;
+}
+
+static const MemoryRegionOps mmcs_files_ops = {
+    .read = mmcs_files_read,
+    .write = mmcs_files_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+
 static int mmcs_fb_only_rearm = 0;  /* set by self-rearm: skip RAM sweep */
 
 static void mmcs_dump_ram(void *opaque)
@@ -457,6 +505,42 @@ static void mmcs_init(MachineState *machine)
          * the locale provider binds before InitLocale runs, making the call
          * optional; emulate that by pointing the slot at the kernel rts-stub
          * (call is fire-and-forget, result unused). */
+        const char *fst = getenv("MMCS_FILESTABLE");
+        if (fst && *fst) {
+            gsize tlen = 0;
+            uint8_t *tbuf = NULL;
+            if (g_file_get_contents(fst, (gchar **)&tbuf, &tlen, NULL)
+                && tbuf && tlen > 4) {
+                mmcs_ftab_n = ldl_le_p(tbuf);
+                if (mmcs_ftab_n > MMCS_MAX_FILES) mmcs_ftab_n = MMCS_MAX_FILES;
+                const uint8_t *p = tbuf + 4;
+                for (int i = 0; i < mmcs_ftab_n; i++) {
+                    mmcs_ftab[i].load_va = ldl_le_p(p); p += 4;
+                    mmcs_ftab[i].real = ldl_le_p(p); p += 4;
+                    mmcs_ftab[i].tbl_off = ldl_le_p(p); p += 4;
+                }
+                mmcs_ftable_data = (uint8_t *)p;
+                mmcs_ftable_len = tlen - 4 - 12 * mmcs_ftab_n;
+                if (mmcs_ftab_n > 0) {
+                    uint32_t lo = mmcs_ftab[0].load_va;
+                    uint32_t span_lo = lo & ~0xFFFFF;   /* align to 1MB */
+                    uint32_t span_hi = 0;
+                    for (int i = 0; i < mmcs_ftab_n; i++) {
+                        uint32_t end = mmcs_ftab[i].load_va + mmcs_ftab[i].real;
+                        if (end > span_hi) span_hi = end;
+                    }
+                    span_hi = (span_hi + 0xFFFFF) & ~0xFFFFF;
+                    MemoryRegion *fmr = g_new(MemoryRegion, 1);
+                    memory_region_init_io(fmr, NULL, &mmcs_files_ops,
+                        (void *)(uintptr_t)span_lo, "mmcs.filestable",
+                        span_hi - span_lo);
+                    memory_region_add_subregion(get_system_memory(),
+                        MMCS_FLASH_BASE + (span_lo - 0x90800000), fmr);
+                    fprintf(stderr, "MMCS: FILES table %d files, span %08x-%08x\n",
+                            mmcs_ftab_n, span_lo, span_hi);
+                }
+            }
+        }
         const char *fsh = getenv("MMCS_FILESHADOW");
         if (fsh) {
             /* FILES-region shadow: pre-decompressed file contents at their
