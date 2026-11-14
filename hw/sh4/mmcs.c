@@ -457,6 +457,25 @@ static void mmcs_init(MachineState *machine)
          * the locale provider binds before InitLocale runs, making the call
          * optional; emulate that by pointing the slot at the kernel rts-stub
          * (call is fire-and-forget, result unused). */
+        const char *fsh = getenv("MMCS_FILESHADOW");
+        if (fsh) {
+            /* FILES-region shadow: pre-decompressed file contents at their
+             * load_va offsets (built offline by our proven pipeline).
+             * Overlay onto the flash RAM after the raw image load. The
+             * kernel (which has no decompressor) then reads valid data. */
+            gsize slen = 0;
+            uint8_t *sbuf = NULL;
+            if (g_file_get_contents(fsh, (gchar **)&sbuf, &slen, NULL)
+                && sbuf && slen <= len) {
+                memcpy(memory_region_get_ram_ptr(flash), sbuf,
+                       MIN(slen, len));
+                fprintf(stderr, "MMCS: FILES shadow overlaid (%llu bytes)\n",
+                        (unsigned long long)slen);
+            } else {
+                fprintf(stderr, "MMCS: FILES shadow load FAILED (%s)\n", fsh);
+            }
+            g_free(sbuf);
+        }
         if (getenv("MMCS_LOCALEFIX")) {
             uint32_t safe = 0x90809f3c;   /* kernel rts stub (S65-verified) */
             hwaddr slot_pa = 0x108F7B04; /* flash base + (0x908F7B04-0x90800000) */
