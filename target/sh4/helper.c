@@ -823,6 +823,22 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     ret = get_physical_address(env, &physical, &prot, address, access_type);
 
+    /* MMCS fork: low-slot unbound-sentinel pages (VA 0x4000-0x7FFF, the
+     * 0x5bd0-class init-stage targets, S82-S84). The kernel flushes
+     * preloaded UTLB entries (MMUCR.TI) so ldtlb cannot survive; satisfy
+     * these fetches here by mapping to the fork's rts-stub page at phys
+     * 0x4000 (mapped under MMCS_LOWSLOT). Callers jsr into the sentinel,
+     * hit rts, return harmlessly, retry loop advances. */
+    if (ret != MMU_OK && address >= 0x4000 && address < 0x8000
+        && getenv("MMCS_LOWSLOT")) {
+        physical = address;               /* 1:1 to the rts page region */
+        prot = PAGE_READ | PAGE_EXEC;
+        tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                     address & TARGET_PAGE_MASK,
+                     PAGE_READ | PAGE_EXEC, mmu_idx, TARGET_PAGE_SIZE);
+        return true;
+    }
+
     if (ret == MMU_OK) {
         address &= TARGET_PAGE_MASK;
         physical &= TARGET_PAGE_MASK;

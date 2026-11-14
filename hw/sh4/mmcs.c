@@ -593,12 +593,42 @@ static void mmcs_init(MachineState *machine)
     memory_region_init_ram(bootrom, NULL, "mmcs.bootrom", 0x1000, &error_fatal);
     boot_stub = memory_region_get_ram_ptr(bootrom);
     /* mov.l @(0,pc),r0 ; jmp @r0 ; .long 0x908066b0 (pool at pc+4) */
-    boot_stub[0] = 0x00; boot_stub[1] = 0xD0;   /* mov.l @(0,pc),r0  */
-    boot_stub[2] = 0x2B; boot_stub[3] = 0x40;   /* jmp @r0           */
-    boot_stub[4] = 0xb0; boot_stub[5] = 0x66;   /* 0x908066b0        */
-    boot_stub[6] = 0x80; boot_stub[7] = 0x90;
+    if (getenv("MMCS_LOWSLOT")) {
+        /* v2 stub: preload UTLB low-slot pages (ldtlb) then jump to kernel */
+        static const uint8_t v2[] = {4,232,13,217,14,218,147,107,9,75,9,75,9,75,178,42,12,218,179,108,8,76,8,76,8,76,12,221,219,44,194,42,9,218,0,237,210,42,56,0,9,221,220,57,16,72,233,139,2,208,43,64,9,0,9,0,0,64,0,0,176,102,128,144,0,0,0,255,4,0,0,255,12,0,0,255,126,1,0,0,0,16,0,0};
+        memcpy(boot_stub, v2, sizeof v2);
+    } else {
+        boot_stub[0] = 0x00; boot_stub[1] = 0xD0;   /* mov.l @(0,pc),r0  */
+        boot_stub[2] = 0x2B; boot_stub[3] = 0x40;   /* jmp @r0           */
+        boot_stub[4] = 0xb0; boot_stub[5] = 0x66;   /* 0x908066b0        */
+        boot_stub[6] = 0x80; boot_stub[7] = 0x90;
+    }
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
+
+    /* MMCS_LOWSLOT=1: rts-filled low page (phys 0x4000-0x8000). Runtime-
+     * composed init-stage pointers sometimes point at unbound low-page
+     * sentinels (0x5bd0-class, S82/S84); the dispatcher jsr's them and
+     * fetch-faults forever. An rts at the target makes the call a no-op
+     * so the retry loop advances past the unbound stage. */
+    {
+        if (getenv("MMCS_LOWSLOT")) {
+            MemoryRegion *mr = g_new(MemoryRegion, 1);
+            memory_region_init_ram(mr, NULL, "mmcs.lowslot", 0x4000,
+                                   &error_fatal);
+            memory_region_add_subregion(get_system_memory(), 0x4000, mr);
+            uint8_t *p = memory_region_get_ram_ptr(mr);
+            for (unsigned o = 0; o + 1 < 0x4000; o += 2) {
+                p[o] = 0x0b; p[o + 1] = 0x00;   /* rts (SH4: 0x000b) */
+            }
+            /* ALSO pre-load UTLB: VA 0x4000-0x7FFF -> phys 0x4000-0x7FFF
+             * (4 x 4KB shared pages) so user-mode fetches at unbound
+             * sentinels hit the rts stub after the kernel enables the MMU.
+             * Loaded from the boot stub via ldtlb BEFORE the kernel runs;
+             * survives unless the kernel flushes the whole UTLB (MMUCR.TI). */
+            fprintf(stderr, "MMCS: LOWSLOT rts page mapped at 0x4000\n");
+        }
+    }
 
     /* optional deterministic RAM dump after MMCS_DUMP seconds */
     {
