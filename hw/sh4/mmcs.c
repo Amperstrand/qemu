@@ -177,6 +177,21 @@ static void mmcs_dump_ram(void *opaque)
                     break;
                 }
             }
+            /* self-re-arm: more sequenced frames remain -> schedule the next
+             * dump without the full RAM sweep (fast path) */
+            {
+                static int fb_seq_left = -1;
+                const char *iv2 = getenv("MMCS_FB_INTERVAL");
+                if (iv2 && fb_seq_left == -1)
+                    fb_seq_left = atoi(iv2) - 1;
+                if (fb_seq_left > 0) {
+                    fb_seq_left--;
+                    QEMUTimer *t2 = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                                 mmcs_dump_ram, NULL);
+                    timer_mod(t2, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                              + atoi(getenv("MMCS_DUMP")) * 1000);
+                }
+            }
         }
     }
     if (getenv("MMCS_MLD")) {
