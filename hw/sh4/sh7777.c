@@ -257,6 +257,13 @@ static uint64_t chanflash_read(void *opaque, hwaddr off, unsigned size)
         }
     }
     if (off + size <= CHAN_SZ) memcpy(&v, chan_flash[c] + off, size);
+    if (sh7777_trace() && (off < 0x100 || (off & 0xF0000000) == 0)) {
+        /* log reads of the sigstruct head (first 0x100 bytes) only */
+        if (off < 0x100) {
+            fprintf(stderr, "SH7777-CHFL-R c=%d off=%05lx -> %04llx\n",
+                    c, (unsigned long)off, (unsigned long long)v);
+        }
+    }
     return v;
 }
 
@@ -272,6 +279,21 @@ static void chanflash_write(void *opaque, hwaddr off, uint64_t val, unsigned siz
         if (v16 == 0x30 && off == 0) {           /* erase confirm at block base */
             memset(chan_flash[c], 0xff, CHAN_SZ);
             chan_autoselect[c] = 0;
+            /* S78/S79: the kernel erases ch0 then awaits a program phase
+             * that never arrives (loader's job on real HW). Without a valid
+             * sigstruct the channel-walker marks ch0 INVALID and the boot
+             * stalls at '//'. Emulate the loader: restore the valid struct
+             * right after the erase completes. */
+            if (getenv("MMCS_CHAN_AUTORESTORE")) {
+                uint32_t *m = (uint32_t *)chan_flash[c];
+                memset(chan_flash[c], 0x00, 0x100);
+                m[0] = 0xffffffff;
+                m[12] = 0; m[13] = 0xffffffff;
+                m[14] = 0; m[15] = 0xffffffff;
+                m[23] = 0;
+                if (sh7777_trace())
+                    fprintf(stderr, "SH7777-CHFL c=%d SIGSTRUCT RESTORED\n", c);
+            }
             if (sh7777_trace()) fprintf(stderr, "SH7777-CHFL c=%d ERASED\n", c);
             return;
         }
