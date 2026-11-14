@@ -141,59 +141,50 @@ static void mmcs_dump_ram(void *opaque)
         }
     }
     /* MMCS_FB=<file.ppm>: dump the unit framebuffer (phys 0x08B00000,
-     * 800x480 RGB565) as a PPM - makes screen output visible (MLD payloads
-     * draw here; the OS GUI target will too). Works in both boot modes.
-     * MMCS_FB_INTERVAL=<n>: emit n sequenced frames (<base>-%03d.ppm) at
-     * MMCS_DUMP-multiples so host tooling can stream screen evolution. */
+     * 800x480 RGB565) as a PPM. MMCS_FB_INTERVAL=<n>: stream n frames, one
+     * per self-re-armed MMCS_DUMP interval, named <base>-%03d.ppm; re-armed
+     * callbacks are FB-only (the full RAM sweep in a timer callback was
+     * proven to starve the chardev -> link wedge). */
     {
         const char *fb = getenv("MMCS_FB");
         if (fb) {
             const char *iv = getenv("MMCS_FB_INTERVAL");
             int total = iv ? atoi(iv) : 1;
+            static int seq = 0;
             if (total < 1) total = 1;
-            for (int seq = 0; seq < total; seq++) {
-                const int FW = 800, FH = 480;
-                static uint8_t rgb565[800 * 480 * 2];
-                static uint8_t ppm[800 * 480 * 3 + 64];
-                cpu_physical_memory_read(0x08B00000, rgb565, sizeof rgb565);
-                int n = snprintf((char *)ppm, sizeof ppm,
-                                 "P6\n%d %d\n255\n", FW, FH);
-                for (int i = 0; i < FW * FH; i++) {
-                    uint16_t p = rgb565[2 * i] | rgb565[2 * i + 1] << 8;
-                    ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13);
-                    ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9);
-                    ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2);
-                }
-                char fn[512];
-                if (total > 1)
-                    snprintf(fn, sizeof fn, "%s-%03d.ppm", fb, seq);
-                else
-                    snprintf(fn, sizeof fn, "%s", fb);
-                FILE *fp = fopen(fn, "wb");
-                if (fp) {
-                    fwrite(ppm, 1, n + FW * FH * 3, fp);
-                    fclose(fp);
-                    fprintf(stderr, "MMCS: framebuffer dumped to %s\n", fn);
-                } else {
-                    fprintf(stderr, "MMCS: cannot write %s\n", fn);
-                    break;
-                }
+            const int FW = 800, FH = 480;
+            static uint8_t rgb565[800 * 480 * 2];
+            static uint8_t ppm[800 * 480 * 3 + 64];
+            cpu_physical_memory_read(0x08B00000, rgb565, sizeof rgb565);
+            int n = snprintf((char *)ppm, sizeof ppm,
+                             "P6\n%d %d\n255\n", FW, FH);
+            for (int i = 0; i < FW * FH; i++) {
+                uint16_t p = rgb565[2 * i] | rgb565[2 * i + 1] << 8;
+                ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13);
+                ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9);
+                ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2);
             }
-            /* self-re-arm: more sequenced frames remain -> schedule the next
-             * dump without the full RAM sweep (fast path) */
-            {
-                static int fb_seq_left = -1;
-                const char *iv2 = getenv("MMCS_FB_INTERVAL");
-                if (iv2 && fb_seq_left == -1)
-                    fb_seq_left = atoi(iv2) - 1;
-                if (fb_seq_left > 0) {
-                    fb_seq_left--;
-                    mmcs_fb_only_rearm = 1;
-                    QEMUTimer *t2 = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                                 mmcs_dump_ram, NULL);
-                    timer_mod(t2, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
-                              + atoi(getenv("MMCS_DUMP")) * 1000);
-                }
+            char fn[512];
+            if (total > 1)
+                snprintf(fn, sizeof fn, "%s-%03d.ppm", fb, seq);
+            else
+                snprintf(fn, sizeof fn, "%s", fb);
+            FILE *fp = fopen(fn, "wb");
+            if (fp) {
+                fwrite(ppm, 1, n + FW * FH * 3, fp);
+                fclose(fp);
+                fprintf(stderr, "MMCS: framebuffer dumped to %s\n", fn);
+            } else {
+                fprintf(stderr, "MMCS: cannot write %s\n", fb);
+            }
+            seq++;
+            if (seq < total) {
+                mmcs_fb_only_rearm = 1;
+                const char *ds = getenv("MMCS_DUMP");
+                QEMUTimer *t2 = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                             mmcs_dump_ram, NULL);
+                timer_mod(t2, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                          + (ds ? atoi(ds) : 5) * 1000);
             }
         }
     }
