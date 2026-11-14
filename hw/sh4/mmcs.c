@@ -197,28 +197,6 @@ static void mmcs_dump_ram(void *opaque)
 
 
 
-/* ---- DLL-section marker sweeper (narrow, correct scope) ----
- * The kernel pages DLL sections into phys 0x108C0000-0x10970000 (inside
- * our flash window; pager re-decompresses pages on every filesys retry,
- * restoring the InitLocale marker 0xffff54e9). Scan just this ~700KB
- * every 10ms and re-patch to the kernel rts-stub. NOT stack memory. */
-static void mmcs_dllfix_sweep(void *opaque)
-{
-    static const hwaddr lo = 0x108c0000, hi = 0x10970000;
-    int patched = 0;
-    for (hwaddr a = lo; a + 4 <= hi; a += 4) {
-        uint32_t v;
-        cpu_physical_memory_read(a, &v, 4);
-        if (v == 0xffff54e9) {
-            uint32_t safe = 0x90809f3c;
-            cpu_physical_memory_write(a, &safe, 4);
-            patched++;
-            fprintf(stderr, "MMCS-DLLFIX @%08llx\n", (unsigned long long)a);
-        }
-    }
-    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dllfix_sweep, NULL);
-    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
-}
 
 
 /* ---- Load-time jsr-to-negative-pool NOP patcher ----
@@ -427,9 +405,12 @@ static void mmcs_init(MachineState *machine)
         }
         g_free(buf);
         g_free(fn);
-        /* neutralize all shipped jsr-to-negative-pool sites in the image */
-        mmcs_nop_marker_jsrs(memory_region_get_ram_ptr(flash), len,
-                             0x90800000);
+        /* neutralize all shipped jsr-to-negative-pool sites in the image
+         * (MMCS_NONOP=1 disables for A/B comparison) */
+        if (!getenv("MMCS_NONOP")) {
+            mmcs_nop_marker_jsrs(memory_region_get_ram_ptr(flash), len,
+                                 0x90800000);
+        }
     }
     /* InitLocale late-bound pools ship marker 0xffff54e9 (config loader
      * that would fill them never runs against our boot); patch at load
@@ -440,9 +421,11 @@ static void mmcs_init(MachineState *machine)
                                     + 0x7ed04);
         static const hwaddr offs[2] = { 0x7ed04, 0xf7b04 };
         uint8_t *base = memory_region_get_ram_ptr(flash);
-        for (unsigned i = 0; i < 2; i++) {
-            uint32_t *p = (uint32_t *)(base + offs[i]);
-            if (*p == 0xffff54e9) { *p = 0x90809f3c; }
+        if (!getenv("MMCS_NOPOOL")) {
+            for (unsigned i = 0; i < 2; i++) {
+                uint32_t *p = (uint32_t *)(base + offs[i]);
+                if (*p == 0xffff54e9) { *p = 0x90809f3c; }
+            }
         }
         (void)fw;
     }
@@ -533,17 +516,6 @@ static void mmcs_init(MachineState *machine)
     boot_stub[6] = 0x80; boot_stub[7] = 0x90;
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
-
-
-    {
-        /* symptom patch, OFF by default: the marker is written at RUNTIME by
-         * a failed init (error-code-as-fn-ptr); enable only after the root
-         * cause is understood (MMCS_DLLFIX=1). */
-        if (getenv("MMCS_DLLFIX")) {
-            QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dllfix_sweep, NULL);
-            timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
-        }
-    }
 
     /* optional deterministic RAM dump after MMCS_DUMP seconds */
     {
