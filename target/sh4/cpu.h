@@ -174,6 +174,7 @@ typedef struct CPUArchState {
     uint32_t tra;               /* TRAPA exception register */
     uint32_t expevt;            /* exception event register */
     uint32_t intevt;            /* interrupt event register */
+    uint32_t mmcs_evt_inject;   /* MMCS fork: vendor-INTC event injection */
 
     tlb_t itlb[ITLB_SIZE];      /* instruction translation table */
     tlb_t utlb[UTLB_SIZE];      /* unified translation table */

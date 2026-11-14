@@ -286,11 +286,32 @@ static qemu_irq mmcs_vintc_irl;      /* SH4 IRL line (vendor INTC demux) */
  * (36.8M zero-mask sweeps, zero reads) = waiting for an interrupt we
  * never injected. This experiment asserts the line; the handler at
  * VBR+0x600 should take it. Level: IRL is active-low encoded priority. */
+static SuperHCPU *mmcs_cpu;
+static uint32_t mmcs_vintc_evt_code;
+
+static void mmcs_vintc_evt_deliver(void *opaque)
+{
+    /* deliver a vendor-INTC event: preset INTEVT + the fork's inject flag,
+     * then raise the CPU IRQ; superh_cpu_do_interrupt picks it up (fork
+     * hook) and the kernel trampoline dispatches slot = code>>10 in its
+     * RAM vector table @0x8867a000 (codes = IRQ<<8, e.g. 0x7C00 = ch124). */
+    if (mmcs_cpu) {
+        CPUSH4State *env = &mmcs_cpu->env;
+        env->intevt = mmcs_vintc_evt_code;
+        env->mmcs_evt_inject = 1;
+        cpu_reset_interrupt(CPU(mmcs_cpu), CPU_INTERRUPT_HARD);
+        cpu_interrupt(CPU(mmcs_cpu), CPU_INTERRUPT_HARD);
+    }
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_evt_deliver, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+              + atoi(getenv("MMCS_VINTC_EVT_MS") ? : "20"));
+}
+
 static void mmcs_vintc_pulse(void *opaque)
 {
     static int level;
     level = !level;
-    qemu_set_irq(mmcs_vintc_irl, level & 15);  /* IRL encoded priority */
+    qemu_set_irq(mmcs_vintc_irl, level & 15);
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_pulse, NULL);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
               + atoi(getenv("MMCS_VINTC_IRQ") ? : "10"));
@@ -474,10 +495,21 @@ static void mmcs_init(MachineState *machine)
     /* Classic SH4 on-chip devices: INTC, TMU, RTC, SCIF serial, DMAC, CPG */
     {
         /* capture the sh7750 state for the IRQ injection experiment (S73) */
+        mmcs_cpu = cpu;
         struct SH7750State *s7750 = sh7750_init(cpu, get_system_memory());
         /* vendor INTC page */
         {
             const char *vi = getenv("MMCS_VINTC_IRQ");
+            const char *evt = getenv("MMCS_VINTC_EVT");
+            if (evt && *evt) {
+                mmcs_vintc_evt_code = strtoul(evt, NULL, 16);
+                QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                            mmcs_vintc_evt_deliver, NULL);
+                timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1500);
+                fprintf(stderr, "MMCS: vendor-INTC EVT injection %08x every %sms\n",
+                        mmcs_vintc_evt_code,
+                        getenv("MMCS_VINTC_EVT_MS") ? : "20");
+            }
             if (vi && *vi) {
                 mmcs_vintc_irl = sh7750_irl(s7750);
                 QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
