@@ -320,7 +320,15 @@ static uint64_t sh_serial_read(void *opaque, hwaddr offs,
 
 static int sh_serial_can_receive(SHSerialState *s)
 {
-    return s->scr & (1 << 4);
+    /* MMCS fork: return actual free FIFO space (was `scr & (1 << 4)`, a
+     * constant 16 whenever RE is set — receive1() then silently dropped
+     * every byte beyond FIFO capacity, killing any SCIF stream >16 bytes
+     * unless the guest out-polled the host). FIFO backpressure is the
+     * hardware-sane behavior for emulation. */
+    if (!(s->scr & (1 << 4))) {
+        return 0;
+    }
+    return SH_RX_FIFO_LENGTH - s->rx_cnt;
 }
 
 static void sh_serial_receive_break(SHSerialState *s)
