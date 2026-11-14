@@ -220,6 +220,59 @@ static void mmcs_dllfix_sweep(void *opaque)
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 }
 
+
+/* ---- Load-time jsr-to-negative-pool NOP patcher ----
+ * Systemic pattern: late-bound calls whose pool word is a shipped
+ * negative config value (sign-extended by mov.w -> invalid address):
+ * InitLocale 0xffff54e9, error-printer 0xfbed, pm.dll 0xfddb, ...
+ * These paths only run when the config loader (registry/filesys) never
+ * filled the slot. A jsr whose register was JUST loaded via mov.w from
+ * a word >= 0x8000 can never be a valid SH4 address -> NOP the jsr at
+ * load time. Executed-on-real-HW paths with valid pools are untouched. */
+static void mmcs_nop_marker_jsrs(uint8_t *img, size_t len, hwaddr img_va)
+{
+    int nops = 0;
+    for (size_t pc = 0; pc + 40 < len; pc += 2) {
+        uint16_t w = img[pc] | (img[pc + 1] << 8);
+        if ((w & 0xf000) != 0x9000) continue;        /* mov.w @(d,pc),Rn */
+        unsigned rn = (w >> 8) & 0xf;
+        unsigned disp = w & 0xff;
+        size_t pool = pc + 4 + disp * 2;   /* mov.w disp is x2-scaled */
+        if (pool + 2 > len) continue;
+        uint16_t pw = img[pool] | (img[pool + 1] << 8);
+        if (!(pw & 0x8000)) continue;                /* would sign-extend negative */
+        /* jsr @Rn at pc+2, or pc+4 with ONE intervening insn that must
+         * not overwrite Rn (mov #imm,Rn = 0xEnnn has rn in the same
+         * nibble position). Anything looser matched 8875 false sites. */
+        /* Only TWO safe shapes:
+         *  (a) jsr @Rn at pc+2 (immediately after the load), or
+         *  (b) jsr @Rn at pc+4 with exactly one intervening insn that
+         *      must be `mov #imm,Rx` (0xExxx) writing a DIFFERENT reg.
+         * Anything else may reload Rn -> the jsr could be legitimate. */
+        uint16_t j2 = img[pc + 2] | (img[pc + 3] << 8);
+        bool hit = false;
+        if ((j2 & 0xf0ff) == 0x400b && ((j2 >> 8) & 0xf) == rn) {
+            hit = true;
+        } else {
+            uint16_t mid = j2;
+            uint16_t j4 = img[pc + 4] | (img[pc + 5] << 8);
+            if ((mid & 0xf000) == 0xe000 && ((mid >> 8) & 0xf) != rn &&
+                (j4 & 0xf0ff) == 0x400b && ((j4 >> 8) & 0xf) == rn) {
+                hit = true;
+                j2 = j4;
+                pc += 2;   /* report the jsr address, not the mid */
+            }
+        }
+        if (hit) {
+            img[pc + 2] = 0x09; img[pc + 3] = 0x00;   /* nop the jsr */
+            nops++;
+            fprintf(stderr, "MMCS-NOP jsr@r%u @%08llx (pool %04x)\n",
+                    rn, (unsigned long long)(img_va + pc + 2), pw);
+        }
+    }
+    fprintf(stderr, "MMCS-NOP: %d marker jsrs neutralized\n", nops);
+}
+
 /* ---- Vendor INTC page @0xF4000000 (status/mask regs; protocol unknown)
  * ---- plus periodic timer-IRQ injection experiment. The kernel's VBR+0x600
  * (SH4 IRQ0) handler is armed; the vendor INTC (0xF4001000/0xF4003000 per
@@ -359,8 +412,24 @@ static void mmcs_init(MachineState *machine)
             exit(1);
         }
         memcpy(memory_region_get_ram_ptr(flash), buf, len);
+        /* MMCS_LOCALEFIX=1: k.coredll InitLocale (VA 0xC004CA58) calls a
+         * late-bound pool slot that SHIPS as sentinel 0xffff54e9 (exactly
+         * one occurrence in plain .text, ROM 0x908F7B04; verified 2026-11-14:
+         * no runtime writer — dual-alias watchpoint never fires). On real HW
+         * the locale provider binds before InitLocale runs, making the call
+         * optional; emulate that by pointing the slot at the kernel rts-stub
+         * (call is fire-and-forget, result unused). */
+        if (getenv("MMCS_LOCALEFIX")) {
+            uint32_t safe = 0x90809f3c;   /* kernel rts stub (S65-verified) */
+            hwaddr slot_pa = 0x108F7B04; /* flash base + (0x908F7B04-0x90800000) */
+            cpu_physical_memory_write(slot_pa, &safe, 4);
+            fprintf(stderr, "MMCS: LOCALEFIX sentinel slot patched\n");
+        }
         g_free(buf);
         g_free(fn);
+        /* neutralize all shipped jsr-to-negative-pool sites in the image */
+        mmcs_nop_marker_jsrs(memory_region_get_ram_ptr(flash), len,
+                             0x90800000);
     }
     /* InitLocale late-bound pools ship marker 0xffff54e9 (config loader
      * that would fill them never runs against our boot); patch at load
