@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/cpu-common.h"
 
 #include "cpu.h"
 #include "exec/exec-all.h"
@@ -86,9 +87,61 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * for the boot-registry bootstrap (the fdf circular-read break). */
     if (cs->exception_index == 0x160 &&
         env->mmcs_regfix_active && env->tra == 0x71) {
-        env->gregs[0] = 0;              /* ERROR_SUCCESS */
-        /* env->pc already points past the trapa (translate advanced it);
-         * just swallow the exception and resume. */
+        /* RegQueryValueExW(hKey=r4, name=r5, res=r6, type=r7,
+         *                  data=[r15+4], cbdata=[r15+8]).
+         * Phase-0: answer known bootstrap names with real values from
+         * default.reg ground truth; unknown names = ERROR_FILE_NOT_FOUND
+         * (benign: the value simply doesn't exist yet). */
+        static const struct { const char *name; uint32_t dword; } vals[] = {
+            { "AutoMount", 1 },
+            { "MountFlags", 0 },
+            { "MountSystem", 1 },
+            { "MountAsROM", 1 },
+            { "MountAsBootable", 1 },
+            { "AutoPart", 0 },
+            { "AutoFormat", 0 },
+            { "PnPWaitIoDelay", 0x1f4 },
+            { "PNPUnloadDelay", 0x12c },
+        };
+        uint32_t r5 = env->gregs[5];
+        uint32_t hit = 0;
+        if (r5 > 0x10000) {
+            char name[40]; int i;
+            for (i = 0; i < 39; i++) {
+                uint32_t ch;
+                cpu_physical_memory_read(r5 + 2 * i, &ch, 1);
+                cpu_physical_memory_read(r5 + 2 * i + 1, &hit, 1);
+                if (!ch && !hit) break;
+                if (ch < 0x80) name[i] = (char)ch; else break;
+                name[i + 1] = 0;
+            }
+            for (unsigned k = 0; k < ARRAY_SIZE(vals); k++) {
+                if (strcmp(name, vals[k].name) == 0) { hit = vals[k].dword; break; }
+            }
+        }
+        if (hit) {
+            /* type=REG_DWORD(4) if lpType; data if lpData/lpcbData */
+            uint32_t type_ptr = env->gregs[7];
+            uint32_t data_ptr = 0, cb_ptr = 0;
+            /* stack args: [r15+4]=lpData [r15+8]=lpcbData (after the
+             * trapa the stack still holds the caller's frame) */
+            cpu_physical_memory_read(env->gregs[15] + 4, &data_ptr, 4);
+            cpu_physical_memory_read(env->gregs[15] + 8, &cb_ptr, 4);
+            if (type_ptr) {
+                uint32_t t = 4;
+                cpu_physical_memory_write(type_ptr, &t, 4);
+            }
+            if (cb_ptr) {
+                uint32_t cb = 4;
+                cpu_physical_memory_write(cb_ptr, &cb, 4);
+            }
+            if (data_ptr) {
+                cpu_physical_memory_write(data_ptr, &hit, 4);
+            }
+            env->gregs[0] = 0;          /* ERROR_SUCCESS */
+        } else {
+            env->gregs[0] = 2;          /* ERROR_FILE_NOT_FOUND */
+        }
         cs->exception_index = -1;
         return;
     }
