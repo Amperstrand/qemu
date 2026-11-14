@@ -279,6 +279,22 @@ static void mmcs_nop_marker_jsrs(uint8_t *img, size_t len, hwaddr img_va)
  * (SH4 IRQ0) handler is armed; the vendor INTC (0xF4001000/0xF4003000 per
  * kernel data tables) presumably demuxes onto it. Stub-first + trace. */
 static uint32_t mmcs_vintc_regs[64];
+static qemu_irq mmcs_vintc_irl;      /* SH4 IRL line (vendor INTC demux) */
+
+/* MMCS_VINTC_IRQ=<ms>: pulse the SH4 IRL line every <ms> virtual ms.
+ * Ground truth (S73): the stalled kernel WRITES-ONLY to the vendor INTC
+ * (36.8M zero-mask sweeps, zero reads) = waiting for an interrupt we
+ * never injected. This experiment asserts the line; the handler at
+ * VBR+0x600 should take it. Level: IRL is active-low encoded priority. */
+static void mmcs_vintc_pulse(void *opaque)
+{
+    static int level;
+    level = !level;
+    qemu_set_irq(mmcs_vintc_irl, level & 15);  /* IRL encoded priority */
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_pulse, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+              + atoi(getenv("MMCS_VINTC_IRQ") ? : "10"));
+}
 static uint64_t mmcs_vintc_read(void *opaque, hwaddr off, unsigned size)
 {
     uint64_t v = 0;
@@ -456,9 +472,21 @@ static void mmcs_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), MMCS_FLASH_BASE, flash);
 
     /* Classic SH4 on-chip devices: INTC, TMU, RTC, SCIF serial, DMAC, CPG */
-    sh7750_init(cpu, get_system_memory());
     {
+        /* capture the sh7750 state for the IRQ injection experiment (S73) */
+        struct SH7750State *s7750 = sh7750_init(cpu, get_system_memory());
         /* vendor INTC page */
+        {
+            const char *vi = getenv("MMCS_VINTC_IRQ");
+            if (vi && *vi) {
+                mmcs_vintc_irl = sh7750_irl(s7750);
+                QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                            mmcs_vintc_pulse, NULL);
+                timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                          + atoi(vi));
+                fprintf(stderr, "MMCS: vendor-INTC IRQ injection every %sms\n", vi);
+            }
+        }
         MemoryRegion *mr = g_new(MemoryRegion, 1);
         memory_region_init_io(mr, NULL, &mmcs_vintc_ops, NULL,
                               "mmcs.vintc", 0x10000);
