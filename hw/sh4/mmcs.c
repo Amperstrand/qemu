@@ -190,6 +190,83 @@ static void mmcs_dump_ram(void *opaque)
     fprintf(stderr, "MMCS: RAM dump written\n");
 }
 
+
+
+/* ---- XIP fixup-marker sweeper (bring-up shim) ----
+ * The kernel's demand pager decompresses XIP module pages but never
+ * applies their fixups: shipped pools still hold marker 0xffff54e9
+ * (jsr target in k.coredll @0xc004cab4 -> Illegal Instruction, killing
+ * the filesys launch thread every retry). Sweep RAM for the marker and
+ * patch it to kernel fn 0x90809f3c (rts; mov #1,r0 — call sites ignore
+ * the return). MMCS_FIXUP_SWEEP=0 disables. */
+static void mmcs_fixup_sweep(void *opaque)
+{
+    static const struct { uint32_t marker; uint32_t safe; } fixes[] = {
+        { 0xffff54e9, 0x90809f3c },   /* InitLocale late-bound call */
+        { 0xfffffbed, 0x90808394 },   /* error-printer walker (OEMWriteDebugString) */
+    };
+    static const struct { hwaddr base; uint64_t size; } rams[] = {
+        { 0x08000000, 128ull << 20 },
+        { 0x10000000, 16ull << 20 },
+        { 0x10800000, 8ull << 20 },   /* kernel XIP flash (first 8MB: pools live low) */
+    };
+    int patched = 0;
+    for (unsigned r = 0; r < ARRAY_SIZE(rams); r++) {
+        for (hwaddr a = rams[r].base; a + 4 <= rams[r].base + rams[r].size; a += 4) {
+            uint32_t v;
+            cpu_physical_memory_read(a, &v, 4);
+            for (unsigned f = 0; f < ARRAY_SIZE(fixes); f++) {
+                if (v == fixes[f].marker) {
+                    cpu_physical_memory_write(a, &fixes[f].safe, 4);
+                    patched++;
+                    fprintf(stderr, "MMCS-FIXUP marker %08x @phys %08llx -> %08x\n",
+                            fixes[f].marker, (unsigned long long)a, fixes[f].safe);
+                }
+            }
+        }
+    }
+    if (patched) {
+        fprintf(stderr, "MMCS-FIXUP sweep: %d sites patched\n", patched);
+    }
+    /* re-run every 250ms while booting (pages appear on demand) */
+    if (!getenv("MMCS_FIXUP_SWEEP") || atoi(getenv("MMCS_FIXUP_SWEEP"))) {
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_fixup_sweep, NULL);
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
+    }
+}
+
+/* ---- Vendor INTC page @0xF4000000 (status/mask regs; protocol unknown)
+ * ---- plus periodic timer-IRQ injection experiment. The kernel's VBR+0x600
+ * (SH4 IRQ0) handler is armed; the vendor INTC (0xF4001000/0xF4003000 per
+ * kernel data tables) presumably demuxes onto it. Stub-first + trace. */
+static uint32_t mmcs_vintc_regs[64];
+static uint64_t mmcs_vintc_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t v = 0;
+    if (off / 4 < 64) memcpy(&v, (uint8_t *)mmcs_vintc_regs + off, size);
+    if (getenv("MMCS_TRACE")) {
+        fprintf(stderr, "MMCS-VINTC R off=%05llx -> %08llx\n",
+                (unsigned long long)off, (unsigned long long)v);
+    }
+    return v;
+}
+static void mmcs_vintc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    if (getenv("MMCS_TRACE")) {
+        fprintf(stderr, "MMCS-VINTC W off=%05llx <- %08llx\n",
+                (unsigned long long)off, (unsigned long long)val);
+    }
+    if (off / 4 < 64) memcpy((uint8_t *)mmcs_vintc_regs + off, &val, size);
+}
+static const MemoryRegionOps mmcs_vintc_ops = {
+    .read = mmcs_vintc_read, .write = mmcs_vintc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+
+
+
+
 static void mmcs_init(MachineState *machine)
 {
     SuperHCPU *cpu;
@@ -294,10 +371,12 @@ static void mmcs_init(MachineState *machine)
 
     /* Classic SH4 on-chip devices: INTC, TMU, RTC, SCIF serial, DMAC, CPG */
     sh7750_init(cpu, get_system_memory());
-
-    /* SH7777 devices: CMT/DMA block, INTC banks, CPG (PLL lock) */
     {
-        sh7777_init(NULL);   /* cpu_irq wired later if needed */
+        /* vendor INTC page */
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+        memory_region_init_io(mr, NULL, &mmcs_vintc_ops, NULL,
+                              "mmcs.vintc", 0x10000);
+        memory_region_add_subregion(get_system_memory(), 0xF4000000, mr);
     }
 
     /* The kernel addresses on-chip regs P4-style (0xFFxxxxxx). qemu's INTC
@@ -350,6 +429,8 @@ static void mmcs_init(MachineState *machine)
         mmcs_chanflash_init();
     }
 
+
+
     /* polled syscon regions (see ops above) */
     {
         MemoryRegion *mr = g_new(MemoryRegion, 1);
@@ -357,6 +438,8 @@ static void mmcs_init(MachineState *machine)
                               "mmcs.syscon-c080", 0x1000);
         memory_region_add_subregion(get_system_memory(), 0xFFC08000, mr);
     }
+    /* 0xFFD80000 = SH7750 TMU (real qemu model, real IRQs) — do NOT
+     * overlay it. Kernel programs TMU1 (TSTR=2) + TCOR/TCNT=0xFFFFFFFF. */
 
     /* Boot ROM stub at physical 0: mask-ROM role, jumps to the OS entry.
      * Reset PC on SH4 is 0xA0000000 (P2 mirror of physical 0). */
@@ -371,6 +454,11 @@ static void mmcs_init(MachineState *machine)
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
 
+    {
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_fixup_sweep, NULL);
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+    }
+
     /* optional deterministic RAM dump after MMCS_DUMP seconds */
     {
         const char *ds = getenv("MMCS_DUMP");
@@ -380,6 +468,9 @@ static void mmcs_init(MachineState *machine)
         }
     }
 }
+
+
+
 
 static void mmcs_machine_init(MachineClass *mc)
 {
