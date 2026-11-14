@@ -104,7 +104,9 @@ int sh_intc_get_pending_vector(struct intc_desc *desc, int imask)
             return source->vect;
         }
     }
-    g_assert_not_reached();
+    /* MMCS fork: HARD asserted with no INTC source pending (our event
+     * injector's stale line) — report idle instead of aborting. */
+    return -1;
 }
 
 typedef enum {

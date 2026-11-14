@@ -90,6 +90,10 @@ void superh_cpu_do_interrupt(CPUState *cs)
             irq_vector = sh_intc_get_pending_vector(env->intc_handle,
                                                     (env->sr >> 4) & 0xf);
             if (irq_vector == -1) {
+                /* MMCS fork: HARD asserted by our injector with the flag
+                 * already consumed = stale line; drop it instead of the
+                 * upstream g_assert_not_reached crash path. */
+                cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
                 return; /* masked */
             }
         }
