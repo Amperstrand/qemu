@@ -3,7 +3,7 @@ sh4_ss.add(files(
   'cpu.c',
   'gdbstub.c',
   'helper.c',
-  'op_helper.c',
+  'op_helper.c',  # -DMMCS_TRACE_TRAPA enables trap syscall logging
   'translate.c',
 ))
 

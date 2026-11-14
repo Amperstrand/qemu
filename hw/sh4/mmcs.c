@@ -108,6 +108,7 @@ static void mmcs_dump_ram(void *opaque)
         { 0x10800000, "/tmp/imgpage1.bin" },
         { 0x10801240, "/tmp/extarea.bin" },
         { 0x0867e000, "/tmp/fntable.bin" },
+        { 0x108f7000, "/tmp/dllpool.bin" },
         { 0x1068e000, "/tmp/pagedmod.bin" },
         { 0x0867a000, "/tmp/kdata2.bin" },
         { 0x08600000, "/tmp/kdata0.bin" },
@@ -194,6 +195,30 @@ static void mmcs_dump_ram(void *opaque)
 
 
 
+
+
+/* ---- DLL-section marker sweeper (narrow, correct scope) ----
+ * The kernel pages DLL sections into phys 0x108C0000-0x10970000 (inside
+ * our flash window; pager re-decompresses pages on every filesys retry,
+ * restoring the InitLocale marker 0xffff54e9). Scan just this ~700KB
+ * every 10ms and re-patch to the kernel rts-stub. NOT stack memory. */
+static void mmcs_dllfix_sweep(void *opaque)
+{
+    static const hwaddr lo = 0x108c0000, hi = 0x10970000;
+    int patched = 0;
+    for (hwaddr a = lo; a + 4 <= hi; a += 4) {
+        uint32_t v;
+        cpu_physical_memory_read(a, &v, 4);
+        if (v == 0xffff54e9) {
+            uint32_t safe = 0x90809f3c;
+            cpu_physical_memory_write(a, &safe, 4);
+            patched++;
+            fprintf(stderr, "MMCS-DLLFIX @%08llx\n", (unsigned long long)a);
+        }
+    }
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dllfix_sweep, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+}
 
 /* ---- Vendor INTC page @0xF4000000 (status/mask regs; protocol unknown)
  * ---- plus periodic timer-IRQ injection experiment. The kernel's VBR+0x600
@@ -319,11 +344,22 @@ static void mmcs_init(MachineState *machine)
                            &error_fatal);
     if (machine->firmware) {
         char *fn = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
-        if (!fn || load_image_targphys(fn, MMCS_FLASH_BASE,
-                                       MMCS_FLASH_SIZE) < 0) {
+        if (!fn) {
             error_report("could not load firmware '%s'", machine->firmware);
             exit(1);
         }
+        /* Load directly into the RAM backing (NOT load_image_targphys:
+         * that registers a ROM blob applied at machine start, which would
+         * overwrite the marker patch applied below). */
+        gsize len = 0;
+        uint8_t *buf = NULL;
+        if (!g_file_get_contents(fn, (gchar **)&buf, &len, NULL) ||
+            len > MMCS_FLASH_SIZE) {
+            error_report("could not read firmware '%s'", machine->firmware);
+            exit(1);
+        }
+        memcpy(memory_region_get_ram_ptr(flash), buf, len);
+        g_free(buf);
         g_free(fn);
     }
     /* InitLocale late-bound pools ship marker 0xffff54e9 (config loader
@@ -429,6 +465,11 @@ static void mmcs_init(MachineState *machine)
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
 
+
+    {
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dllfix_sweep, NULL);
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+    }
 
     /* optional deterministic RAM dump after MMCS_DUMP seconds */
     {
