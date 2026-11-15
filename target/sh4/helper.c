@@ -93,6 +93,24 @@ void superh_cpu_do_interrupt(CPUState *cs)
                 "r6=%08x r7=%08x\n", cs->exception_index, env->pc,
                 env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7]);
     }
+    /* MMCS fork: APIFIX — calls to unmapped 0xFFFFxxxx API slots (the
+     * 0xfffffbed class = syscall-to-unmapped-slot) crash forever on real
+     * fetch faults. Synthesize r0=0 (success/NULL) and RET to the caller,
+     * like the REGFIX pattern but at the syscall boundary. */
+    if (getenv("MMCS_APIFIX") && do_exp
+        && env->pc >= 0xffff0000 && env->pc < 0xffff8000
+        && cs->exception_index == 0x0e0) {
+        /* WinCE syscall convention: the caller did a `jsr @slot` — the
+         * slot address IS the syscall entry. Returning = set r0 and
+         * RET via the saved PR in the caller's stack frame. But the
+         * SH4 exception already saved SPC/SSR; the simplest correct
+         * "return" = restore SPC/SSR (undo the trap) and set r0. */
+        env->gregs[0] = 0;              /* return value: success/NULL */
+        env->pc = env->spc;             /* saved PC (post-jsr) */
+        env->sr = env->ssr;             /* saved SR */
+        cs->exception_index = -1;
+        return;
+    }
     /* MMCS fork: REGFIX trapa hook — synthesize RegQueryValueExW success
      * for the boot-registry bootstrap (the fdf circular-read break). */
     if (cs->exception_index == 0x160 &&

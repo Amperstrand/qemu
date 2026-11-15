@@ -386,7 +386,7 @@ static void mmcs_vintc_pulse(void *opaque)
     static int level;
     level = !level;
     qemu_set_irq(mmcs_vintc_irl, level & 15);
-    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_pulse, NULL);
+    QEMUTimer *t __attribute__((unused)) = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_pulse, NULL);
     /* first pulse waits for the polled boot to settle (early IRQ derails
      * kernel init before filesys launches; verified 10ms+1000ms both die) */
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
