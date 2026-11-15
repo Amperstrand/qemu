@@ -396,6 +396,86 @@ ilk_no_emu:;
         return;                     /* re-execute the store */
     }
 cow_done:;
+
+    /* MMCS fork: MMCS_FILEVIEW (L7) — back the launched servers' user
+     * heap-arena write misses below 0x40000000.
+     *
+     * Decoded 2026-11-16 (launch lane, third pass): the per-launch
+     * death sequence is NOT the 0xC8001000 reads (those are normal
+     * kernel demand-paging — the kernel miss handler @0x90822de6
+     * refills the SystemHeap window from real phys 0x08684000 /
+     * 0x08a96000, proven by MMCS_UTLBLOG; do NOT intercept). The
+     * actual killer, per -d int block-walk before every
+     * RaiseException(0xC0000005) (x3025/boot): the coredll heap-grow
+     * fn @0x40024d4c takes a USER write-MISS (excp 0x060) at
+     * tea=0x18NN0036 — a user heap arena BELOW COWFIX's 0x40000000
+     * floor (0x183f0000.. incrementing +0x20000 per relaunch =
+     * 128KB leaked block per dead launch). Kernel servicing
+     * (pc=0x90807382 x2) cannot page it in (the same broken pager
+     * holes), so the write propagates as 0xC0000005 -> launch dies
+     * -> relaunch. Fix: extend COWFIX shape (a) to tea >= 0x00800000
+     * (above LOWSLOT, below 0x40000000), backed by the dedicated
+     * "mmcs.fileview" RAM region at phys 0x20000000 (env MMCS_FILEVIEW
+     * creates it in mmcs.c; 64MB = ~512 launches of leaked blocks —
+     * enough for the driver-init phase to complete). VA-deduped like
+     * the original COWFIX; exhaustion falls through to the old
+     * behavior with a log line.
+     *
+     * Second shape (same pass): KERNEL-mode write-miss of the
+     * 0xD0600000-0xDC000000 stack arena — the per-launch kernel-
+     * thread stacks (tea=0xDBxxEF30-class descending 0x10000 per
+     * relaunch, then 0xDAxx/0xD1xx after the first window was
+     * covered, REPEATED faults at the same address = the kernel
+     * retry-fails writing its own exception frame -> thread kill
+     * 0xC0000005). The kernel never installs entries for these
+     * (MMCS_UTLBLOG: no stack-arena installs); same scratch
+     * treatment. */
+    if (env->mmcs_cowfix_active && getenv("MMCS_FILEVIEW")
+        && (cs->exception_index == 0x060
+            || cs->exception_index == 0x0c0)
+        && (((env->sr & (1u << SR_MD)) == 0
+             && env->tea >= 0x00800000 && env->tea < 0x40000000)
+            || ((env->sr & (1u << SR_MD)) != 0
+                && env->tea >= 0xD0600000 && env->tea < 0xDC000000))) {
+        uint32_t va = env->tea & ~0xFFFu;
+        static struct { uint32_t va, pa; } fvmap[16384];
+        static int nfvmap;
+        static uint32_t fv_next = 0x20000000;
+        uint32_t pa = 0;
+        for (int i = 0; i < nfvmap; i++) {
+            if (fvmap[i].va == va) {
+                pa = fvmap[i].pa;
+                break;
+            }
+        }
+        if (!pa) {
+            if (fv_next + 0x1000 <= 0x24000000 && nfvmap < 16384) {
+                pa = fv_next;
+                fv_next += 0x1000;
+                fvmap[nfvmap].va = va;
+                fvmap[nfvmap].pa = pa;
+                nfvmap++;
+            } else {
+                fprintf(stderr, "MMCS: FILEVIEW scratch exhausted "
+                        "(%d pages)\n", nfvmap);
+                goto fileview_done;
+            }
+        }
+        /* install a guest UTLB entry via the ldtlb path (COWFIX miss
+         * branch pattern) so kernel-mode servicing of the same VA
+         * resolves too. */
+        env->pteh = (va & PTEH_VPN_MASK) | (env->pteh & PTEH_ASID_MASK);
+        env->ptel = ((pa >> 10) << 10)      /* PPN */
+                    | (3 << 5)              /* PR = RW */
+                    | PTEL_V | PTEL_SZ_LOW  /* 4K */
+                    | PTEL_C | PTEL_D | PTEL_SH;
+        cpu_load_tlb(env);
+        increment_urc(env);
+        cs->exception_index = -1;
+        return;                     /* re-execute the store */
+    }
+fileview_done:;
+
     /* MMCS fork: APIFIX — calls to unmapped 0xFFFFxxxx API slots (the
      * 0xfffffbed class = syscall-to-unmapped-slot) crash forever on real
      * fetch faults. Synthesize r0=0 (success/NULL) and RET to the caller,
@@ -896,6 +976,25 @@ void cpu_load_tlb(CPUSH4State * env)
     CPUState *cs = env_cpu(env);
     int n = cpu_mmucr_urc(env->mmucr);
     tlb_t * entry = &env->utlb[n];
+
+    /* MMCS fork: MMCS_UTLBLOG — log guest UTLB installs in the
+     * 0xC8000000 SystemHeap window (L7: which phys does the kernel
+     * give the heap pages, and when). */
+    if (getenv("MMCS_UTLBLOG")
+        && (env->pteh & PTEH_VPN_MASK) >= 0xC8000000
+        && (env->pteh & PTEH_VPN_MASK) < 0xC9000000
+        && (env->ptel & PTEL_V)) {
+        static int nlog;
+        if (nlog++ < 100) {
+            fprintf(stderr, "UTLBINSTALL va=%08x pa=%08x pr=%d sh=%d "
+                    "sz=%d pc=%08x\n",
+                    (env->pteh & PTEH_VPN_MASK) & ~0x3FF,
+                    (env->ptel & 0x1FFFFC00) << 0,
+                    (env->ptel >> 5) & 3, (env->ptel >> 1) & 1,
+                    1 << (7 + 2 * ((env->ptel >> 7) & 3)),
+                    env->pc);
+        }
+    }
 
     if (entry->v) {
         /* Overwriting valid entry in utlb. */

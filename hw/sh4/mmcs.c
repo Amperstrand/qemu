@@ -521,6 +521,21 @@ static void mmcs_init(MachineState *machine)
         }
     }
 
+    /* MMCS_FILEVIEW: scratch RAM (64 MB) at phys 0x20000000 backing the
+     * launched servers' user heap-arena write misses below 0x40000000
+     * (the 0x18NN0036-class per-launch coredll heap-grow faults — see
+     * the do_interrupt hook in target/sh4/helper.c). Outside every unit
+     * window, inside the SH4 PPN range; demand-zero per 4K page,
+     * VA-deduped. */
+    if (getenv("MMCS_FILEVIEW")) {
+        MemoryRegion *fv = g_new(MemoryRegion, 1);
+        memory_region_init_ram(fv, NULL, "mmcs.fileview", 64 * MiB,
+                               &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0x20000000, fv);
+        fprintf(stderr, "MMCS: FILEVIEW scratch RAM at phys 0x20000000 "
+                "(64 MB)\n");
+    }
+
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —
      * map the loader RAM image, our payload, and the test stub at phys 0.
      * MMCS_PAYLOAD = container file (mapped at phys 0x0A000000),
