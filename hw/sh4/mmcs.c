@@ -140,6 +140,32 @@ static const MemoryRegionOps mmcs_files_ops = {
     .valid.min_access_size = 1, .valid.max_access_size = 4,
 };
 
+/* ---- Framebuffer console (MMCS_FBCON=1): live screen via QEMU display ---- */
+#include "ui/console.h"
+static QemuConsole *mmcs_con;
+
+static void mmcs_fbcon_refresh(void *opaque)
+{
+    if (mmcs_con) {
+        dpy_gfx_update_full(mmcs_con);
+    }
+}
+
+static const GraphicHwOps mmcs_fbcon_ops = {
+    .gfx_update = mmcs_fbcon_refresh,
+};
+
+static void mmcs_fbcon_init(MemoryRegion *sdram_mr)
+{
+    mmcs_con = graphic_console_init(NULL, 0, &mmcs_fbcon_ops, NULL);
+    uint8_t *fb = memory_region_get_ram_ptr(sdram_mr)
+                  + (0x08B00000 - MMCS_SDRAM_BASE);
+    DisplaySurface *s = qemu_create_displaysurface_from(
+        800, 480, PIXMAN_r5g6b5, 800 * 2, fb);
+    dpy_gfx_replace_surface(mmcs_con, s);
+    fprintf(stderr, "MMCS: framebuffer console live (800x480 RGB565)\n");
+}
+
 static int mmcs_fb_only_rearm = 0;  /* set by self-rearm: skip RAM sweep */
 
 static void mmcs_dump_ram(void *opaque)
@@ -361,8 +387,10 @@ static void mmcs_vintc_pulse(void *opaque)
     level = !level;
     qemu_set_irq(mmcs_vintc_irl, level & 15);
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_pulse, NULL);
+    /* first pulse waits for the polled boot to settle (early IRQ derails
+     * kernel init before filesys launches; verified 10ms+1000ms both die) */
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
-              + atoi(getenv("MMCS_VINTC_IRQ") ? : "10"));
+              + atoi(getenv("MMCS_VINTC_DELAY") ? : "15000"));
 }
 static uint64_t mmcs_vintc_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -404,6 +432,9 @@ static void mmcs_init(MachineState *machine)
     memory_region_init_ram(sdram, NULL, "mmcs.sdram", MMCS_SDRAM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), MMCS_SDRAM_BASE, sdram);
+    if (getenv("MMCS_FBCON")) {
+        mmcs_fbcon_init(sdram);
+    }
 
     /* second RAM window: the kernel probes phys 0x04000000-0x047FFFFF during
      * RAM discovery (write/read test at 0x47FFFF8 seen in boot traces) */
@@ -621,7 +652,10 @@ static void mmcs_init(MachineState *machine)
                 mmcs_vintc_evt_code = strtoul(evt, NULL, 16);
                 QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                             mmcs_vintc_evt_deliver, NULL);
-                timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1500);
+                /* first delivery must wait for the polled boot to settle
+                 * (early injection derails kernel init; MMCS_VINTC_EVT_DELAY) */
+                timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                          + atoi(getenv("MMCS_VINTC_EVT_DELAY") ? : "12000"));
                 fprintf(stderr, "MMCS: vendor-INTC EVT injection %08x every %sms\n",
                         mmcs_vintc_evt_code,
                         getenv("MMCS_VINTC_EVT_MS") ? : "20");
