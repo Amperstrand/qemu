@@ -27,6 +27,7 @@
 #include "hw/boards.h"
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
+#include "hw/usb.h"
 #include "hw/loader.h"
 #include "exec/address-spaces.h"
 #include "hw/char/serial.h"
@@ -426,6 +427,46 @@ static const MemoryRegionOps mmcs_vintc_ops = {
 
 
 
+/* USB OHCI at the SH7777's on-chip base (S70 register map, env-gated
+ * via MMCS_USB for A/B testing). qemu's stock sysbus-ohci model provides
+ * real OHCI register semantics for MLSIDK USB driver development. Called
+ * from BOTH boot paths (full OS boot and MMCS_MLD payload mode). */
+static void mmcs_usb_setup(void)
+{
+    if (!getenv("MMCS_USB")) {
+        return;
+    }
+    DeviceState *ohci = qdev_new("sysbus-ohci");
+    qdev_prop_set_uint32(ohci, "num-ports", 2);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ohci), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(ohci), 0, 0xFFE70400);
+    /* IRQ: the SH7777 OHCI sysintr 53-class mapping is Unknown; route to a
+     * sink IRQ for now (polling driver, no guest IRQ needed yet). */
+    qemu_irq ohci_irq = qemu_allocate_irq(
+        (void (*)(void *, int, int))qemu_set_irq, NULL, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(ohci), 0, ohci_irq);
+    fprintf(stderr, "MMCS: USB OHCI at 0xFFE70400 (env-gated)\n");
+
+    /* Optional attached device for enumeration testing: the OHCI's USB bus
+     * is created here (machine init), too late for -device CLI resolution,
+     * so attach programmatically. MMCS_USB_DEV names the guest-visible USB
+     * device (default: usb-storage). */
+    const char *usb_dev = getenv("MMCS_USB_DEV");
+    if (!usb_dev) {
+        usb_dev = "usb-kbd";   /* self-contained HID: no drive/net backend */
+    }
+    /* the OHCI's USB bus is a child bus of the controller device (the
+     * controller itself is NOT a USBDevice — do not USB_DEVICE() cast it) */
+    BusState *usb_bus = qdev_get_child_bus(ohci, "usb-bus");
+    if (!usb_bus) {
+        /* fall back to the first child bus if unnamed */
+        usb_bus = QLIST_FIRST(&ohci->child_bus);
+    }
+    assert(usb_bus);
+    usb_create_simple((USBBus *)usb_bus, usb_dev);
+    fprintf(stderr, "MMCS: USB device '%s' attached to port 1\n", usb_dev);
+}
+
 static void mmcs_init(MachineState *machine)
 {
     SuperHCPU *cpu;
@@ -511,6 +552,7 @@ static void mmcs_init(MachineState *machine)
                 timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + atoi(ds) * 1000);
             }
         }
+        mmcs_usb_setup();
         return;
     }
 
@@ -716,8 +758,12 @@ static void mmcs_init(MachineState *machine)
         sysbus_mmio_map(sb, 0, 0xffe40000);
     }
 
-    /* census regions as logged stubs */
+    /* census regions as logged stubs (skip the 0xFFE70000 cpg stub when
+     * MMCS_USB is active so it cannot shadow the OHCI at 0xFFE70400) */
     for (unsigned i = 0; i < ARRAY_SIZE(mmcs_unimpl); i++) {
+        if (getenv("MMCS_USB") && mmcs_unimpl[i].base == 0xFFE70000) {
+            continue;
+        }
         create_unimplemented_device(mmcs_unimpl[i].name,
                                     mmcs_unimpl[i].base, 0x10000);
     }
@@ -763,21 +809,7 @@ static void mmcs_init(MachineState *machine)
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
 
-    /* USB OHCI at the SH7777's on-chip base (S70 register map, env-gated
-     * for A/B testing). qemu's stock sysbus-ohci model provides the real
-     * OHCI register semantics for MLSIDK USB driver development. */
-    if (getenv("MMCS_USB")) {
-        DeviceState *ohci = qdev_new("sysbus-ohci");
-        qdev_prop_set_uint32(ohci, "num-ports", 2);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(ohci), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(ohci), 0, 0xFFE70400);
-        /* IRQ: connect to the sh7750 INTC IRQ 34 (the SH7777 OHCI sysintr
-         * 53-class mapping is Unknown; use a qemu IRQ for now) */
-        qemu_irq ohci_irq = qemu_allocate_irq(
-            (void (*)(void *, int, int))qemu_set_irq, NULL, 0);
-        sysbus_connect_irq(SYS_BUS_DEVICE(ohci), 0, ohci_irq);
-        fprintf(stderr, "MMCS: USB OHCI at 0xFFE70400 (env-gated)\n");
-    }
+    mmcs_usb_setup();
 
     /* MMCS_LOWSLOT=1: rts-filled low page (phys 0x4000-0x8000). Runtime-
      * composed init-stage pointers sometimes point at unbound low-page
