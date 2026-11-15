@@ -685,6 +685,12 @@ static void mmcs_init(MachineState *machine)
              * (helper.c: fault at 0x908083fc). */
             cpu->env.mmcs_kapifix_active = 1;
         }
+        if (getenv("MMCS_COWFIX")) {
+            /* Arm the COWFIX fork-side COW for user .data write
+             * violations (helper.c: excp 0x060 -> private scratch page,
+             * UTLB rewire, re-execute). */
+            cpu->env.mmcs_cowfix_active = 1;
+        }
         if (getenv("MMCS_LOCALEFIX")) {
             uint32_t safe = 0x90809f3c;   /* kernel rts stub (S65-verified) */
             hwaddr slot_pa = 0x108F7B04; /* flash base + (0x908F7B04-0x90800000) */

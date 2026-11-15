@@ -54,6 +54,12 @@ int cpu_sh4_is_cached(CPUSH4State *env, target_ulong addr)
 
 #else /* !CONFIG_USER_ONLY */
 
+/* MMCS fork: file-scope prototype — the COWFIX hook in
+ * superh_cpu_do_interrupt calls this before its definition. */
+static int find_utlb_entry(CPUSH4State *env, target_ulong address,
+                           int use_asid);
+static void increment_urc(CPUSH4State *env);
+
 void superh_cpu_do_interrupt(CPUState *cs)
 {
     SuperHCPU *cpu = SUPERH_CPU(cs);
@@ -90,9 +96,306 @@ void superh_cpu_do_interrupt(CPUState *cs)
         && (env->pc & 1 || env->pc >= 0xffff0000)) {
         /* flycast wince.h pattern: CE syscalls = odd/hi fetch exceptions */
         fprintf(stderr, "SYSCALL exp=%03x pc=%08x r4=%08x r5=%08x "
-                "r6=%08x r7=%08x\n", cs->exception_index, env->pc,
-                env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7]);
+                "r6=%08x r7=%08x pr=%08x\n", cs->exception_index, env->pc,
+                env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7],
+                env->pr);
+        /* MMCS_SYSTRACE_PR=<hex>[,<hex>...]: when pr matches, dump the
+         * caller stack frame — decodes who calls through the coredll
+         * wrapper identified by pr. MMCS_SYSTRACE_MEM=a,b,c: also dump
+         * 12 words at each VA at the same hit. */
+        const char *pw = getenv("MMCS_SYSTRACE_PR");
+        if (pw) {
+            char buf[256];
+            snprintf(buf, sizeof buf, "%08x", env->pr);
+            size_t hl = strlen(buf);
+            for (const char *p = pw; p && *p; ) {
+                if (strncmp(p, buf, hl) == 0
+                    && (p[hl] == ',' || p[hl] == '\0')) {
+                    fprintf(stderr, "PRWATCH pr=%08x r15=%08x frame:",
+                            env->pr, env->gregs[15]);
+                    for (int i = 0; i < 24; i++) {
+                        uint32_t w = 0;
+                        cpu_memory_rw_debug(cs, env->gregs[15] + 4 * i,
+                                             (void *)&w, 4, 0);
+                        fprintf(stderr, " %08x", w);
+                    }
+                    const char *mw = getenv("MMCS_SYSTRACE_MEM");
+                    if (mw) {
+                        char mb[512];
+                        snprintf(mb, sizeof mb, "%s", mw);
+                        for (char *tok = strtok(mb, ","); tok;
+                             tok = strtok(NULL, ",")) {
+                            uint32_t a = strtoul(tok, NULL, 16);
+                            fprintf(stderr, "\nMEM %08x:", a);
+                            for (int i = 0; i < 12; i++) {
+                                uint32_t w = 0;
+                                cpu_memory_rw_debug(cs, a + 4 * i,
+                                                     (void *)&w, 4, 0);
+                                fprintf(stderr, " %08x", w);
+                            }
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                    break;
+                }
+                p = strchr(p, ',');
+                if (p) p++;
+            }
+        }
     }
+    /* MMCS fork: MMCS_KAPIFIX — kernel-side API thunk faults. The OEM
+     * thunk @0x908083f8 (callers 0x90807674 / 0x90807720, the per-IRQ
+     * source init walkers) resolves its API set via *(0x88602bec); in
+     * our boot the slot still holds the RAW handle 0x100 (the bind
+     * stage never ran), so `mov.l @(40,r2),r3` faults (tea=0x128).
+     * Late-binding the table is NOT safe (the kernel resets it and the
+     * thunk then jmps to a stale/NULL method -> pc=0 storm, observed
+     * 2026-11-15). The callers ignore the return value and proceed
+     * with their per-source register writes, so synthesize a failed
+     * API call: r0=0, resume at PR (the thunk jmps, so PR = the
+     * caller's post-jsr site). Same treatment for kernel-mode fetch
+     * faults at pc=0 (NULL method from a reset table). */
+    if (env->mmcs_kapifix_active
+        && (cs->exception_index == 0x040 || cs->exception_index == 0x060)
+        && (env->pc == 0x908083fc || env->pc == 0x00000000)) {
+        env->gregs[0] = 0;
+        env->pc = env->pr;
+        cs->exception_index = -1;
+        return;
+    }
+    /* KAPIFIX part 3: the per-IRQ-source config fn (entry 0x9080765c,
+     * 7-reg frame) faults reading its source's register block when
+     * *(desc+84) is NULL (loader-data hole: the runtime descriptor
+     * tables at 0x886028xx are incompletely populated in our boot).
+     * Synthesize the full function return (r0=0 = source skipped) so
+     * the walk advances — the same recovery the pre-ILKFIX boot got
+     * for free when the CAS faults aborted the walk early. */
+    if (env->mmcs_kapifix_active && cs->exception_index == 0x040
+        && env->pc == 0x9080772c && env->tea == 0) {
+        uint32_t w[7];
+        cpu_memory_rw_debug(cs, env->gregs[15] + 20, (void *)w, 28, 0);
+        env->pr = w[0];
+        env->gregs[13] = w[1];
+        env->gregs[12] = w[2];
+        env->gregs[11] = w[3];
+        env->gregs[10] = w[4];
+        env->gregs[9] = w[5];
+        env->gregs[8] = w[6];
+        env->gregs[15] += 20 + 28;
+        env->gregs[0] = 0;
+        env->pc = env->pr;
+        cs->exception_index = -1;
+        return;
+    }
+    /* MMCS fork: MMCS_RINGFIX — the uHAL exception ring write
+     * (kernel FUN_9080755c @0x9080755c, called by the exception
+     * formatter FUN_90807364 via the handle slot @0x88602d30) faults
+     * at its first deref `mov.l @(12,r2),r7` (pc 0x908075a2) because
+     * the ring sub-state (*param_1) is NULL/garbage — the uHAL ring
+     * second-stage init never ran in our boot (loader-data gated).
+     * Every kernel exception then storms fault-logging itself
+     * (5.2M faults/boot census 2026-11-15). Synthesize the function
+     * return (r0=1 write-dropped): pop the r8/r9 pair pushed at entry
+     * and return to PR, so the kernel exception handler completes. */
+    if (env->mmcs_ringfix_active && cs->exception_index == 0x040
+        && env->pc == 0x908075a2) {
+        uint32_t rv[2];
+        cpu_memory_rw_debug(cs, env->gregs[15], (void *)rv, 8, 0);
+        env->gregs[9] = rv[0];
+        env->gregs[8] = rv[1];
+        env->gregs[15] += 8;
+        env->gregs[0] = 1;              /* epilogue returns r8 -> 1 */
+        env->pc = env->pr;
+        cs->exception_index = -1;
+        return;
+    }
+    /* MMCS fork: ILKFIX emulation half — interlocked ops whose KData
+     * slots hold live vendor data (see tlb_fill MMCS_ILKFIX) execute as
+     * exceptions instead (exp 0x180 illegal on the data bytes, or 0x040/
+     * 0x0e0 if the page is otherwise unmapped). Emulate the stock
+     * shexcept.src semantics and return to PR (the intrlock.src wrappers
+     * jmp @r0 so PR = the original caller; the Decrement wrapper jsr's
+     * and lands back in its own "jmp @r3; add #-1,r0" tail naturally).
+     *
+     * USER-mode: all blocks. KERNEL-mode: all blocks, but ARMED only
+     * after the first user-mode interlocked fault (user_seen latch) —
+     * that latch flips when the first launched user process runs its
+     * coredll, i.e. strictly AFTER the kernel's early IRQ-init walk
+     * (whose loader-data holes must stay hidden behind abort-early).
+     * The kernel then needs the ops for the pager's COW copy of
+     * compressed .data sections (coredll 0x40074000-page): without
+     * them the copy aborts, the launched server maps the shared ROM
+     * page read-only, and its first heap write takes a write violation
+     * (excp 0x060 at 0x4002cdce -> 0x400746e8 x6066/boot = the
+     * 0xC0000005 kill). The kernel DATA-page map stays user-only. */
+    if (env->mmcs_ilkfix_active
+        && (cs->exception_index == 0x180
+            || cs->exception_index == 0x040
+            || cs->exception_index == 0x0e0)
+        && (env->pc & ~7u) >= 0x5B80 && (env->pc & ~7u) <= 0x5BF0) {
+        static bool user_seen;
+        bool kern = (env->sr & (1u << SR_MD)) != 0;
+        if (!kern) {
+            user_seen = true;
+        } else if (!user_seen) {
+            /* fall through to normal kernel exception handling */
+            goto ilk_no_emu;
+        }
+        uint32_t blk = env->pc & ~7u, old = 0;
+        switch (blk) {
+        case 0x5B80: {                    /* ILMaskByte(r4, and, or) */
+            uint8_t v;
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&v, 1, 0);
+            old = (int8_t)v;
+            v = (v & (uint8_t)env->gregs[5]) | (uint8_t)env->gregs[6];
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&v, 1, 1);
+            break;
+        }
+        case 0x5B90:                      /* ILPopList(r4) */
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&old, 4, 0);
+            if (old) {
+                uint32_t next;
+                cpu_memory_rw_debug(cs, old, (void *)&next, 4, 0);
+                cpu_memory_rw_debug(cs, env->gregs[4], (void *)&next, 4, 1);
+            }
+            break;
+        case 0x5BB0: {                    /* ILPushList(r4 list, r5 item) */
+            uint32_t head;
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&head, 4, 0);
+            cpu_memory_rw_debug(cs, env->gregs[5], (void *)&head, 4, 1);
+            cpu_memory_rw_debug(cs, env->gregs[4],
+                                (void *)&env->gregs[5], 4, 1);
+            old = head;
+            break;
+        }
+        case 0x5BC0:                      /* ILExchange(r4, r5) */
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&old, 4, 0);
+            cpu_memory_rw_debug(cs, env->gregs[4],
+                                (void *)&env->gregs[5], 4, 1);
+            break;
+        case 0x5BD0:                      /* ILCmpExchange(r4,r5,r6) */
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&old, 4, 0);
+            if (old == env->gregs[6]) {
+                cpu_memory_rw_debug(cs, env->gregs[4],
+                                    (void *)&env->gregs[5], 4, 1);
+            }
+            break;
+        case 0x5BE0:                      /* ILIncrement(r4) */
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&old, 4, 0);
+            old = old + 1;
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&old, 4, 1);
+            break;
+        case 0x5BF0: {                    /* ILXAdd(r4, r5) */
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&old, 4, 0);
+            uint32_t nv = old + env->gregs[5];
+            cpu_memory_rw_debug(cs, env->gregs[4], (void *)&nv, 4, 1);
+            break;
+        }
+        }
+        env->gregs[0] = old;
+        env->pc = env->pr;
+        cs->exception_index = -1;
+        return;
+    }
+ilk_no_emu:;
+    /* MMCS fork: MMCS_COWFIX — fork-side copy-on-write for user .data.
+     *
+     * Decoded 2026-11-15 (driver-init lane): the launched PSL servers
+     * die because their coredll .data page (VA 0x40074000-class) never
+     * gets a demand page-in from the kernel pager (the compressed-
+     * section private-copy path silently fails in our boot): kernel-
+     * mode reads of 0x4007xxxx miss (excp 0x040, pc c0035c10) and the
+     * user heap-arena write (0x4002cdce -> 0x400746e8) takes a write
+     * MISS (excp 0x060, x6066/boot) which propagates as 0xC0000005 ->
+     * TerminateProcess x3033 -> device.exe/BuiltIn/sdhi.dll never
+     * load. On a user-mode write miss/violation inside
+     * [0x40000000,0x80000000): map a private scratch RAM page (the 1MB
+     * SDRAM margin above the ROMHDR top: phys 0x10710000..0x10800000),
+     * best-effort copy the current page content (zero if unreadable —
+     * the PSL bind retry loop re-creates its descriptors), rewire the
+     * UTLB entry (pr=3, d=1) and re-execute the store. VA-deduped: a
+     * re-fault re-points to the SAME scratch page (previous writes
+     * preserved; NO re-copy). */
+    /* Two gated shapes (env MMCS_COWFIX):
+     *  (a) USER-mode write miss/violation, tea in [0x40000000,0x80000000)
+     *      — the launched server's heap-arena writes;
+     *  (b) KERNEL-mode read miss, tea in the coredll .data span
+     *      [0x40074000,0x40078000) — the api0 servicing reads that
+     *      would otherwise abort the PSL bind (x2/launch). */
+    if (env->mmcs_cowfix_active
+        && (((env->sr & (1u << SR_MD)) == 0
+             && (cs->exception_index == 0x060
+                 || cs->exception_index == 0x0c0)
+             && env->tea >= 0x40000000 && env->tea < 0x80000000)
+            || ((env->sr & (1u << SR_MD)) != 0
+                && cs->exception_index == 0x040
+                && env->tea >= 0x40074000 && env->tea < 0x40080000))) {
+        uint32_t va = env->tea & ~0xFFFu;
+        int n = find_utlb_entry(env, va,
+                                !(env->mmucr & MMUCR_SV)
+                                || !(env->sr & (1u << SR_MD)));
+        tlb_t *e = (n >= 0) ? &env->utlb[n] : NULL;
+        uint32_t mask = e ? (e->size - 1) : 0xFFF;
+        uint32_t base = va & ~mask;
+        /* dedup table + bump allocator over the scratch margin */
+        static struct { uint32_t va, pa; } map[512];
+        static int nmap;
+        uint32_t pa = 0;
+        bool reused = false;
+        for (int i = 0; i < nmap; i++) {
+            if (map[i].va == base) {
+                pa = map[i].pa;
+                reused = true;
+                break;
+            }
+        }
+        if (!reused) {
+            static uint32_t next = 0x10710000;
+            if (next + mask + 1 <= 0x10800000 && nmap < 512) {
+                pa = next;
+                next += mask + 1;
+                map[nmap].va = base;
+                map[nmap].pa = pa;
+                nmap++;
+            } else {
+                fprintf(stderr, "MMCS: COWFIX scratch exhausted\n");
+                goto cow_done;
+            }
+        }
+        if (!reused) {
+            static uint8_t pg[0x10000] __attribute__((aligned(8)));
+            uint32_t sz = mask + 1;
+            if (sz > sizeof pg) {
+                sz = sizeof pg;
+            }
+            memset(pg, 0, sz);
+            cpu_memory_rw_debug(cs, base, pg, sz, 0);  /* best-effort */
+            cpu_physical_memory_write(pa, pg, sz);
+        }
+        if (e) {
+            /* rewire the existing guest UTLB entry */
+            e->ppn = (pa & ~mask) >> 10;
+            e->pr = 3;              /* user+kernel RW */
+            e->d = 1;
+            e->v = 1;
+            tlb_flush(env_cpu(env));
+        } else {
+            /* write MISS: no guest entry — install one via the ldtlb
+             * path (PTEH/PTEL -> UTLB[urc]) so kernel-mode servicing
+             * reads of the same VA also resolve; shared + RW. */
+            env->pteh = (base & PTEH_VPN_MASK)
+                        | (env->pteh & PTEH_ASID_MASK);
+            env->ptel = ((pa >> 10) << 10)      /* PPN */
+                        | (3 << 5)              /* PR = RW */
+                        | PTEL_V | PTEL_SZ_LOW  /* 4K */
+                        | PTEL_C | PTEL_D | PTEL_SH;
+            cpu_load_tlb(env);
+            increment_urc(env);
+        }
+        cs->exception_index = -1;
+        return;                     /* re-execute the store */
+    }
+cow_done:;
     /* MMCS fork: APIFIX — calls to unmapped 0xFFFFxxxx API slots (the
      * 0xfffffbed class = syscall-to-unmapped-slot) crash forever on real
      * fetch faults. Synthesize r0=0 (success/NULL) and RET to the caller,
@@ -197,6 +500,44 @@ void superh_cpu_do_interrupt(CPUState *cs)
             cs->exception_index == 0x0a0) {
             fprintf(stderr, "SH4-MMU: excp=%03x pc=%08x tea=%08x pteh=%08x\n",
                     cs->exception_index, env->pc, env->tea, env->pteh);
+            /* MMCS_FAULTPC=<hex>[,<hex>...]: at a fault whose PC matches,
+             * dump the full register set + 16 stack words (the faulting
+             * context BEFORE kernel dispatch — unlike a monitor 'stop'
+             * which lands in the exception handler). */
+            const char *fpw = getenv("MMCS_FAULTPC");
+            if (fpw) {
+                char buf[256];
+                snprintf(buf, sizeof buf, "%08x", env->pc);
+                size_t hl = strlen(buf);
+                for (const char *p = fpw; p && *p; ) {
+                    if (strncmp(p, buf, hl) == 0
+                        && (p[hl] == ',' || p[hl] == '\0')) {
+                        fprintf(stderr, "FAULTCTX pc=%08x tea=%08x pr=%08x "
+                                "spc=%08x r0=%08x r1=%08x r2=%08x r3=%08x "
+                                "r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x "
+                                "r9=%08x r10=%08x r11=%08x r12=%08x "
+                                "r13=%08x r14=%08x r15=%08x\n",
+                                env->pc, env->tea, env->pr, env->spc,
+                                env->gregs[0], env->gregs[1], env->gregs[2],
+                                env->gregs[3], env->gregs[4], env->gregs[5],
+                                env->gregs[6], env->gregs[7], env->gregs[8],
+                                env->gregs[9], env->gregs[10], env->gregs[11],
+                                env->gregs[12], env->gregs[13], env->gregs[14],
+                                env->gregs[15]);
+                        fprintf(stderr, "STACK:");
+                        for (int i = 0; i < 16; i++) {
+                            uint32_t w = 0;
+                            cpu_memory_rw_debug(cs, env->gregs[15] + 4 * i,
+                                                 (void *)&w, 4, 0);
+                            fprintf(stderr, " %08x", w);
+                        }
+                        fprintf(stderr, "\n");
+                        break;
+                    }
+                    p = strchr(p, ',');
+                    if (p) p++;
+                }
+            }
         }
         switch (cs->exception_index) {
         case 0x0e0:
@@ -915,6 +1256,105 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     ret = get_physical_address(env, &physical, &prot, address, access_type);
 
+    /* MMCS fork: MMCS_ILKFIX — the WinCE5 SH4 KData user page (VA 0x5800).
+     *
+     * Decoded 2026-11-15 (driver-init lane): stock mdsh3.c MDInitialize
+     * memcpy's the _InterlockedAPIs block (shexcept.src, 0x80 bytes at
+     * KData+0x380) so user+kernel code can jsr into VA 0x5B80-0x5C00
+     * (intrlock.src wrappers: InterlockedExchange 0x5BC0, CompareExchange
+     * 0x5BD0, Increment 0x5BE0, ExchangeAdd/Decrement 0x5BF0, PopList
+     * 0x5B90...). Our kernel never stocks that block and never ldtlb's
+     * the page (S112/S117), so every interlocked call fetch-faults
+     * (census 2026-11-15: pc=0x5bd0 x17.8K, 0x5b90 x5.8K, 0x5bf0 x2.9K,
+     * KData hdr data faults at 0x5808/0x580c x7.9K), every PSL-server
+     * launch dies 0xC0000005 in coredll heap init (TerminateProcess x3033
+     * = the relaunch loop), device.exe/BuiltIn/sdhi.dll never load and
+     * IISR chain[23]/[24] stay NULL.
+     *
+     * Fix: on first fault of VA page 0x5800, seed the stock-semantics
+     * interlocked routines (assembled from shexcept.src with
+     * sh4-linux-gnu-as, offsets cross-checked vs intrlock.src targets)
+     * into the LIVE KData phys page 0x0C020800 (header verified live by
+     * monitor dump: lpvTls/ahSys pointers), then map the surrounding 4K
+     * guest page (qemu sh4 granularity) VA 0x5000 -> phys 0x0C020000 so
+     * VA 0x5800..0x5BFF aliases the live KData page. Only provably-zero
+     * blocks are seeded (read-before-write): live vendor runtime values
+     * at phys +0x3b8..+0x3d4 are left alone and their slots handled by
+     * the do_interrupt emulation half if ever fetched.
+     *
+     * Push vs pull (2026-11-15 A/B): kernel-mode interlocked
+     * successes send the kernel's early IRQ-init walk deep into
+     * loader-data holes (uHAL ring sub-state, kapi set slot,
+     * per-source descriptors @0x886028xx +84, scheduler lists) — a
+     * bottomless set this fork cannot fill. Pre-ILKFIX boots recovered
+     * from kernel-mode CAS faults by aborting those walks early and
+     * still reached the PSL launcher (the ~3033-relaunch loop). So the
+     * map+seed applies to USER-MODE faults ONLY (mmu_idx == 1): user
+     * processes (coredll DllMain PSL bind/heap init in the launched
+     * servers) get working interlocked ops; the kernel keeps the
+     * abort-early behavior.
+     */
+    if (ret != MMU_OK && ((uint32_t)address & 0xFFFFF000u) == 0x5000
+        && mmu_idx == MMU_USER_IDX
+        && getenv("MMCS_ILKFIX")) {
+        static const uint8_t blk_poplist[16] = {   /* +0x390 */
+            0x42, 0x60, 0x09, 0x00, 0x08, 0x20, 0x05, 0x8b,
+            0x00, 0x0b, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,
+        };
+        static const uint8_t blk_cas[16] = {       /* +0x3d0 */
+            0x42, 0x60, 0x00, 0x36, 0x8b, 0x00, 0x52, 0x24,
+            0x00, 0x0b, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,
+        };
+        static const uint8_t blk_inc[16] = {       /* +0x3e0 */
+            0x42, 0x60, 0x09, 0x00, 0x01, 0x70, 0x02, 0x24,
+            0x00, 0x0b, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,
+        };
+        static const uint8_t blk_xadd[16] = {      /* +0x3f0 */
+            0x42, 0x60, 0x53, 0x61, 0x0c, 0x31, 0x12, 0x24,
+            0x00, 0x0b, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,
+        };
+        static const uint8_t blk_maskbyte[16] = {  /* +0x380 */
+            0x40, 0x60, 0x59, 0x20, 0x6b, 0x20, 0x00, 0x24,
+            0x00, 0x0b, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,
+        };
+        static bool seeded;
+        if (!seeded) {
+            /* Read-before-write: only seed blocks that are still all
+             * zero. The vendor kernel keeps live runtime values in some
+             * of these slots (observed +0x3bc/+0x3c8/+0x3cc/+0x3d0 at
+             * stall); those slots are NOT seeded — their fetches are
+             * emulated in superh_cpu_do_interrupt instead. */
+            struct { uint32_t off; const uint8_t *b; } sb[] = {
+                { 0x00, blk_maskbyte }, { 0x10, blk_poplist },
+                { 0x50, blk_cas },     { 0x60, blk_inc },
+                { 0x70, blk_xadd },
+            };
+            for (unsigned i = 0; i < ARRAY_SIZE(sb); i++) {
+                uint8_t cur[16];
+                cpu_physical_memory_read(0x0C020B80 + sb[i].off, cur, 16);
+                bool zero = true;
+                for (int j = 0; j < 16; j++) {
+                    if (cur[j]) { zero = false; break; }
+                }
+                if (zero) {
+                    cpu_physical_memory_write(0x0C020B80 + sb[i].off,
+                                              sb[i].b, 16);
+                } else {
+                    fprintf(stderr, "MMCS: ILKFIX slot +%03x busy "
+                            "(live vendor data) - emulation only\n",
+                            sb[i].off);
+                }
+            }
+            seeded = true;
+            fprintf(stderr, "MMCS: ILKFIX seeded interlocked blocks "
+                    "@phys 0x0C020B80 (KData page)\n");
+        }
+        tlb_set_page(cs, 0x5000, 0x0C020000,
+                     PAGE_READ | PAGE_WRITE | PAGE_EXEC, mmu_idx,
+                     TARGET_PAGE_SIZE);
+        return true;
+    }
+
     /* MMCS fork: low-slot unbound-sentinel pages (VA 0x4000-0x7FFF, the
      * 0x5bd0-class init-stage targets, S82-S84). The kernel flushes
      * preloaded UTLB entries (MMUCR.TI) so ldtlb cannot survive; satisfy
@@ -934,6 +1374,46 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     if (ret == MMU_OK) {
         address &= TARGET_PAGE_MASK;
         physical &= TARGET_PAGE_MASK;
+        /* MMCS fork: MMCS_PSLFIX — force-complete coredll's PSL bind.
+         *
+         * Decoded 2026-11-15 (driver-init lane): each process's coredll
+         * binds the running PSL servers' API sets via the bind fn at
+         * coreddll VA 0x400181f0 (queries A/B/C/E = kernel api0-m17
+         * lookups returning set handles 0x00400103..0x00430103, D = the
+         * set-66 ready check via api2-m26). The E step (FUN_40024fc4 ->
+         * FUN_40024cf4 -> coredll heap grow -> kernel api0-m29 call at
+         * slot 0xfffffdc7, PR=0x40021336, hProc=0xc0000005) returns NULL
+         * in our boot: the kernel services it in the target-process
+         * context and that path takes an exception (k.coredll PDATA
+         * cluster 0xc0035bd4+) every time. The bind therefore never
+         * reaches its success tail, the "PSL APIs bound" latch
+         * *(0x400746d8) stays 0, the server-launch loop retries ~3033x,
+         * the launch thread dies -> device.exe/BuiltIn/sdhi.dll never
+         * load -> IISR chain[23]/[24] stay NULL (the 0xAE0/0xB00
+         * no-wake root cause).
+         *
+         * coredll is a compressed XIP module: each process's slot copy is
+         * decompressed to RAM by the kernel pager, so the fix patches the
+         * E-failure branch `bt 0x4001821c` (word 0x89e5 at page offset
+         * 0x24e of the page mapped at VA 0x40018000, signature-verified)
+         * to a NOP at TLB-fill time — before the page is ever translated,
+         * per process instance. The bind tail then always runs and sets
+         * the latch; the PSL heap is simply absent (driver init is local
+         * and does not need it). */
+        if (getenv("MMCS_PSLFIX") && address == 0x40018000) {
+            static const uint8_t sig[6] = {
+                0x0b, 0x43, 0x09, 0x00, 0x08, 0x20   /* jsr r3;nop;tst;bt.. */
+            };
+            uint8_t buf[8];
+            cpu_physical_memory_read(physical + 0x248, buf, 8);
+            if (buf[6] == 0xe5 && buf[7] == 0x89
+                && memcmp(buf, sig, 6) == 0) {
+                static uint8_t nop[2] = { 0x09, 0x00 };
+                cpu_physical_memory_write(physical + 0x24e, nop, 2);
+                fprintf(stderr, "MMCS: PSLFIX patched coredll bind gate "
+                        "(phys %08x)\n", (unsigned)(physical + 0x24e));
+            }
+        }
         tlb_set_page(cs, address, physical, prot, mmu_idx, TARGET_PAGE_SIZE);
         return true;
     }
