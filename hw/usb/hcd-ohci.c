@@ -452,13 +452,27 @@ static inline int put_words(OHCIState *ohci,
 static inline int ohci_read_ed(OHCIState *ohci,
                                dma_addr_t addr, struct ohci_ed *ed)
 {
-    return get_dwords(ohci, addr, (uint32_t *)ed, sizeof(*ed) >> 2);
+    int r = get_dwords(ohci, addr, (uint32_t *)ed, sizeof(*ed) >> 2);
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "OHCI_READ_ED @%08llx ctrl=%08x tail=%08x head=%08x next=%08x\n",
+                (unsigned long long)addr,
+                ((uint32_t *)ed)[0], ((uint32_t *)ed)[1],
+                ((uint32_t *)ed)[2], ((uint32_t *)ed)[3]);
+    }
+    return r;
 }
 
 static inline int ohci_read_td(OHCIState *ohci,
                                dma_addr_t addr, struct ohci_td *td)
 {
-    return get_dwords(ohci, addr, (uint32_t *)td, sizeof(*td) >> 2);
+    int r = get_dwords(ohci, addr, (uint32_t *)td, sizeof(*td) >> 2);
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "OHCI_READ_TD @%08llx ctrl=%08x cbp=%08x next=%08x be=%08x\n",
+                (unsigned long long)addr,
+                ((uint32_t *)td)[0], ((uint32_t *)td)[1],
+                ((uint32_t *)td)[2], ((uint32_t *)td)[3]);
+    }
+    return r;
 }
 
 static inline int ohci_read_iso_td(OHCIState *ohci,
@@ -520,6 +534,11 @@ static int ohci_copy_td(OHCIState *ohci, struct ohci_td *td,
     if (n > len) {
         n = len;
     }
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "OHCI_TD_DMA %s ptr=%08llx len=%lld pre=[%02x %02x %02x %02x]\n",
+                dir == DMA_DIRECTION_TO_DEVICE ? "READ" : "WRITE",
+                (unsigned long long)ptr, (long long)n, buf[0], buf[1], buf[2], buf[3]);
+    }
     if (dma_memory_rw(ohci->as, ptr + ohci->localmem_base, buf,
                       n, dir, MEMTXATTRS_UNSPECIFIED)) {
         return -1;
@@ -547,6 +566,11 @@ static int ohci_copy_iso_td(OHCIState *ohci,
     n = 0x1000 - (ptr & 0xfff);
     if (n > len) {
         n = len;
+    }
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "OHCI_DMA %s ptr=%08llx len=%lld buf[0..3]=%02x %02x %02x %02x\n",
+                dir == DMA_DIRECTION_TO_DEVICE ? "READ" : "WRITE",
+                (unsigned long long)ptr, (long long)n, buf[0], buf[1], buf[2], buf[3]);
     }
     if (dma_memory_rw(ohci->as, ptr + ohci->localmem_base, buf,
                       n, dir, MEMTXATTRS_UNSPECIFIED)) {
@@ -964,6 +988,12 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     }
 
     flag_r = (td.flags & OHCI_TD_R) != 0;
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "OHCI_SVC_TD addr=%08x completion=%d async_td=%08x "
+                "async_complete=%d dir=%d pktlen=%lld len=%lld cbp=%08x\n",
+                addr, completion, ohci->async_td, ohci->async_complete,
+                dir, (long long)pktlen, (long long)len, td.cbp);
+    }
     trace_usb_ohci_td_pkt_hdr(addr, (int64_t)pktlen, (int64_t)len, str,
                               flag_r, td.cbp, td.be);
     ohci_td_pkt("OUT", ohci->usb_buf, pktlen);
