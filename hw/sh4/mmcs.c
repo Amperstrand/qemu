@@ -367,8 +367,15 @@ static void mmcs_vintc_evt_deliver(void *opaque)
 {
     /* deliver a vendor-INTC event: preset INTEVT + the fork's inject flag,
      * then raise the CPU IRQ; superh_cpu_do_interrupt picks it up (fork
-     * hook) and the kernel trampoline dispatches slot = code>>10 in its
-     * RAM vector table @0x8867a000 (codes = IRQ<<8, e.g. 0x7C00 = ch124). */
+     * hook) and the kernel trampoline @0x90822f80 dispatches
+     *   handler = *(u32*)(0x8867a000 + (evt>>3))   [BYTE offset, no scaling]
+     * i.e. slot dword = evt>>5 = id+16 for HookInterrupt id, so
+     *   EVT = 0x200 + id*0x20   (stock shexcept.src InterruptExceptionHandler
+     * arithmetic; S75/S76's "IRQ<<8, slot=code>>10" decode was WRONG - all
+     * S77 sweep codes landed outside the 0x800-byte table). Proven live:
+     * evt 0xAE0->slot87->0x9080caec (SDHI0 thunk, IISR chain[23]),
+     * evt 0xB00->slot88->0x9080cb08 (SDHI1, chain[24]),
+     * evt 0x3E0->slot31->0x9080ce70 (vendor-INTC ch ISR, sysintr 34). */
     if (mmcs_cpu) {
         CPUSH4State *env = &mmcs_cpu->env;
         env->intevt = mmcs_vintc_evt_code;
@@ -755,6 +762,22 @@ static void mmcs_init(MachineState *machine)
     }
     memory_region_set_readonly(bootrom, true);
     memory_region_add_subregion(get_system_memory(), 0, bootrom);
+
+    /* USB OHCI at the SH7777's on-chip base (S70 register map, env-gated
+     * for A/B testing). qemu's stock sysbus-ohci model provides the real
+     * OHCI register semantics for MLSIDK USB driver development. */
+    if (getenv("MMCS_USB")) {
+        DeviceState *ohci = qdev_new("sysbus-ohci");
+        qdev_prop_set_uint32(ohci, "num-ports", 2);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ohci), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ohci), 0, 0xFFE70400);
+        /* IRQ: connect to the sh7750 INTC IRQ 34 (the SH7777 OHCI sysintr
+         * 53-class mapping is Unknown; use a qemu IRQ for now) */
+        qemu_irq ohci_irq = qemu_allocate_irq(
+            (void (*)(void *, int, int))qemu_set_irq, NULL, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(ohci), 0, ohci_irq);
+        fprintf(stderr, "MMCS: USB OHCI at 0xFFE70400 (env-gated)\n");
+    }
 
     /* MMCS_LOWSLOT=1: rts-filled low page (phys 0x4000-0x8000). Runtime-
      * composed init-stage pointers sometimes point at unbound low-page
