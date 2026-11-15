@@ -28,6 +28,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
 #include "hw/usb.h"
+#include "chardev/char.h"
 #include "hw/loader.h"
 #include "exec/address-spaces.h"
 #include "hw/char/serial.h"
@@ -463,7 +464,20 @@ static void mmcs_usb_setup(void)
         usb_bus = QLIST_FIRST(&ohci->child_bus);
     }
     assert(usb_bus);
-    usb_create_simple((USBBus *)usb_bus, usb_dev);
+    /* usb-cdc-acm takes a "chardev" property; the backend is created via
+     * CLI: -chardev socket,id=mlsdkusb,path=...,server=on,wait=off and
+     * looked up by that fixed id. */
+    DeviceState *udev = qdev_new(usb_dev);
+    if (strcmp(usb_dev, "usb-cdc-acm") == 0) {
+        Chardev *chr = qemu_chr_find("mlsdkusb");
+        if (chr) {
+            qdev_prop_set_chr(udev, "chardev", chr);
+        } else {
+            fprintf(stderr, "MMCS: usb-cdc-acm: no chardev id 'mlsdkusb' "
+                    "(-chardev socket,id=mlsdkusb,...)\n");
+        }
+    }
+    qdev_realize_and_unref(udev, usb_bus, &error_fatal);
     fprintf(stderr, "MMCS: USB device '%s' attached to port 1\n", usb_dev);
 }
 
@@ -652,6 +666,24 @@ static void mmcs_init(MachineState *machine)
             hwaddr off = (0x90942000 - 0x90800000) + (0xC00C9FF4 - 0xC00B1000);
             cpu_physical_memory_write(MMCS_FLASH_BASE + off, &trapa71, 2);
             fprintf(stderr, "MMCS: REGFIX trapa hook @0xC00C9FF4\n");
+        }
+        if (getenv("MMCS_ILKFIX")) {
+            /* Arm the ILKFIX interlocked-op emulation (see helper.c
+             * do_interrupt + tlb_fill hooks): KData page seeding/map +
+             * exception-boundary emulation for slots holding live vendor
+             * data. */
+            cpu->env.mmcs_ilkfix_active = 1;
+        }
+        if (getenv("MMCS_RINGFIX")) {
+            /* Arm the RINGFIX uHAL-ring write-drop synthesis (helper.c:
+             * fault at 0x908075a2 returns r0=1, kernel exception
+             * handler completes instead of fault-logging storms). */
+            cpu->env.mmcs_ringfix_active = 1;
+        }
+        if (getenv("MMCS_KAPIFIX")) {
+            /* Arm the KAPIFIX kernel-API-thunk late-bind / fail-return
+             * (helper.c: fault at 0x908083fc). */
+            cpu->env.mmcs_kapifix_active = 1;
         }
         if (getenv("MMCS_LOCALEFIX")) {
             uint32_t safe = 0x90809f3c;   /* kernel rts stub (S65-verified) */

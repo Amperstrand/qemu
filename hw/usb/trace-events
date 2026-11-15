@@ -366,3 +366,5 @@ canokey_handle_data_out(uint8_t ep_out, uint32_t out_len) "ep %d len %d"
 canokey_handle_data_in(uint8_t ep_in, uint32_t in_len) "ep %d len %d"
 canokey_realize(void)
 canokey_unrealize(void)
+usb_cdc_acm_line_coding(int rate, int fmt, int parity, int bits) "line coding %d %d %d %d"
+usb_cdc_acm_ctrl_line(int state) "control line state 0x%x"
