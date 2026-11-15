@@ -83,6 +83,16 @@ void superh_cpu_do_interrupt(CPUState *cs)
     }
     env->in_sleep = 0;
 
+    /* MMCS fork: syscall tracer — log every trapa with args (flycast
+     * wince.h pattern: decode API calls at the trap boundary; our CE5
+     * calibration: TRA 0x71 = RegQueryValueExW per the REGFIX hook). */
+    if (getenv("MMCS_SYSTRACE") && do_exp
+        && (env->pc & 1 || env->pc >= 0xffff0000)) {
+        /* flycast wince.h pattern: CE syscalls = odd/hi fetch exceptions */
+        fprintf(stderr, "SYSCALL exp=%03x pc=%08x r4=%08x r5=%08x "
+                "r6=%08x r7=%08x\n", cs->exception_index, env->pc,
+                env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7]);
+    }
     /* MMCS fork: REGFIX trapa hook — synthesize RegQueryValueExW success
      * for the boot-registry bootstrap (the fdf circular-read break). */
     if (cs->exception_index == 0x160 &&
