@@ -601,6 +601,23 @@ static void mmcs_init(MachineState *machine)
                 "(64 MB)\n");
     }
 
+    /* MMCS_KILLSTK: 64KB RAM at phys 0x1F00000 backing the KillThread
+     * dispatch stack (P2 0xBF00FF00-class; see the KILLSTK hook in
+     * target/sh4/helper.c do_interrupt — the L11 kill-loop fix). Must
+     * stay below phys 0x20000000: the SH4 P1/P2 windows only translate
+     * the low 29 bits (P1/P2 0xA5000000-class aliases phys 0x05000000,
+     * NOT 0x25000000 — first cut wrote to an unmapped hole and the
+     * push-pop cycle read zeros back into pr). */
+    if (getenv("MMCS_KILLSTK")) {
+        MemoryRegion *ks = g_new(MemoryRegion, 1);
+        memory_region_init_ram(ks, NULL, "mmcs.killstk", 64 * KiB,
+                               &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0x1F000000, ks);
+        cpu->env.mmcs_killstk_active = 1;
+        fprintf(stderr, "MMCS: KILLSTK kill-stack RAM at phys 0x1F000000 "
+                "(P2 0xBF00FF00)\n");
+    }
+
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —
      * map the loader RAM image, our payload, and the test stub at phys 0.
      * MMCS_PAYLOAD = container file (mapped at phys 0x0A000000),

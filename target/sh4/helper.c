@@ -169,6 +169,47 @@ void superh_cpu_do_interrupt(CPUState *cs)
         return;
     }
 
+    /* MMCS fork: MMCS_KILLSTK (L11) — give the kernel's KillThread
+     * dispatch a stack when the dying thread's sp is dead. Decode
+     * (L11, gdb bp at the kill-init block 0x90825c9c + thread-struct
+     * walk): the post-APIRET endgame kills the broken servant by
+     * writing its thread context [+0xb0 sp][+0xb4 pc = KillThread
+     * 0x9083be50][+0xb8 sr] and making it runnable; the scheduler
+     * resumes it THROUGH the PSL trampoline (pr=0x908236a8), so the
+     * epilogue's `add #16,r15` turns the dead sp 0 into 0x10 and
+     * KillThread's first `mov.l r8,@-r15` faults at VA 0xC (NULL
+     * page) -> ExceptionDispatch -> stack-grow fails (0x10 is in
+     * neither the kernel stack [0xd026ff00] nor the user stack
+     * [0x0002ff00] range) -> "Secure stack overflow" -> kill-init
+     * AGAIN -> the ~10 Hz forever loop that eats the CPU the
+     * driver-init walk needs (the L11 spin; the in_asm "walk" pcs
+     * 0x908083f8/0x90822990 = the exception-report formatter dumping
+     * each cycle's register dump to the 0xa4500000 log ring, char by
+     * char via the 0x90806958 writer). Fix: a kernel-mode fault at
+     * the KillThread entry with a NULL-page-class sp = the kill
+     * continuation arriving with no stack: re-point r15 at the top
+     * of a dedicated kill-stack page (P1 alias of phys 0x25000000 —
+     * kernel-mode P1/P2 bypass the UTLB, no translation needed) and
+     * re-execute; KillThread then runs its shutdown list and the
+     * kill COMPLETES, freeing the scheduler for the launch chain.
+     * Stack = P2 0xBF00FF00 (uncached alias of phys 0x1F000000+64K;
+     * P1/P2 only translate phys < 0x20000000). */
+    if (env->mmcs_killstk_active && do_exp
+        && (cs->exception_index == 0x060 || cs->exception_index == 0x040
+            || cs->exception_index == 0x0e0)
+        && (env->sr & (1u << SR_MD))
+        && (env->pc == 0x9083be50 || (env->pc & ~1) == 0x9083be50)
+        && env->gregs[15] < 0x1000) {
+        static int nkill;
+        if (nkill++ < 32) {
+            fprintf(stderr, "MMCS: KILLSTK kill-dispatch stacked: pc=%08x "
+                    "sp=%08x -> BF00FF00\n", env->pc, env->gregs[15]);
+        }
+        env->gregs[15] = 0xBF00FF00;    /* P2 alias of the kill-stack page */
+        cs->exception_index = -1;
+        return;                         /* re-execute the entry push */
+    }
+
     /* MMCS fork: syscall tracer — log every trapa with args (flycast
      * wince.h pattern: decode API calls at the trap boundary; our CE5
      * calibration: TRA 0x71 = RegQueryValueExW per the REGFIX hook). */

@@ -180,6 +180,7 @@ typedef struct CPUArchState {
     uint32_t mmcs_ringfix_active; /* MMCS fork: RINGFIX uHAL ring ret */
     uint32_t mmcs_kapifix_active; /* MMCS fork: KAPIFIX kapi thunk bind */
     uint32_t mmcs_apiret_active; /* MMCS fork: APIRET direct-return MD fix */
+    uint32_t mmcs_killstk_active; /* MMCS fork: KILLSTK kill-dispatch stack */
     uint32_t mmcs_cowfix_active; /* MMCS fork: COWFIX user .data COW */
 
     tlb_t itlb[ITLB_SIZE];      /* instruction translation table */
