@@ -19,6 +19,9 @@
 #include "migration/vmstate.h"
 #include "desc.h"
 #include "chardev/char-fe.h"
+#include "chardev/char-socket.h"
+#include "io/channel-socket.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "trace.h"
 
@@ -38,6 +41,7 @@
 struct USBCDCACMState {
     USBDevice dev;
     USBEndpoint *bulk_in;
+    QEMUTimer *pull_timer;
     uint8_t recv_buf[RECV_BUF];
     uint16_t recv_ptr;
     uint16_t recv_used;
@@ -259,6 +263,10 @@ static int usb_cdc_acm_can_read(void *opaque)
 {
     USBCDCACMState *s = opaque;
 
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "CDC_ACM can_read attached=%d space=%d\n",
+                s->dev.attached, RECV_BUF - s->recv_used);
+    }
     if (!s->dev.attached) {
         return 0;
     }
@@ -285,7 +293,60 @@ static void usb_cdc_acm_read(void *opaque, const uint8_t *buf, int size)
     }
     s->recv_used += size;
 
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "CDC_ACM read %d bytes, used=%d -> wakeup\n",
+                size, s->recv_used);
+    }
     usb_wakeup(s->bulk_in, 0);
+}
+
+/* Host-clock pull timer: the socket chardev's glib-watch dispatch proved
+ * unreliable in this TCG setup (main loop runs at 2kHz, can_read polled
+ * 1M+ times, the child watch attached, yet tcp_chr_read dispatched only
+ * ~once per run). TEST-HARNESS WORKAROUND (layering violation, accepted
+ * for this emulation-only device): drain the chardev's socket fd directly
+ * with a nonblocking recv() every 10ms host time and feed the receive
+ * ring through the same handler the push path uses. */
+static void usb_cdc_acm_pull(void *opaque)
+{
+    USBCDCACMState *s = opaque;
+    Chardev *chr = s->cs.chr;
+
+    if (chr && OBJECT(chr)->class &&
+        object_dynamic_cast(OBJECT(chr), TYPE_CHARDEV_SOCKET)) {
+        SocketChardev *sch = SOCKET_CHARDEV(chr);
+        if (sch->ioc && sch->state == TCP_CHARDEV_STATE_CONNECTED) {
+            QIOChannelSocket *sioc = QIO_CHANNEL_SOCKET(sch->ioc);
+            int fd = sioc->fd;
+            uint8_t buf[512];
+            int n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+            if (n > 0) {
+                int space = RECV_BUF - s->recv_used;
+                if (n > space) n = space;
+                if (n > 0) {
+                    usb_cdc_acm_read(s, buf, n);
+                }
+            }
+        }
+    }
+    timer_mod(s->pull_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
+}
+
+static void usb_cdc_acm_event(void *opaque, QEMUChrEvent event)
+{
+    USBCDCACMState *s = opaque;
+
+    switch (event) {
+    case CHR_EVENT_OPENED:
+        /* re-kick the chardev read handlers (dev-serial pattern: without
+         * this the socket-chardev read watch is not armed for the FE) */
+        qemu_chr_fe_accept_input(&s->cs);
+        break;
+    case CHR_EVENT_CLOSED:
+    case CHR_EVENT_BREAK:
+    default:
+        break;
+    }
 }
 
 static void usb_cdc_acm_realize(USBDevice *dev, Error **errp)
@@ -300,7 +361,10 @@ static void usb_cdc_acm_realize(USBDevice *dev, Error **errp)
         return;
     }
     qemu_chr_fe_set_handlers(&s->cs, usb_cdc_acm_can_read,
-                             usb_cdc_acm_read, NULL, NULL, s, NULL, true);
+                             usb_cdc_acm_read, usb_cdc_acm_event,
+                             NULL, s, NULL, true);
+    s->pull_timer = timer_new_ms(QEMU_CLOCK_REALTIME, usb_cdc_acm_pull, s);
+    timer_mod(s->pull_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
     s->bulk_in = usb_ep_get(dev, USB_TOKEN_IN, 2);
 }
 

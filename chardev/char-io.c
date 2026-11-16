@@ -50,6 +50,7 @@ static gboolean io_watch_poll_prepare(GSource *source,
         return FALSE;
     }
 
+
     if (now_active) {
         iwp->src = qio_channel_create_watch(
             iwp->ioc, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL);

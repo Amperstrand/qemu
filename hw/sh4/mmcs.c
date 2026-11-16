@@ -468,7 +468,7 @@ static void mmcs_usb_setup(void)
      * CLI: -chardev socket,id=mlsdkusb,path=...,server=on,wait=off and
      * looked up by that fixed id. */
     DeviceState *udev = qdev_new(usb_dev);
-    if (strcmp(usb_dev, "usb-cdc-acm") == 0) {
+    if (strcmp(usb_dev, "usb-cdc-acm") == 0 || strcmp(usb_dev, "usb-serial") == 0) {
         Chardev *chr = qemu_chr_find("mlsdkusb");
         if (chr) {
             qdev_prop_set_chr(udev, "chardev", chr);

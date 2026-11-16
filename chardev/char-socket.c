@@ -488,6 +488,10 @@ static gboolean tcp_chr_read(QIOChannel *chan, GIOCondition cond, void *opaque)
     uint8_t buf[CHR_READ_BUF_LEN];
     int len, size;
 
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "CDC_SOCK read-ready\n");
+    }
+
     if ((s->state != TCP_CHARDEV_STATE_CONNECTED) ||
         s->max_size <= 0) {
         return TRUE;
@@ -919,6 +923,10 @@ static void tcp_chr_accept(QIONetListener *listener,
                            void *opaque)
 {
     Chardev *chr = CHARDEV(opaque);
+
+    if (getenv("OHCI_DEBUG_DMA")) {
+        fprintf(stderr, "CDC_SOCK accept chr=%s\n", chr->label);
+    }
     SocketChardev *s = SOCKET_CHARDEV(chr);
 
     tcp_chr_change_state(s, TCP_CHARDEV_STATE_CONNECTING);
