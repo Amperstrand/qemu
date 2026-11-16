@@ -142,6 +142,97 @@ static const MemoryRegionOps mmcs_files_ops = {
     .valid.min_access_size = 1, .valid.max_access_size = 4,
 };
 
+/* ---- MMCS_SRVPG (L12): servant-window page-in synthesis support ----
+ * The relaunched servant's kernel-side k.coredll window pages never get
+ * rebuilt in the new process's page tables (see the SRVPG hook in
+ * target/sh4/helper.c): the .text is a linear unrelocated image of the
+ * ROM module section (mapped read-only straight at the flash), but the
+ * .data sections are FILES-compressed in the raw image — their init
+ * content must be decompressed via the side table. This allocator
+ * hands out seeded demand pages (deduped per VA per boot) from the
+ * dedicated mmcs.srvpg RAM at phys 0x26000000. */
+static struct { uint32_t va, pa; } mmcs_srvpg_map[256];
+static int mmcs_nsrvpg;
+static uint32_t mmcs_srvpg_nxt = 0x26000000;
+
+#define MMCS_SRVPG_ROM_BASE 0x90800000
+static const struct { uint32_t va, sz, rom; } mmcs_srvpg_secs[] = {
+    /* k.coredll servant .data sections (realaddr manifest, verified
+     * against the live window: 0xc004dba2/0xc002f0a0 pages byte-equal
+     * their ROM images). */
+    { 0xC0083000, 0x8A8,  0x912E4D14 },  /* files-compressed */
+    { 0xC0084000, 0x4BA8, 0x944A635C },  /* files-compressed */
+    { 0xC0089000, 0x13114, 0x9092E000 }, /* raw in image */
+};
+
+/* Servant .data VA -> scratch phys page seeded with the module's init
+ * content (FILES side table where the section is compressed, raw flash
+ * otherwise). Returns 0 when out of pages or the VA is unknown.
+ * Prototype consumed by target/sh4/helper.c (SRVPG hook). */
+hwaddr mmcs_srvpg_data_pa(uint32_t va);
+hwaddr mmcs_srvpg_data_pa(uint32_t va)
+{
+    va &= ~0xFFFu;
+    uint32_t rom = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(mmcs_srvpg_secs); i++) {
+        if (va >= mmcs_srvpg_secs[i].va
+            && va < mmcs_srvpg_secs[i].va + mmcs_srvpg_secs[i].sz) {
+            rom = mmcs_srvpg_secs[i].rom + (va - mmcs_srvpg_secs[i].va);
+            break;
+        }
+    }
+    if (!rom) {
+        return 0;
+    }
+    for (int i = 0; i < mmcs_nsrvpg; i++) {
+        if (mmcs_srvpg_map[i].va == va) {
+            return mmcs_srvpg_map[i].pa;
+        }
+    }
+    if (mmcs_nsrvpg >= ARRAY_SIZE(mmcs_srvpg_map)
+        || mmcs_srvpg_nxt + 0x1000 > 0x26400000) {
+        return 0;
+    }
+    uint32_t pa = mmcs_srvpg_nxt;
+    static uint8_t page[0x1000];
+    for (unsigned o = 0; o < 0x1000; o++) {
+        uint32_t rva = rom + o;
+        uint8_t b = 0;
+        bool hit = false;
+        for (int f = 0; f < mmcs_ftab_n; f++) {
+            if (rva >= mmcs_ftab[f].load_va
+                && rva < mmcs_ftab[f].load_va + mmcs_ftab[f].real) {
+                uint32_t off = rva - mmcs_ftab[f].load_va
+                               + mmcs_ftab[f].tbl_off;
+                if (off < mmcs_ftable_len) {
+                    b = mmcs_ftable_data[off];
+                }
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            cpu_physical_memory_read(
+                MMCS_FLASH_BASE + (rva - MMCS_SRVPG_ROM_BASE), &b, 1);
+        }
+        page[o] = b;
+    }
+    cpu_physical_memory_write(pa, page, 0x1000);
+    mmcs_srvpg_map[mmcs_nsrvpg].va = va;
+    mmcs_srvpg_map[mmcs_nsrvpg].pa = pa;
+    mmcs_nsrvpg++;
+    mmcs_srvpg_nxt += 0x1000;
+    if (getenv("MMCS_SRVPGLOG")) {
+        static int nsl;
+        if (nsl++ < 64) {
+            fprintf(stderr, "MMCS: SRVPG servant .data page-in va=%08x "
+                    "rom=%08x -> pa=%08x (n=%d)\n", va, rom, pa,
+                    mmcs_nsrvpg);
+        }
+    }
+    return pa;
+}
+
 /* ---- Framebuffer console (MMCS_FBCON=1): live screen via QEMU display ---- */
 #include "ui/console.h"
 static QemuConsole *mmcs_con;
@@ -616,6 +707,24 @@ static void mmcs_init(MachineState *machine)
         cpu->env.mmcs_killstk_active = 1;
         fprintf(stderr, "MMCS: KILLSTK kill-stack RAM at phys 0x1F000000 "
                 "(P2 0xBF00FF00)\n");
+    }
+
+    /* MMCS_SRVPG / MMCS_KSLOT (L12 relaunch-cycle fixes; hooks live in
+     * target/sh4/helper.c — tlb_fill servant page-in synthesis and the
+     * do_interrupt kernel-mode slot-call re-tag). SRVPG also needs its
+     * scratch RAM for the seeded servant .data pages (phys 0x26000000,
+     * 4 MB, outside every unit window, inside the SH4 PPN range). */
+    if (getenv("MMCS_SRVPG")) {
+        cpu->env.mmcs_srvpg_active = 1;
+        MemoryRegion *sp = g_new(MemoryRegion, 1);
+        memory_region_init_ram(sp, NULL, "mmcs.srvpg", 4 * MiB,
+                               &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0x26000000, sp);
+        fprintf(stderr, "MMCS: SRVPG servant scratch RAM at phys 0x26000000 "
+                "(4 MB)\n");
+    }
+    if (getenv("MMCS_KSLOT")) {
+        cpu->env.mmcs_kslot_active = 1;
     }
 
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —

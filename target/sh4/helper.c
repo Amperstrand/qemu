@@ -60,6 +60,10 @@ static int find_utlb_entry(CPUSH4State *env, target_ulong address,
                            int use_asid);
 static void increment_urc(CPUSH4State *env);
 
+/* MMCS fork (L12): hw/sh4/mmcs.c serves seeded scratch pages for the
+ * servant .data window (FILES-decompressed init content). */
+hwaddr mmcs_srvpg_data_pa(uint32_t va);
+
 /* MMCS fork (L8): the MMCS_FILEVIEW scratch va->pa table, hoisted to
  * file scope so diagnostics (MMCS_NULLCALL) can read a frozen stack
  * physically — the guest UTLB entries get flushed per launch, but the
@@ -652,14 +656,35 @@ cow_done:;
      * retry-fails writing its own exception frame -> thread kill
      * 0xC0000005). The kernel never installs entries for these
      * (MMCS_UTLBLOG: no stack-arena installs); same scratch
-     * treatment. */
+     * treatment.
+     *
+     * L12 (2026-11-16): with the relaunch cycle surviving past the
+     * servant page-ins (MMCS_SRVPG), the per-launch kernel stacks
+     * march UP from 0xd006f000 (+0x10000/launch) and the newest
+     * stack page is again missing from the guest page tables at the
+     * thread's first write (pc=0xc003c9e0, tea=0xd007fe8c-class) —
+     * the exception propagates and the launch parks. The L7-era
+     * 0xD0600000 floor ("corrupts live kernel tables below") predates
+     * KILK (its freeze = the L8 never-started-thread class, since
+     * root-caused); MMCS_STKFLOOR=<hex> lowers the intercept floor
+     * for the A/B (default unchanged). */
+    static uint32_t mmcs_stkfloor;
+    if (!mmcs_stkfloor) {
+        const char *sf = getenv("MMCS_STKFLOOR");
+        mmcs_stkfloor = sf ? strtoul(sf, NULL, 16) : 0xD0600000;
+    }
     if (env->mmcs_cowfix_active && getenv("MMCS_FILEVIEW")
         && (cs->exception_index == 0x060
             || cs->exception_index == 0x0c0)
         && (((env->sr & (1u << SR_MD)) == 0
              && env->tea >= 0x00800000 && env->tea < 0x40000000)
             || ((env->sr & (1u << SR_MD)) != 0
-                && env->tea >= 0xD0600000 && env->tea < 0xDC000000))) {
+                && env->tea >= mmcs_stkfloor
+                && env->tea < 0xDC000000
+                /* below the L7 default floor = the L12 march frontier:
+                 * only once the launches are live (the early IRQ-init
+                 * walk's own low-arena writes must reach the guest) */
+                && (env->tea >= 0xD0600000 || mmcs_ilkfix_user_seen)))) {
         /* user heap-arena write misses only happen once the PSL
          * launches are live — arm the kernel-mode ILKFIX fetch map
          * (L8, MMCS_KILK) */
@@ -792,6 +817,46 @@ fileview_done:;
         }
         cs->exception_index = -1;
         return;
+    }
+
+    /* MMCS fork: MMCS_KSLOT (L12) — raise the API-slot fetch fault for
+     * KERNEL-mode slot calls. The vendor coredll re-raise wrapper
+     * (0xc002f0a0-class: `mov.w #slot_lo16; jmp @r3`) jumps to the odd
+     * 0xFFFFxxxx slot address expecting the instruction-fetch ADDRESS
+     * ERROR (event 0x0e0) that the stock APICall entry (VBR+0x100,
+     * shexcept.src) decodes as the syscall purely from (event==0x0e0 &&
+     * SPC odd && SPC >= API_MAX) — mode-agnostic, with the previous
+     * mode passed along via r2_user. QEMU's SH4 model raises that
+     * address error for USER-mode P4 fetches only; a KERNEL-mode fetch
+     * at the same VA is served from the unassigned system bus (the
+     * page is softmmu-cached as MMIO by the marshaller's own data
+     * loads at 0xfffffff8-class, so it never even reaches tlb_fill as
+     * a fetch), reads 0x0000, and raises illegal_instruction 0x180
+     * instead — so every kernel-side exception re-raise (the L12
+     * forwarded-exception end game: no user handler installed ->
+     * wrapper jmp @slot with the marshalled code) turns into
+     * 0xC000001D, which is itself forwarded, re-raised, and recursed
+     * ~55 deep down the kernel stack 0x450/iteration (the L12 march +
+     * CPU burn that starves the relaunch chain). Fix: at the exception
+     * boundary, a KERNEL-mode illegal-instruction raise (0x180/0x1a0)
+     * whose pc is in the slot window [0xFFFF8000, 4GB) = the
+     * kernel-mode API-slot call: re-tag it as the 0x0e0 address error
+     * the vendor syscall entry decodes (SPC/SSR already saved by the
+     * illegal raise; TEA := pc) and let the normal dispatch deliver
+     * the vendor kernel its syscall. Gated on the launch-phase latch. */
+    if (env->mmcs_kslot_active && do_exp
+        && (cs->exception_index == 0x180 || cs->exception_index == 0x1a0)
+        && (env->sr & (1u << SR_MD))
+        && env->pc >= 0xFFFF8000u
+        && mmcs_ilkfix_user_seen) {
+        static int nks;
+        if (nks++ < 32) {
+            fprintf(stderr, "MMCS: KSLOT kernel-mode slot call pc=%08x "
+                    "pr=%08x -> 0x0e0\n", env->pc, env->pr);
+        }
+        env->tea = env->pc;
+        cs->exception_index = 0x0e0;
+        /* fall through to the normal 0x0e0 dispatch */
     }
 
     if (do_irq) {
@@ -1728,6 +1793,90 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      address & TARGET_PAGE_MASK,
                      PAGE_READ | PAGE_EXEC, mmu_idx, TARGET_PAGE_SIZE);
+        return true;
+    }
+
+    /* MMCS fork: MMCS_SRVPG (L12) — page-in synthesis for the relaunched
+     * servant's kernel-side k.coredll .text window.
+     *
+     * Decoded 2026-11-16 (L12, gdb bps at the servant entry 0xc004dba2 +
+     * the re-raise jsr 0xc0036364 + the -d int walk): after KILLSTK the
+     * relaunch cycle dies BEFORE its first syscall because the relaunched
+     * servant's fresh thread (r16 cookie 0x108f115e-class) faults on its
+     * FIRST kernel-side startup fetch (ITLB miss 0x040 at servant .text
+     * e.g. 0xc003c3dc) — the guest's 2-level walk finds no page-table
+     * entry for the new process's slot (the relaunch never rebuilds the
+     * k.coredll module mapping; launch-1's directory is gone with the
+     * dead process), so the vendor kernel's ExceptionDispatch classifies
+     * the miss as a PSL-call access violation and FORWARDS it to user
+     * mode: kernel 0x90823340 jsr's the marshal fn 0x90825694 which
+     * forges the "user continuation" (RAM cells 0x8867f030 sp /
+     * 0x8867f034 pc) and the rte at 0x908233d8 delivers the thread at
+     * the k.coredll PSL-exception stub 0xc004dba2 with a 0xe4(228)-byte
+     * marshalled param block (r4; the "ERROR 0xe4" of the L11 notes is
+     * the BLOCK SIZE loaded by `mov.w #0xe4` at 0x90823334 — not an
+     * error code; the block's first dword IS the error: 0xC0000005).
+     * The stub -> 0xc00360f4 checks the per-process user exception
+     * handler cell 0xc00836f0 (NULL — nobody ran SetExceptionHandler),
+     * then tail-jumps 0xc004db6c which re-raises via the coredll API
+     * wrapper at 0xc002f0a0 (`mov.w #0xfdc7; jmp @r3` — a USER-mode
+     * syscall-slot call). But the whole forged chain carries SSR.MD=1
+     * (the thread's own saved kernel mode — CE4 servants run kernel
+     * side, so the vendor design is correct), and a KERNEL-mode fetch
+     * at the 0xFFFFxxxx slot does not raise the slot-call fetch fault
+     * in this SH4 model (P4 passthrough reads unassigned-bus zeros):
+     * the fetched 0x0000 word raises illegal_instruction 0x180 ->
+     * 0xC000001D (pr=0xc0036368) -> TerminateProcess -> relaunch ->
+     * same missing page -> loop (94/320s in the L11 census, kernel
+     * stack marching 0x450/launch).
+     *
+     * Fix (LOWSLOT/KILK shape): service the missing fetch directly —
+     * a KERNEL-mode instruction miss in the k.coredll servant .text
+     * window [0xC0021000, 0xC0082AD8) (the linear, unrelocated ROM
+     * module section — byte-verified live: the stub page 0xc004dba2
+     * and the wrapper 0xc002f0a0 match their ROM images exactly) maps
+     * the 4K page at the flash ROM physical [0x108CC000 + (va -
+     * 0xC0021000)] and re-executes. The fetch succeeds, the exception
+     * is never raised, the forward/marshal/re-raise chain never runs,
+     * and the relaunched servant proceeds into its normal startup.
+     * Gated on the launch-phase latch (mmcs_ilkfix_user_seen) so the
+     * early IRQ-init walk never touches the window. */
+    if (ret != MMU_OK && mmu_idx != MMU_USER_IDX
+        && mmcs_ilkfix_user_seen
+        && env->mmcs_srvpg_active
+        && (((uint32_t)address >= 0xC0021000
+             && (uint32_t)address < 0xC0082B00
+             && (access_type == MMU_INST_FETCH
+                 || access_type == MMU_DATA_LOAD))
+            || ((uint32_t)address >= 0xC0083000
+                && (uint32_t)address < 0xC009D000))) {
+        uint32_t page = (uint32_t)address & 0xFFFFF000u;
+        if (page < 0xC0083000) {
+            /* .text (and .text read as data): the linear unrelocated
+             * ROM module image, mapped read-only straight at flash. */
+            hwaddr pa = 0x108CC000 + (page - 0xC0021000);
+            if (getenv("MMCS_SRVPGLOG")) {
+                static int npg;
+                if (npg++ < 64) {
+                    fprintf(stderr, "MMCS: SRVPG servant page-in va=%08x "
+                            "-> pa=%08" HWADDR_PRIx "\n", page, pa);
+                }
+            }
+            tlb_set_page(cs, page, pa, PAGE_READ | PAGE_EXEC, mmu_idx,
+                         TARGET_PAGE_SIZE);
+        } else {
+            /* .data sections: FILES-compressed init content — seeded
+             * scratch page from hw/sh4/mmcs.c (deduped per VA). */
+            hwaddr pa = mmcs_srvpg_data_pa(page);
+            if (pa) {
+                tlb_set_page(cs, page, pa, PAGE_READ | PAGE_WRITE, mmu_idx,
+                             TARGET_PAGE_SIZE);
+            } else {
+                fprintf(stderr, "MMCS: SRVPG servant .data scratch "
+                        "exhausted at va=%08x\n", page);
+                return false;
+            }
+        }
         return true;
     }
 

@@ -181,6 +181,10 @@ typedef struct CPUArchState {
     uint32_t mmcs_kapifix_active; /* MMCS fork: KAPIFIX kapi thunk bind */
     uint32_t mmcs_apiret_active; /* MMCS fork: APIRET direct-return MD fix */
     uint32_t mmcs_killstk_active; /* MMCS fork: KILLSTK kill-dispatch stack */
+    uint32_t mmcs_srvpg_active; /* MMCS fork: SRVPG servant .text page-in
+                                   * synthesis (L12) */
+    uint32_t mmcs_kslot_active; /* MMCS fork: KSLOT kernel-mode slot-call
+                                   * illegal->0x0e0 re-tag (L12) */
     uint32_t mmcs_cowfix_active; /* MMCS fork: COWFIX user .data COW */
 
     tlb_t itlb[ITLB_SIZE];      /* instruction translation table */
