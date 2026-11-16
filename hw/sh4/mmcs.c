@@ -170,6 +170,71 @@ static void mmcs_fbcon_init(MemoryRegion *sdram_mr)
 
 static int mmcs_fb_only_rearm = 0;  /* set by self-rearm: skip RAM sweep */
 
+/* ---- MMCS_JITFIX: break the WinCE JIT-debugger name in kernel RAM ----
+ * L9 decode: the last remaining per-boot fault (a servant's second-chance
+ * RaiseException(0xC0000005, NONCONTINUABLE) after a failed kernel-side
+ * 0xfffffdff-class call) engages the CE5 JIT path (schedule.c
+ * UserExceptionFilter: pDebugger from HKLM\Debug\JITDebugger — the REAL
+ * registry now answers "JitDbgrEXE.exe"): CreateProcess(JitDbgrEXE.exe)
+ * succeeds (relfsd serves \Windows from the FILES table — first USER EXE
+ * launch from the ROM FS), then the system DEADLOCKS: the faulting thread
+ * loops ProcGetCode/STILL_ACTIVE waiting for the debugger attach while the
+ * debugger parks on an INFINITE wait. On real HW servants don't fault, so
+ * the JIT path never runs; our fault is an emulation gap. This fix breaks
+ * the UTF-16 name in kernel RAM ('J'->'X') so CreateProcess fails and the
+ * exception path takes the normal thread-death route. Bounded: sweeps
+ * guest RAM every 2 s (virtual), stops after 128 patches or 120 s. */
+static int mmcs_jitfix_hits;
+
+static void mmcs_jitfix_sweep(void *opaque)
+{
+    /* UTF-16LE of the registry-configured JIT debugger name */
+    static const char jit_name[] = "JitDbgrEXE.exe";
+    static const struct { hwaddr lo, hi; } ranges[] = {
+        { 0x08600000, 0x0B000000 },  /* kernel pool + filesys heaps */
+        { 0x10000000, 0x10800000 },  /* kernel-stack arena backing */
+    };
+    uint8_t pat[32];
+    int patlen = 0;
+    for (const char *p = jit_name; *p; p++) {
+        pat[patlen++] = (uint8_t)*p;
+        pat[patlen++] = 0;
+    }
+    for (unsigned r = 0; r < ARRAY_SIZE(ranges); r++) {
+        static uint8_t chunk[0x10000];
+        const hwaddr lo = ranges[r].lo, hi = ranges[r].hi;
+        for (hwaddr pa = lo; pa < hi && mmcs_jitfix_hits < 128;
+             pa += sizeof chunk - patlen) {
+            hwaddr n = MIN((hwaddr)sizeof chunk, hi - pa);
+            cpu_physical_memory_read(pa, chunk, n);
+            const uint8_t *hit = chunk;
+            while (mmcs_jitfix_hits < 128) {
+                hit = memmem(hit, n - (hit - chunk), pat, patlen);
+                if (!hit) {
+                    break;
+                }
+                hwaddr ha = pa + (hit - chunk);
+                uint8_t broken = 'X';
+                cpu_physical_memory_write(ha, &broken, 1);
+                fprintf(stderr, "MMCS-JITFIX: JIT debugger name broken at "
+                        "phys %08" HWADDR_PRIx "\n", ha);
+                mmcs_jitfix_hits++;
+                hit += patlen;
+            }
+        }
+    }
+    if (mmcs_jitfix_hits < 128
+        && qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) < 120000) {
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_jitfix_sweep,
+                                    NULL);
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
+    } else {
+        fprintf(stderr, "MMCS-JITFIX: done (%d patches)\n",
+                mmcs_jitfix_hits);
+    }
+}
+
+
 static void mmcs_dump_ram(void *opaque)
 {
     static const struct { hwaddr pa; const char *fn; } dumps[] = {
@@ -895,6 +960,13 @@ static void mmcs_init(MachineState *machine)
             QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_dump_ram, NULL);
             timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + atoi(ds) * 1000);
         }
+    }
+
+    /* MMCS_JITFIX=1: periodic JIT-debugger-name breaker (see above) */
+    if (getenv("MMCS_JITFIX")) {
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_jitfix_sweep,
+                                    NULL);
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
     }
 }
 
