@@ -765,6 +765,14 @@ static void mmcs_init(MachineState *machine)
              * (helper.c: fault at 0x908083fc). */
             cpu->env.mmcs_kapifix_active = 1;
         }
+        if (getenv("MMCS_APIRET")) {
+            /* Arm the APIRET user-mode direct-return recovery (helper.c:
+             * user-mode fetch fault at the PSL trampoline window
+             * 0x908236a8 -> set SR.MD, let the trampoline epilogue
+             * unwind the call properly; see the L10 decode there).
+             * Needs the launch lane (KILK-class combo) to matter. */
+            cpu->env.mmcs_apiret_active = 1;
+        }
         if (getenv("MMCS_COWFIX")) {
             /* Arm the COWFIX fork-side COW for user .data write
              * violations (helper.c: excp 0x060 -> private scratch page,

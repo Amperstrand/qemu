@@ -121,6 +121,54 @@ void superh_cpu_do_interrupt(CPUState *cs)
     }
     env->in_sleep = 0;
 
+    /* MMCS fork: MMCS_APIRET (L10) — recover the kernel PSL direct-return
+     * that lands in a USER thread. Decode (L10): WIN32 implicit-set
+     * method 129 (slot pc 0xfffffdff) = the vendor kernel's
+     * QueryPerformanceCounter (static table decode: CINFO "Wn32"
+     * @0x90821848 -> methods @0x90821028, [129]=0x90842378; live bp:
+     * PSL servant callers, pr=0xc0050d9e-class, pass r4=&stack-buffer
+     * — the "r4=0" seen at the trap boundary is the USER's leftover
+     * gregs, not the kernel's call args). While servicing the launch-1
+     * servant's wait-family call chain (m19 slot 0xfffffddb from the
+     * coredll wrapper at 0x4002cb02 -> kernel sub-calls m129 twice:
+     * traps with pr=0xfffffdff [slot convention] and pr=0x908236a8
+     * [trampoline continuation]), the kernel's dispatch returns through
+     * the kernel-mode direct-return address (KData.pAPIReturn,
+     * +0x98 = 0x9082369e/0x908236a8 in the PSL trampoline) but with
+     * SSR still carrying the USER mode bits: the thread fetches the
+     * trampoline at kernel P1 0x908236a8 IN USER MODE -> 0x0e0 ->
+     * the kernel raises RaiseException(0xC0000005, NONCONTINUABLE)
+     * into the servant (the L9 "#10 fault"). The servant dies mid-init
+     * WHILE OWNING the coredll .data critical section at 0x40074648
+     * (kernel sync-object arena at phys 0x1068xxxx, name=0x40074648,
+     * handle family 0x004302xx); the filesys relaunch's first wait on
+     * that dead-owned object (m17 = the WaitForMultiple-family
+     * per-object wait, slot 0xfffffddf, r5=0xffffffff INFINITE) never
+     * returns = THE L10 PARK. Fix: at the boundary, a USER-mode fetch
+     * fault at the trampoline window [0x908236a8,0x908236b0) (P1 or
+     * P2 alias) = the direct-return arriving with the wrong mode bit:
+     * set SR.MD and resume — the trampoline's own epilogue (add #16,
+     * mov r8,r0, restore regs, jmp @r3 = the saved user continuation)
+     * then unwinds the thread correctly, the wait call completes, the
+     * creator leaves the .data critsec normally, and the relaunched
+     * servant's INFINITE wait is satisfied. */
+    if (env->mmcs_apiret_active && do_exp
+        && (cs->exception_index == 0x0e0 || cs->exception_index == 0x040
+            || cs->exception_index == 0x060 || cs->exception_index == 0x0a0)
+        && !(env->sr & (1u << SR_MD))
+        && ((env->pc >= 0x908236a8 && env->pc < 0x908236b0)
+            || (env->pc >= 0xb08236a8 && env->pc < 0xb08236b0))) {
+        static int naret;
+        if (naret++ < 16) {
+            fprintf(stderr, "MMCS: APIRET user-mode direct-return recovered, "
+                    "pc=%08x pr=%08x spc=%08x\n", env->pc, env->pr,
+                    env->spc);
+        }
+        env->sr |= (1u << SR_MD);
+        cs->exception_index = -1;
+        return;
+    }
+
     /* MMCS fork: syscall tracer — log every trapa with args (flycast
      * wince.h pattern: decode API calls at the trap boundary; our CE5
      * calibration: TRA 0x71 = RegQueryValueExW per the REGFIX hook). */
