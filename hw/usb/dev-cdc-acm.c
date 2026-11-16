@@ -239,6 +239,14 @@ static void usb_cdc_acm_handle_data(USBDevice *dev, USBPacket *p)
             p->status = USB_RET_NAK;
             break;
         }
+        if (getenv("OHCI_DEBUG_DMA")) {
+            static unsigned long hin;
+            if (!(++hin % 1000)) {
+                fprintf(stderr, "CDC_IN svc used=%d iov=%d t=%lldms\n",
+                        s->recv_used, (int)p->iov.size,
+                        (long long)qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+            }
+        }
         len = MIN(p->iov.size, s->recv_used);
         /* ring-buffer drain (may wrap once) */
         {
@@ -294,7 +302,7 @@ static void usb_cdc_acm_read(void *opaque, const uint8_t *buf, int size)
     s->recv_used += size;
 
     if (getenv("OHCI_DEBUG_DMA")) {
-        fprintf(stderr, "CDC_ACM read %d bytes, used=%d -> wakeup\n",
+        fprintf(stderr, "CDC_ACM read %d bytes, used=%d\n",
                 size, s->recv_used);
     }
     usb_wakeup(s->bulk_in, 0);
@@ -331,7 +339,7 @@ static void usb_cdc_acm_pull(void *opaque)
     }
     if (getenv("OHCI_DEBUG_DMA")) {
         static unsigned long pf;
-        if (!(++pf % 1000)) {
+        if (!(++pf % 10000)) {
             fprintf(stderr, "CDC_PULL x%lu\n", pf);
         }
     }

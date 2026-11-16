@@ -988,12 +988,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     }
 
     flag_r = (td.flags & OHCI_TD_R) != 0;
-    if (getenv("OHCI_DEBUG_DMA")) {
-        fprintf(stderr, "OHCI_SVC_TD addr=%08x completion=%d async_td=%08x "
-                "async_complete=%d dir=%d pktlen=%lld len=%lld cbp=%08x\n",
-                addr, completion, ohci->async_td, ohci->async_complete,
-                dir, (long long)pktlen, (long long)len, td.cbp);
-    }
+
     trace_usb_ohci_td_pkt_hdr(addr, (int64_t)pktlen, (int64_t)len, str,
                               flag_r, td.cbp, td.be);
     ohci_td_pkt("OUT", ohci->usb_buf, pktlen);
