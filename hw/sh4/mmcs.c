@@ -789,19 +789,38 @@ static void mmcs_hdevt_fire(void *opaque)
      * MMCS_HDEVT_REPEAT=<ms> the delivery re-arms: each firing wakes
      * whatever waitblock is currently linked on the slot's event; the
      * stub's +0x8 guard makes empty firings no-ops (safe while the
-     * woken thread runs its next step). */
-    if (getenv("MMCS_HDEVT_REPEAT")) {
+      * woken thread runs its next step). L16 hardening: an empty-string
+      * env var (the common `VAR=$X` scripting accident) must NOT arm
+      * the repeat — atoi("")=0 makes it a +0ms fire loop (3.5M
+      * fires/300s starved every other chained delivery; found live in
+      * the first L16 verify run). */
+    const char *l16rep = getenv("MMCS_HDEVT_REPEAT");
+    if (l16rep && *l16rep && atoi(l16rep) > 0) {
         QEMUTimer *r = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_fire,
                                     NULL);
         timer_mod(r, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
-                  + atoi(getenv("MMCS_HDEVT_REPEAT")));
+                  + atoi(l16rep));
     }
 }
+
+/* L16 forward: the tick chain below services one pending event-wake
+ * per tick once MMCS_L16EV arms them (full block + decode below). */
+#define MMCS_L16_MAX 8
+struct mmcs_l16_ent {
+    uint32_t evt_va;
+    uint32_t stub_va;
+    uint32_t evt_code;
+    uint32_t slot_pa;
+    int pending;
+};
+static struct mmcs_l16_ent mmcs_l16_ents[MMCS_L16_MAX];
+static int mmcs_l16_n;
 
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
     bool hdevt = mmcs_hdevt_pending > 0;
+    bool l16 = false;
     if (hdevt) {
         mmcs_inject_evt(0x200);
         if (--mmcs_hdevt_pending == 0) {
@@ -815,9 +834,26 @@ static void mmcs_tick_deliver(void *opaque)
          * printed). We still skip this slot's 0x440 inject (the stub
          * evt consumed it) but keep the 1ms cadence alive. */
     } else {
-        mmcs_inject_evt(0x440);
+        /* L16: service one pending event-wake per tick (after the
+         * HDEVT chain; same slot-consuming semantics, same guard) */
+        for (int i = 0; i < mmcs_l16_n; i++) {
+            struct mmcs_l16_ent *e = &mmcs_l16_ents[i];
+            if (e->pending > 0) {
+                mmcs_inject_evt(e->evt_code);
+                if (--e->pending == 0) {
+                    fprintf(stderr, "MMCS-L16: evt %03x deliveries done\n",
+                            e->evt_code);
+                }
+                l16 = true;
+                break;
+            }
+        }
+        if (!l16) {
+            mmcs_inject_evt(0x440);
+        }
     }
-    if (!hdevt && getenv("MMCS_TMUDEBUG") && (ntick++ % 500) == 0) {
+    if (!hdevt && !l16 && getenv("MMCS_TMUDEBUG")
+        && (ntick++ % 500) == 0) {
         uint32_t tcnt = 0;
         cpu_physical_memory_read(0xFFD8000C, &tcnt, 4);
         fprintf(stderr, "MMCS-TMU: tick#%" PRIu64 " vclk=%" PRId64
@@ -874,6 +910,177 @@ static void mmcs_hdevt_trace(void *opaque)
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_trace, NULL);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
               + atoi(getenv("MMCS_HDEVT_TRACE_MS") ? : "10"));
+}
+
+/* MMCS fork (L16): MMCS_L16EV=<eventVA>@<delay_ms>[,...] — wake the
+ * servant-side waiters of the L15 frontier. DECODE (L16, park walks +
+ * full-RAM content scans + the stock CE5 mirror, all mirrored against
+ * PRIVATE/WINCEOS/COREOS/STORAGE/STOREMGR/storemain.cpp and the fsdmgr
+ * ghidra decode): the five parked events belong to THREE servant
+ * threads of the filesys process (thread list {0x906ff024 the hd.dll
+ * pump, 0x906a36f4, 0x906dc7a4, 0x906dcacc, ...}):
+ *  - WAITER A 0x906a36f4 = the fsdmgr STOREMGR PNPThread (thread start
+ *    0xc02c5da0 = FUN_c02c6048's CreateThread target, the stock
+ *    PNPThread mirror) waiting WaitForMultiple(3) with a PROXY ARRAY on
+ *    its kstack (0xd01cfad4/af8/b1c, stride 0x24 = sizeof(PROXY)) on
+ *    {0x9069c6ac g_hAutoLoadEvent "SYSTEM\AutoLoadFileSystems"
+ *    (manual-reset, NAMED — bType 0xff HT_MANUALEVENT in its proxy),
+ *    0x906a3598 g_hPNPUpdateEvent (auto-reset), 0x906a3634 = the PNP
+ *    msgqueue's read event (event+0x9c -> queue 0x8867ab14, whose
+ *    message list holds TWO real pending notifications, data at
+ *    0x906fedb0/0x906fef1c)}.
+ *  - WAITER B 0x906dc7a4 = a second kernel service pump (start
+ *    0x9083816c, the same pump class as the hd.dll thread's
+ *    0x908382be loop; service cells at 0x8867eb34) waiting on
+ *    0x906dc6e4 — no pending request (unset).
+ *  - WAITER C 0x906dcacc = a filesys.dll-tail thread (start
+ *    0xc00d0d40) that walked the Notify-class kernel methods
+ *    (0x90842fcc/0x90843032 frames) waiting on 0x906dc9fc — unset.
+ * THE SMOKING GUN (event +0x8c byte pair {+0x8d state, +0x8e flags}):
+ * 0x9069c6ac AND 0x906a3634 sit SIGNALED (fb010000: state=1) with
+ * their waiter proxies STILL LINKED — the vendor set paths ran (the
+ * phase-2 sync autoload DID complete, the queue DID receive device
+ * notifications) but the wakes were lost (the stock kernel prevents
+ * this via the BlockWithHelper wCount re-check; the vendor
+ * WaitForMultiple path does not) = the same missing-wake class L14
+ * found on hd.dll, now with REAL state behind it. FIX: complete the
+ * wake through 100% vendor code — per-event instances of the
+ * L15-proven stub (guard -> EventModIntr walker 0x90827f68(pEvent,
+ * EVENT_SET) -> MakeRunIfNeeded 0x908278e8) installed on the KILLSTK
+ * page (blocks at 0xBF00E000+n*0x100, below the L14 stub at 0xF000,
+ * clear of the kill-stack top 0xFF00 and the INTC reg window), wired
+ * to EMPTY dispatch slots (evt 0x220/0x260/0x280/0x2A0/0x2C0 — the
+ * fresh dispatch census shows only the default 0x90822e40 there),
+ * delivered through the 1ms tick chain (the proven path; the stub's
+ * event+0x8 guard makes the chained re-deliveries no-ops). One-shot
+ * per list entry: NO permanent synthetic pumping (a second firing =
+ * list the same VA again with a later delay). */
+#define MMCS_L16_STUB_BASE 0xBF00E000
+#define MMCS_L16_STUB_MARK 0xF0     /* marker cell at block+0xF0 */
+static const uint32_t mmcs_l16_evts[MMCS_L16_MAX] = {
+    0x220, 0x260, 0x280, 0x2A0, 0x2C0, 0x2E0, 0x300, 0x320
+};
+static const uint32_t mmcs_l16_slots[MMCS_L16_MAX] = {
+    0x0867A044, 0x0867A04C, 0x0867A050, 0x0867A054,
+    0x0867A058, 0x0867A05C, 0x0867A060, 0x0867A064
+};
+
+/* body = the L15 hdevt v2 stub verbatim (pool literals patched per
+ * instance: .Le event VA + .Lm marker cell — located by VALUE search,
+ * robust against layout drift) */
+static uint8_t mmcs_l16_stub[] = {
+    0x22, 0x4f,                /* sts.l pr,@-r15 */
+    0xe6, 0x2f,                /* mov.l r14,@-r15 */
+    0x0f, 0xd4,                /* mov.l .Le,r4 */
+    0x42, 0x50,                /* mov.l @(8,r4),r0 (proxy head) */
+    0x08, 0x20,                /* tst r0,r0 */
+    0x13, 0x89,                /* bt Lret (already delivered: no-op) */
+    0x0a, 0xe1,                /* mov #10,r1 (marker: delivery entered) */
+    0x0c, 0xd2,                /* mov.l .Lm,r2 */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x03, 0xe5,                /* mov #3,r5 (EVENT_SET) */
+    0x0c, 0xd3,                /* mov.l .Lw,r3 */
+    0x0b, 0x43,                /* jsr @r3 */
+    0x09, 0x00,                /* nop */
+    0x03, 0x6e,                /* mov r0,r14 (hWake = pTh) */
+    0x0b, 0xe1,                /* mov #11,r1 (marker: walker returned) */
+    0x08, 0xd2,                /* mov.l .Lm,r2 (reload: clobbered) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xe8, 0x2e,                /* tst r14,r14 */
+    0x06, 0x89,                /* bt Lret */
+    0xe3, 0x64,                /* mov r14,r4 */
+    0x08, 0xd3,                /* mov.l .Lmri,r3 */
+    0x0b, 0x43,                /* jsr @r3 */
+    0x09, 0x00,                /* nop */
+    0x0d, 0xe1,                /* mov #13,r1 (marker: MRI done) */
+    0x03, 0xd2,                /* mov.l .Lm,r2 */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xf6, 0x6e,                /* Lret: mov.l @r15+,r14 */
+    0x26, 0x4f,                /* lds.l @r15+,pr */
+    0x00, 0xe0,                /* mov #0,r0 (SYSINTR_NOP) */
+    0x0b, 0x00,                /* rts */
+    0x09, 0x00,                /* nop */
+    0x09, 0x00,                /* nop (align pad) */
+    0x00, 0xff, 0x00, 0xbf,    /* .Lm: marker cell */
+    0x34, 0xc2, 0x6d, 0x90,    /* .Le: pEvent (patched) */
+    0x68, 0x7f, 0x82, 0x90,    /* .Lw: 0x90827f68 walker */
+    0xe8, 0x78, 0x82, 0x90,    /* .Lmri: 0x908278e8 MRI */
+};
+
+static void mmcs_l16_slot_restore(void *opaque)
+{
+    struct mmcs_l16_ent *e = opaque;
+    static const uint32_t dflt = 0x90822e40;
+    cpu_physical_memory_write(e->slot_pa, &dflt, 4);
+    fprintf(stderr, "MMCS-L16: dispatch slot evt %03x restored\n",
+            e->evt_code);
+}
+
+static void mmcs_l16ev_fire(void *opaque)
+{
+    struct mmcs_l16_ent *e = opaque;
+    uint32_t slot_cur = 0;
+    cpu_physical_memory_read(e->slot_pa, &slot_cur, 4);
+    if (slot_cur != 0x90822e40) {
+        fprintf(stderr, "MMCS-L16: evt %03x slot busy (%08x) - SKIPPED\n",
+                e->evt_code, slot_cur);
+        return;
+    }
+    /* patch the two pool literals into a scratch copy (the pristine
+     * template must never be mutated — later fires search it again) */
+    uint8_t stub[sizeof mmcs_l16_stub];
+    memcpy(stub, mmcs_l16_stub, sizeof stub);
+    uint8_t *le = (uint8_t *)memmem(stub, sizeof stub, "\x34\xc2\x6d\x90", 4);
+    uint8_t *lm = (uint8_t *)memmem(stub, sizeof stub, "\x00\xff\x00\xbf", 4);
+    if (!le || !lm) {
+        fprintf(stderr, "MMCS-L16: stub literal locate FAILED\n");
+        return;
+    }
+    stl_le_p(le, e->evt_va);
+    stl_le_p(lm, e->stub_va + MMCS_L16_STUB_MARK);
+    /* P2 alias -> phys: subtract the P2 base 0xA0000000 (0xBF00Exxx ->
+     * 0x1F00Exxx; the L15 hdevt stub at 0xBF00F000 uses the same
+     * arithmetic — a -0x8000000/P1-style subtraction writes nowhere) */
+    cpu_physical_memory_write(e->stub_va - 0xA0000000, stub,
+                              sizeof stub);
+    cpu_physical_memory_write(e->slot_pa, &e->stub_va, 4);
+    e->pending = 8;    /* chain the next ticks (guard = no-op re-fires) */
+    fprintf(stderr, "MMCS-L16: stub @%08x for event %08x, slot evt %03x "
+            "wired, chained to next ticks\n",
+            e->stub_va, e->evt_va, e->evt_code);
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_l16_slot_restore,
+                                e);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+}
+
+static void mmcs_l16_boot_parse(void)
+{
+    const char *spec = getenv("MMCS_L16EV");
+    if (!spec) {
+        return;
+    }
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *tok = strtok(buf, ","); tok && mmcs_l16_n < MMCS_L16_MAX;
+         tok = strtok(NULL, ",")) {
+        unsigned long va = 0, ms = 0;
+        if (sscanf(tok, "%lx@%lu", &va, &ms) != 2 || !va) {
+            fprintf(stderr, "MMCS-L16: bad spec '%s'\n", tok);
+            continue;
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[mmcs_l16_n];
+        e->evt_va = va;
+        e->stub_va = MMCS_L16_STUB_BASE + mmcs_l16_n * 0x100;
+        e->evt_code = mmcs_l16_evts[mmcs_l16_n];
+        e->slot_pa = mmcs_l16_slots[mmcs_l16_n];
+        e->pending = 0;
+        fprintf(stderr, "MMCS-L16: event %08x scheduled @%lums "
+                "(stub %08x slot evt %03x)\n",
+                e->evt_va, ms, e->stub_va, e->evt_code);
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_l16ev_fire, e);
+        timer_mod(t, ms);
+        mmcs_l16_n++;
+    }
 }
 
 static void mmcs_vintc_evt_deliver(void *opaque)
@@ -1332,6 +1539,18 @@ static void mmcs_init(MachineState *machine)
                         fprintf(stderr, "MMCS: HDEVT event-set delivery "
                                 "(delay %sms)\n",
                                 getenv("MMCS_HDEVT_DELAY") ? : "140000");
+                    }
+                }
+                /* L16: servant-side waiter wakes (MMCS_L16EV list;
+                 * needs the KILLSTK stub page + the TICK delivery
+                 * chain, exactly like HDEVT) */
+                if (getenv("MMCS_L16EV")) {
+                    if (!mmcs_env_on("MMCS_KILLSTK")
+                        || !mmcs_env_on("MMCS_TICK")) {
+                        fprintf(stderr, "MMCS-L16: needs MMCS_KILLSTK"
+                                "+MMCS_TICK; not arming\n");
+                    } else {
+                        mmcs_l16_boot_parse();
                     }
                 }
             }
