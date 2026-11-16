@@ -603,9 +603,104 @@ void mmcs_inject_evt(uint32_t evt)
  * the ISR natively, the tick advances, sleepers expire, the notify
  * fires. Delayed start (MMCS_TICK_DELAY, default 12s, the
  * early-injection-derails-init rule from the VINTC experiments). */
+/* MMCS fork (L14): MMCS_HDEVT=1 — deliver the event-set for the parked
+ * boot thread's last wait. DECODE (L14, full-boot Z2 write-watchpoints on
+ * the waiter's event object + park walks + the stock-source mirror): the
+ * deterministic post-kill park leaves exactly ONE interesting waiter —
+ * the boot-stack kernel-only thread 0x906ff024 (kstk 0xd001ff00, THE
+ * first boot stack) blocked INFINITE in the vendor DoWait loop
+ * (0x90837cf6: re-issues KCall(0x90828244) = the old-CE BlockWithHelper
+ * while thread->wait-state bit 0x4000 is set) on the kernel EVENT object
+ * 0x906dc234 — an EVNT-class named event "hd.dll" (handle 0x8400, HDATA
+ * @0x906dc2d0 = {phys-self, lock, ref, pci="EVNT"@0x90822040, pvObj,
+ * hValue 0x00010002}), created at t~3s by 0x908361xx in the vendor
+ * KernelInit2 debug-harness lane (right after a "CeLog.dll"-named event;
+ * the stock mirror = kwin32.c KernelInit2: LoadKernelLibrary("hd.dll")/
+ * osaxst0/1/kd.dll, g_pHdEvent = the HDSTUB-client handshake event).
+ * The wait-block (0xd001fd98, on the waiter's kstack: {obj, next=self,
+ * prev=self, .., pTh=0x906ff024}) is the event's only proxy. NOTHING
+ * ever sets the event: a Z2 write-watch on the object for the whole boot
+ * saw ZERO writes after the block at t=16s — and no OAL ISR references
+ * it: the live 24-slot dispatch-table census shows only status-gated
+ * multi-source ISRs and unconditional-sysintr stubs (0x240->19, 0x540->
+ * 18, 0x780->33, 0x5a0->43, 0x640->57...), all of which pend+drain
+ * anonymously through PendEvents1 @0x886798b8 (the stock IntrEvents[]
+ * holds ONLY the OAL's own sysintr-34 stub at KData+0x208; registering
+ * our event into IntrEvents[6]+pend+bResched drains without a wake —
+ * the vendor drain has no stock EventModIntr walk). The feeder on real
+ * HW = the hd.dll client's own completion (or a boot config that skips
+ * the harness); in emulation it never comes.
+ * FIX: synthesize the set through 100% vendor code — a one-shot (BQL
+ * virtual timer, default MMCS_HDEVT_DELAY=140s = post-park) writes a
+ * small SH4 stub to the KILLSTK page (P2 0xBF00F000, kernel-executable,
+ * clear of both the sh7750 INTC register window at the region bottom and
+ * the kill stack top 0xBF00FF00; requires MMCS_KILLSTK) that calls the
+ * vendor event-set walker 0x90827f68(pEvent=0x906dc234, EVENT_SET=3)
+ * (both the EVNT m2 wrapper 0x9083fff0 — which decodes a HANDLE arg —
+ * and the internal DoEventMod 0x9083fe94 — which KCall()s the walker —
+ * fault when invoked from interrupt context; the walker itself runs
+ * with interrupts masked exactly like an ISR body),
+ * rewires an EMPTY dispatch-table slot (evt 0x200 -> slot dword
+ * @0x8867a040, RAM), then chains the delivery through the NEXT ticks
+ * (mmcs_hdevt_pending: a free-running injection races the 1ms tick's
+ * intevt overwrite — the tick callback is the proven delivery path).
+ * The waiter should wake with WAIT_OBJECT_0 and KernelInit2 continues. */
+static const uint8_t mmcs_hdevt_stub[] = {
+    0x22, 0x4f,             /* sts.l pr,@-r15 */
+    0xe6, 0x2f,             /* mov.l r14,@-r15 */
+    0x0a, 0xe1,             /* mov #10,r1 (marker: dispatch entered) */
+    0x07, 0xd2,             /* mov.l .Lm,r2 */
+    0x12, 0x22,             /* mov.l r1,@r2 */
+    0x07, 0xd4,             /* mov.l .Lh,r4 (pEvent 0x906dc234) */
+    0x03, 0xe5,             /* mov #3,r5 (EVENT_SET) */
+    0x07, 0xd3,             /* mov.l .Lf,r3 (0x9083fe94 DoEventMod) */
+    0x0b, 0x43,             /* jsr @r3 */
+    0x09, 0x00,             /* nop */
+    0x0b, 0xe1,             /* mov #11,r1 (marker: call returned) */
+    0x12, 0x22,             /* mov.l r1,@r2 */
+    0x02, 0x22,             /* mov.l r0,@r2 (EventModify ret) */
+    0xf6, 0x6e,             /* mov.l @r15+,r14 */
+    0x26, 0x4f,             /* lds.l @r15+,pr */
+    0x00, 0xe0,             /* mov #0,r0 (SYSINTR_NOP) */
+    0x0b, 0x00,             /* rts */
+    0x09, 0x00,             /* nop */
+    0x00, 0xff, 0x00, 0xbf, /* .Lm: marker cell 0xBF00FF00 (killstk top) */
+    0x34, 0xc2, 0x6d, 0x90, /* .Lh: pEvent 0x906dc234 */
+    0x68, 0x7f, 0x82, 0x90, /* .Lf: 0x90827f68 (DoEventMod's walker) */
+};
+
+static int mmcs_hdevt_pending;
+
+static void mmcs_hdevt_restore(void *opaque)
+{
+    static const uint32_t zero;
+    cpu_physical_memory_write(0x0867a040, &zero, 4);
+    fprintf(stderr, "MMCS-HDEVT: dispatch slot evt 0x200 restored\n");
+}
+
+static void mmcs_hdevt_fire(void *opaque)
+{
+    uint32_t stub_va = 0xBF00F000;
+    cpu_physical_memory_write(0x1F00F000, mmcs_hdevt_stub,
+                              sizeof mmcs_hdevt_stub);
+    cpu_physical_memory_write(0x0867a040, &stub_va, 4);
+    mmcs_hdevt_pending = 10;    /* chain the next 10 ticks to evt 0x200 */
+    fprintf(stderr, "MMCS-HDEVT: stub installed @%08x, slot evt 0x200 "
+            "rewired, chained to next ticks\n", stub_va);
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_restore, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+}
+
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
+    if (mmcs_hdevt_pending > 0) {
+        mmcs_inject_evt(0x200);
+        if (--mmcs_hdevt_pending == 0) {
+            fprintf(stderr, "MMCS-HDEVT: stub-evt deliveries done\n");
+        }
+        return;                 /* this tick slot consumed by the stub evt */
+    }
     mmcs_inject_evt(0x440);
     if (getenv("MMCS_TMUDEBUG") && (ntick++ % 500) == 0) {
         uint32_t tcnt = 0;
@@ -1059,6 +1154,23 @@ static void mmcs_init(MachineState *machine)
                 fprintf(stderr, "MMCS: TICK evt 0x440 every 1ms "
                         "(delay %sms)\n",
                         getenv("MMCS_TICK_DELAY") ? : "12000");
+                /* MMCS fork (L14): the parked boot-thread event-set
+                 * delivery (see mmcs_hdevt_fire; needs KILLSTK + TICK) */
+                if (mmcs_env_on("MMCS_HDEVT")) {
+                    if (!mmcs_env_on("MMCS_KILLSTK")) {
+                        fprintf(stderr, "MMCS-HDEVT: needs MMCS_KILLSTK "
+                                "for the stub page; not arming\n");
+                    } else {
+                        QEMUTimer *h = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                                    mmcs_hdevt_fire, NULL);
+                        timer_mod(h, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                                  + atoi(getenv("MMCS_HDEVT_DELAY")
+                                         ? : "140000"));
+                        fprintf(stderr, "MMCS: HDEVT event-set delivery "
+                                "(delay %sms)\n",
+                                getenv("MMCS_HDEVT_DELAY") ? : "140000");
+                    }
+                }
             }
         }
         MemoryRegion *mr = g_new(MemoryRegion, 1);
