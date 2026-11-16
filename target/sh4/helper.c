@@ -378,8 +378,10 @@ void superh_cpu_do_interrupt(CPUState *cs)
         static int nkd;
         if (nkd++ < 32) {
             fprintf(stderr, "MMCS: KAPIFIX garbage dispatch pc=%08x "
-                    "pr=%08x exp=%03x -> failed-call return\n", env->pc,
-                    env->pr, cs->exception_index);
+                    "pr=%08x exp=%03x tea=%08x r4=%08x r15=%08x"
+                    " -> failed-call return\n", env->pc,
+                    env->pr, cs->exception_index, env->tea, env->gregs[4],
+                    env->gregs[15]);
         }
         env->gregs[0] = 0;
         env->pc = env->pr;

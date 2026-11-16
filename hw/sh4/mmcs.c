@@ -644,32 +644,113 @@ void mmcs_inject_evt(uint32_t evt)
  * @0x8867a040, RAM), then chains the delivery through the NEXT ticks
  * (mmcs_hdevt_pending: a free-running injection races the 1ms tick's
  * intevt overwrite — the tick callback is the proven delivery path).
- * The waiter should wake with WAIT_OBJECT_0 and KernelInit2 continues. */
+ * The waiter should wake with WAIT_OBJECT_0 and KernelInit2 continues.
+ *
+ * MMCS fork (L15): complete the wake — the L14 stub delivered only the
+ * FIRST half of the vendor EventModify(EVENT_SET): the walker
+ * 0x90827f68 (= the stock EventModIntr, sched.c:1538) detaches the
+ * proxy, wCount++s and flips the waiter state16 0x62 -> 0x63
+ * (NEEDSRUN, `wInfo |= 3`), returning pTh — but the stock
+ * SC_EventModify (sched.c:1643-44) then does
+ * `if (hWake) KCall(MakeRunIfNeeded, hWake)`, and THAT half (the
+ * run-queue insert) never ran, so the vendor scheduler had no runnable
+ * thread to pick and the waiter stayed parked at NEEDSRUN. DECODE
+ * (L15, re_tools disasm + park walks, all mirroring stock sched.c):
+ *  - MakeRunIfNeeded 0x908278e8: guard state16&3==3, then (state&0x20
+ *    -> RunqDequeue 0x90826308 = the sleep-list unlink — the parked
+ *    waiter has the +0x148 sleep link 0x9069c2f8) + wCount++, then
+ *    MakeRun 0x90825ee4.
+ *  - MakeRun 0x90825ee4 = stock MakeRun (sched.c:709) instruction for
+ *    instruction: bSuspendCnt(+14) check, state16=(s&~3)|1 RUNNABLE,
+ *    cprio(+65), enqueue RunList@0x8867efa0 {+0 pRunnable,
+ *    +8+4*(cprio/8) pHashThread[]}, thread links +324/+328 (list) and
+ *    +340/+344 (hash ring), tail: when !pth or higher prio, the
+ *    long-store *(KDataPtr+0x88)=1 with KDataPtr=*0x8867ed64=
+ *    0x88679800 (park-verified) — i.e. the "resched/drain-B" gate
+ *    0x88679888, NOT the {drainA-flag,cNest} word 0x88679884 the
+ *    interrupt-return trampoline checks (word==0x0101 -> scheduler
+ *    entry 0x90822b0a).
+ *  - the completion is vendor-native from interrupt context: the
+ *    scheduler re-check (0x90822b7e) runs drain A 0x90826f4c (the
+ *    IntrEvents/KData-pend walk whose wake path itself calls MakeRun
+ *    0x90825ee4 directly from ISR context — proof the vendor does the
+ *    run-queue insert there too) and drain B 0x90827148 (gated by the
+ *    0x88679888 cell MakeRun sets: quantum bookkeeping + THE PICK that
+ *    fills RunList.pth from pRunnable), then switches to *(pth) and
+ *    rte-resumes the thread at its saved ctx (thread+0xb0/b4/b8).
+ *  - the L14 "walker switches context mid-flight / never returns"
+ *    reading was a stub bug: the stale r2 (callee-clobbered to pTh)
+ *    sent the marker+retval stores to *(pTh+0) (self-repairing); the
+ *    walker returned pTh in r0 all along.
+ * FIX: stub v2 — guarded (reads pEvent+0x8 first: re-deliveries on the
+ * 10-chained ticks after the arena reaped the event no-op instead of
+ * writing the recycled object), calls walker(pEvent, EVENT_SET), saves
+ * r0=hWake, reloads r2 (clobber lesson), and calls the vendor's own
+ * MakeRunIfNeeded(hWake) — the exact stock SC_EventModify post-flip
+ * sequence, minus the KCall wrapper (we are already in the
+ * interrupts-masked ISR-equivalent context KCall would create; the
+ * vendor's drain A does the same). The idle loop's tick wake ->
+ * drain-B pick -> switch completes the resume natively.
+ * RESULT (L15 A/B, one-shot @v140s + MMCS_HDEVT_REPEAT ladder):
+ * the wake WORKS — marker 0x0d (walker+MakeRunIfNeeded complete),
+ * wCount +2 per delivery (20 after the 10-tick chain = every chained
+ * delivery resumed the thread), the L14 tick-timer suicide is fixed
+ * (ticks survive the delivery: 187K post-delivery ticks; see
+ * mmcs_tick_deliver) — and the thread RE-BLOCKS every time BY DESIGN:
+ * the parked waiter's caller is an UNCONDITIONAL SERVICE PUMP
+ * (0x908382be: loop { KCall(SetPrio-class 0x90826b88); wait on the
+ * event at *(*(0x8867ebb4)+0x90); 0x908424d0; 0x90845aec; bra }),
+ * i.e. the L14 "last wait" is a kernel service loop (the harness/
+ * notify pump), not a boot step — the boot frontier is the OTHER
+ * parked waiters (the servant-side threads with waitblocks on
+ * 0x9069c6ac/0x906a3598/0x906a3634/0x906dc6e4/0x906dc9fc-class
+ * events), each needing its own feeder decoded (L16). */
 static const uint8_t mmcs_hdevt_stub[] = {
-    0x22, 0x4f,             /* sts.l pr,@-r15 */
-    0xe6, 0x2f,             /* mov.l r14,@-r15 */
-    0x0a, 0xe1,             /* mov #10,r1 (marker: dispatch entered) */
-    0x07, 0xd2,             /* mov.l .Lm,r2 */
-    0x12, 0x22,             /* mov.l r1,@r2 */
-    0x07, 0xd4,             /* mov.l .Lh,r4 (pEvent 0x906dc234) */
-    0x03, 0xe5,             /* mov #3,r5 (EVENT_SET) */
-    0x07, 0xd3,             /* mov.l .Lf,r3 (0x9083fe94 DoEventMod) */
-    0x0b, 0x43,             /* jsr @r3 */
-    0x09, 0x00,             /* nop */
-    0x0b, 0xe1,             /* mov #11,r1 (marker: call returned) */
-    0x12, 0x22,             /* mov.l r1,@r2 */
-    0x02, 0x22,             /* mov.l r0,@r2 (EventModify ret) */
-    0xf6, 0x6e,             /* mov.l @r15+,r14 */
-    0x26, 0x4f,             /* lds.l @r15+,pr */
-    0x00, 0xe0,             /* mov #0,r0 (SYSINTR_NOP) */
-    0x0b, 0x00,             /* rts */
-    0x09, 0x00,             /* nop */
-    0x00, 0xff, 0x00, 0xbf, /* .Lm: marker cell 0xBF00FF00 (killstk top) */
-    0x34, 0xc2, 0x6d, 0x90, /* .Lh: pEvent 0x906dc234 */
-    0x68, 0x7f, 0x82, 0x90, /* .Lf: 0x90827f68 (DoEventMod's walker) */
+    0x22, 0x4f,                /* sts.l pr,@-r15 */
+    0xe6, 0x2f,                /* mov.l r14,@-r15 */
+    0x0f, 0xd4,                /* mov.l .Le,r4 (pEvent 0x906dc234) */
+    0x42, 0x50,                /* mov.l @(8,r4),r0 (proxy head) */
+    0x08, 0x20,                /* tst r0,r0 */
+    0x13, 0x89,                /* bt Lret (already delivered: no-op) */
+    0x0a, 0xe1,                /* mov #10,r1 (marker: delivery entered) */
+    0x0c, 0xd2,                /* mov.l .Lm,r2 */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x03, 0xe5,                /* mov #3,r5 (EVENT_SET) */
+    0x0c, 0xd3,                /* mov.l .Lw,r3 (0x90827f68 walker) */
+    0x0b, 0x43,                /* jsr @r3 */
+    0x09, 0x00,                /* nop */
+    0x03, 0x6e,                /* mov r0,r14 (hWake = pTh) */
+    0x0b, 0xe1,                /* mov #11,r1 (marker: walker returned) */
+    0x08, 0xd2,                /* mov.l .Lm,r2 (reload: clobbered) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xe8, 0x2e,                /* tst r14,r14 */
+    0x06, 0x89,                /* bt Lret */
+    0xe3, 0x64,                /* mov r14,r4 */
+    0x08, 0xd3,                /* mov.l .Lmri,r3 (0x908278e8 MakeRunIfNeeded) */
+    0x0b, 0x43,                /* jsr @r3 */
+    0x09, 0x00,                /* nop */
+    0x0d, 0xe1,                /* mov #13,r1 (marker: MakeRunIfNeeded done) */
+    0x03, 0xd2,                /* mov.l .Lm,r2 */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xf6, 0x6e,                /* Lret: mov.l @r15+,r14 */
+    0x26, 0x4f,                /* lds.l @r15+,pr */
+    0x00, 0xe0,                /* mov #0,r0 (SYSINTR_NOP) */
+    0x0b, 0x00,                /* rts */
+    0x09, 0x00,                /* nop */
+    0x09, 0x00,                /* nop (align pad) */
+    0x00, 0xff,                /* .Lm: marker cell 0xBF00FF00 (killstk top) */
+    0x00, 0xbf,
+    0x34, 0xc2,                /* .Le: pEvent 0x906dc234 */
+    0x6d, 0x90,
+    0x68, 0x7f,                /* .Lw: 0x90827f68 (EventModIntr walker) */
+    0x82, 0x90,
+    0xe8, 0x78,                /* .Lmri: 0x908278e8 (MakeRunIfNeeded) */
+    0x82, 0x90,
 };
 
 static int mmcs_hdevt_pending;
+
+static void mmcs_hdevt_fire(void *opaque);
 
 static void mmcs_hdevt_restore(void *opaque)
 {
@@ -678,31 +759,65 @@ static void mmcs_hdevt_restore(void *opaque)
     fprintf(stderr, "MMCS-HDEVT: dispatch slot evt 0x200 restored\n");
 }
 
+static void mmcs_hdevt_trace(void *opaque);
+
 static void mmcs_hdevt_fire(void *opaque)
 {
     uint32_t stub_va = 0xBF00F000;
+    uint32_t link = 0;
+    cpu_physical_memory_read(0x106DC23C, &link, 4);   /* event +0x8 */
     cpu_physical_memory_write(0x1F00F000, mmcs_hdevt_stub,
                               sizeof mmcs_hdevt_stub);
     cpu_physical_memory_write(0x0867a040, &stub_va, 4);
     mmcs_hdevt_pending = 10;    /* chain the next 10 ticks to evt 0x200 */
     fprintf(stderr, "MMCS-HDEVT: stub installed @%08x, slot evt 0x200 "
-            "rewired, chained to next ticks\n", stub_va);
+            "rewired, chained to next ticks (event+8=%08x)\n",
+            stub_va, link);
+    if (mmcs_env_on("MMCS_HDEVT_TRACE")) {
+        QEMUTimer *tr = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_trace,
+                                     NULL);
+        timer_mod(tr, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+    }
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_restore, NULL);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+    /* MMCS fork (L15): the handshake LADDER — the vendor KernelInit2
+     * debug-harness lane waits sequentially ({osaxst1, osaxst0, hd.dll,
+     * kd.dll} per the L14 string table), and the arena reuses the
+     * 0x906dc234 slot for each successive named event (observed live:
+     * "CeLog.dll"->"hd.dll"->the post-wake event, all EVNT-class at
+     * the same address with the same HDATA @0x906dc2d0). With
+     * MMCS_HDEVT_REPEAT=<ms> the delivery re-arms: each firing wakes
+     * whatever waitblock is currently linked on the slot's event; the
+     * stub's +0x8 guard makes empty firings no-ops (safe while the
+     * woken thread runs its next step). */
+    if (getenv("MMCS_HDEVT_REPEAT")) {
+        QEMUTimer *r = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_fire,
+                                    NULL);
+        timer_mod(r, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                  + atoi(getenv("MMCS_HDEVT_REPEAT")));
+    }
 }
 
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
-    if (mmcs_hdevt_pending > 0) {
+    bool hdevt = mmcs_hdevt_pending > 0;
+    if (hdevt) {
         mmcs_inject_evt(0x200);
         if (--mmcs_hdevt_pending == 0) {
             fprintf(stderr, "MMCS-HDEVT: stub-evt deliveries done\n");
         }
-        return;                 /* this tick slot consumed by the stub evt */
+        /* L15 fix: do NOT return early — the tick timer must re-arm
+         * itself or the delivery kills every future tick (the L14
+         * early-return silently stopped the scheduler tick after the
+         * first HDEVT chain: the woken thread re-blocked into a tick
+         * void and could never be rescheduled; "deliveries done" never
+         * printed). We still skip this slot's 0x440 inject (the stub
+         * evt consumed it) but keep the 1ms cadence alive. */
+    } else {
+        mmcs_inject_evt(0x440);
     }
-    mmcs_inject_evt(0x440);
-    if (getenv("MMCS_TMUDEBUG") && (ntick++ % 500) == 0) {
+    if (!hdevt && getenv("MMCS_TMUDEBUG") && (ntick++ % 500) == 0) {
         uint32_t tcnt = 0;
         cpu_physical_memory_read(0xFFD8000C, &tcnt, 4);
         fprintf(stderr, "MMCS-TMU: tick#%" PRIu64 " vclk=%" PRId64
@@ -711,6 +826,54 @@ static void mmcs_tick_deliver(void *opaque)
     }
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_tick_deliver, NULL);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+}
+
+/* MMCS fork (L15 diagnostics): MMCS_HDEVT_TRACE=1 — sample the vendor
+ * scheduler cells around the parked waiter every 10ms of virtual time
+ * and print a line on ANY change (bounded: stops after 64 lines). Catches
+ * the wake/schedule/resume sequence ground-truth without gdb (whose
+ * stop sequencing proved unreliable for hot breakpoints). */
+static void mmcs_hdevt_trace(void *opaque)
+{
+    struct { uint32_t phys; const char *name; } cells[] = {
+        { 0x106FF030, "state16" },   /* waiter 0x906ff024 +0xc */
+        { 0x106FF0D4, "ctx.pc" },    /* waiter +0xb4 */
+        { 0x106FF0D0, "ctx.sp" },    /* waiter +0xb0 */
+        { 0x0867EFA0, "pRunnable" },
+        { 0x0867EFA4, "pth" },
+        { 0x08679884, "flagpair16" },
+        { 0x08679888, "drainB" },
+        { 0x08679810, "pCur" },
+    };
+    static uint32_t prev[8];
+    static int lines;
+    uint32_t cur[8];
+    bool changed = false;
+    for (unsigned i = 0; i < 8; i++) {
+        cur[i] = 0;
+        cpu_physical_memory_read(cells[i].phys, &cur[i], 4);
+        if (i == 5) {
+            cur[i] &= 0xffff;   /* the word84 pair only: mask the noisy
+                                 * per-tick byte at +2 (idle heartbeat) */
+        }
+        if (cur[i] != prev[i]) {
+            changed = true;
+        }
+    }
+    if (changed && lines < 256) {
+        fprintf(stderr, "MMCS-TRACE t=%" PRId64 "ms", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+        for (unsigned i = 0; i < 8; i++) {
+            if (cur[i] != prev[i]) {
+                fprintf(stderr, " %s=%08x->%08x", cells[i].name, prev[i], cur[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+        lines++;
+    }
+    memcpy(prev, cur, sizeof prev);
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_trace, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+              + atoi(getenv("MMCS_HDEVT_TRACE_MS") ? : "10"));
 }
 
 static void mmcs_vintc_evt_deliver(void *opaque)
