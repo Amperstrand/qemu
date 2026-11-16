@@ -328,25 +328,32 @@ static void mmcs_jitfix_sweep(void *opaque)
 
 static void mmcs_dump_ram(void *opaque)
 {
-    static const struct { hwaddr pa; const char *fn; } dumps[] = {
-        { 0x08602000, "/tmp/copy0.bin" },
-        { 0x0862c000, "/tmp/copy1.bin" },
-        { 0x0867a000, "/tmp/copy2.bin" },
-        { 0x08600000, "/tmp/ramstart.bin" },
-        { 0x08602848, "/tmp/waittable.bin" },
-        { 0x08602800, "/tmp/waitctx.bin" },
-        { 0x0867b200, "/tmp/apiset.bin" },
-        { 0x081C0000, "/tmp/srd1.bin" },
-        { 0x081C2800, "/tmp/srd2.bin" },
-        { 0x08602000, "/tmp/kdata64k.bin" },
-        { 0x10800000, "/tmp/imgpage1.bin" },
-        { 0x10801240, "/tmp/extarea.bin" },
-        { 0x0867e000, "/tmp/fntable.bin" },
-        { 0x0867a000, "/tmp/nkproc.bin" },
-        { 0x108f7000, "/tmp/dllpool.bin" },
-        { 0x1068e000, "/tmp/pagedmod.bin" },
-        { 0x0867a000, "/tmp/kdata2.bin" },
-        { 0x08600000, "/tmp/kdata0.bin" },
+    static const struct { hwaddr pa; uint32_t len; const char *fn; } dumps[] = {
+        { 0x08602000, 0x10000, "/tmp/copy0.bin" },
+        { 0x0862c000, 0x10000, "/tmp/copy1.bin" },
+        { 0x0867a000, 0x10000, "/tmp/copy2.bin" },
+        { 0x08600000, 0x10000, "/tmp/ramstart.bin" },
+        { 0x08602848, 0x10000, "/tmp/waittable.bin" },
+        { 0x08602800, 0x10000, "/tmp/waitctx.bin" },
+        { 0x0867b200, 0x10000, "/tmp/apiset.bin" },
+        { 0x081C0000, 0x10000, "/tmp/srd1.bin" },
+        { 0x081C2800, 0x10000, "/tmp/srd2.bin" },
+        { 0x08602000, 0x10000, "/tmp/kdata64k.bin" },
+        { 0x10800000, 0x10000, "/tmp/imgpage1.bin" },
+        { 0x10801240, 0x10000, "/tmp/extarea.bin" },
+        { 0x0867e000, 0x10000, "/tmp/fntable.bin" },
+        { 0x0867a000, 0x10000, "/tmp/nkproc.bin" },
+        { 0x108f7000, 0x10000, "/tmp/dllpool.bin" },
+        { 0x1068e000, 0x10000, "/tmp/pagedmod.bin" },
+        { 0x0867a000, 0x10000, "/tmp/kdata2.bin" },
+        { 0x08600000, 0x10000, "/tmp/kdata0.bin" },
+        /* FILEVIEW scratch (servant heap backing, phys 0x20000000): the
+         * park-state heap-content analysis target (S129). 64MB dump; the
+         * scan keeps only nonzero 4K pages. */
+        { 0x20000000, 16 * 1024 * 1024, "/tmp/fileview.bin" },
+        /* SRVPG .data window (servant .data seeded scratch, phys 0x26000000):
+         * the list heads the coredll walker consumes live here (S129). */
+        { 0x26000000, 4 * 1024 * 1024, "/tmp/srvpg.bin" },
     };
     static uint8_t buf[0x10000];
     /* MMCS_TLBDUMP=1: print all valid UTLB/ITLB VA->PA mappings of the
@@ -429,6 +436,18 @@ static void mmcs_dump_ram(void *opaque)
         return;
     }
     for (unsigned i = 0; !mmcs_fb_only_rearm && i < ARRAY_SIZE(dumps); i++) {
+        if (dumps[i].len > sizeof buf) {
+            /* large region: stream it */
+            FILE *f = fopen(dumps[i].fn, "wb");
+            if (f) {
+                uint8_t *big = g_malloc(dumps[i].len);
+                cpu_physical_memory_read(dumps[i].pa, big, dumps[i].len);
+                fwrite(big, 1, dumps[i].len, f);
+                g_free(big);
+                fclose(f);
+            }
+            continue;
+        }
         cpu_physical_memory_read(dumps[i].pa, buf, sizeof buf);
         FILE *f = fopen(dumps[i].fn, "wb");
         if (f) { fwrite(buf, 1, sizeof buf, f); fclose(f); }
