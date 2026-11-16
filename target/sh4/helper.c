@@ -422,6 +422,12 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * (5.2M faults/boot census 2026-11-15). Synthesize the function
      * return (r0=1 write-dropped): pop the r8/r9 pair pushed at entry
      * and return to PR, so the kernel exception handler completes. */
+    /* NOTE L15 (REVERTED EXPERIMENT): extending this guard to
+     * pc=0x90807562 (the ring-handle read) was WRONG — that fault fires
+     * in jmp-style call contexts where pr is stale/0, so the synthesis
+     * jumped to 0 (a manufactured pc=0/pr=0 freeze). The real L15 fix is
+     * the ring consumer (MMCS_RINGDRAIN): the producer's space check
+     * `ring[12]-ring[8] < r6` blocks when nothing drains the ring. */
     if (env->mmcs_ringfix_active && cs->exception_index == 0x040
         && env->pc == 0x908075a2) {
         uint32_t rv[2];
