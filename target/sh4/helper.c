@@ -673,6 +673,46 @@ cow_done:;
         const char *sf = getenv("MMCS_STKFLOOR");
         mmcs_stkfloor = sf ? strtoul(sf, NULL, 16) : 0xD0600000;
     }
+    /* MMCS_HBZERO (S131 repair #1): heap-window DATA-READ misses
+     * (exception 0x0A0 — distinct from the 0x040 instruction-fetch miss)
+     * get a demand-zero page. Rationale: the coredll list-walker (S129)
+     * follows item pointers into never-written heap VAs; FILEVIEW only
+     * backs writes. With a zero page the item key (+12) reads 0 — never
+     * matches — and next (0) terminates the walk cleanly. Additive,
+     * user-heap window only. */
+    if (env->mmcs_cowfix_active && getenv("MMCS_HBZERO")
+        && cs->exception_index == 0x0a0
+        && (env->sr & (1u << SR_MD)) == 0
+        && env->tea >= 0x00800000 && env->tea < 0x40000000) {
+        uint32_t rva = env->tea & ~0xFFFu;
+        uint32_t rpa = 0;
+        for (int i = 0; i < mmcs_nfvmap; i++) {
+            if (mmcs_fvmap[i].va == rva) {
+                rpa = mmcs_fvmap[i].pa;
+                break;
+            }
+        }
+        if (!rpa
+            && mmcs_fvmap_nxt + 0x1000 <= 0x24000000
+            && mmcs_nfvmap < 16384) {
+            rpa = mmcs_fvmap_nxt;
+            mmcs_fvmap_nxt += 0x1000;
+            mmcs_fvmap[mmcs_nfvmap].va = rva;
+            mmcs_fvmap[mmcs_nfvmap].pa = rpa;
+            mmcs_nfvmap++;
+        }
+        if (rpa) {
+            env->pteh = (rva & PTEH_VPN_MASK) | (env->pteh & PTEH_ASID_MASK);
+            env->ptel = ((rpa >> 10) << 10)
+                        | (3 << 5) | PTEL_V | PTEL_SZ_LOW
+                        | PTEL_C | PTEL_D | PTEL_SH;
+            cpu_load_tlb(env);
+            increment_urc(env);
+            cs->exception_index = -1;
+            return;
+        }
+    }
+
     if (env->mmcs_cowfix_active && getenv("MMCS_FILEVIEW")
         && (cs->exception_index == 0x060
             || cs->exception_index == 0x0c0)
