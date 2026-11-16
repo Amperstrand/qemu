@@ -521,26 +521,87 @@ static qemu_irq mmcs_vintc_irl;      /* SH4 IRL line (vendor INTC demux) */
 static SuperHCPU *mmcs_cpu;
 static uint32_t mmcs_vintc_evt_code;
 
-static void mmcs_vintc_evt_deliver(void *opaque)
+/* env-gate helper: on when set to anything except "0" (repo convention:
+ * scripts pass VAR=0 for the A/B off-arm) */
+static int mmcs_env_on(const char *name)
 {
-    /* deliver a vendor-INTC event: preset INTEVT + the fork's inject flag,
-     * then raise the CPU IRQ; superh_cpu_do_interrupt picks it up (fork
-     * hook) and the kernel trampoline @0x90822f80 dispatches
-     *   handler = *(u32*)(0x8867a000 + (evt>>3))   [BYTE offset, no scaling]
-     * i.e. slot dword = evt>>5 = id+16 for HookInterrupt id, so
-     *   EVT = 0x200 + id*0x20   (stock shexcept.src InterruptExceptionHandler
-     * arithmetic; S75/S76's "IRQ<<8, slot=code>>10" decode was WRONG - all
-     * S77 sweep codes landed outside the 0x800-byte table). Proven live:
-     * evt 0xAE0->slot87->0x9080caec (SDHI0 thunk, IISR chain[23]),
-     * evt 0xB00->slot88->0x9080cb08 (SDHI1, chain[24]),
-     * evt 0x3E0->slot31->0x9080ce70 (vendor-INTC ch ISR, sysintr 34). */
+    const char *v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+void mmcs_inject_evt(uint32_t evt);
+
+/* MMCS fork (L13): inject a vendor-INTC event into the CPU — the shared
+ * engine behind the MMCS_VINTC_EVT injector and the MMCS_TICK timer-tick
+ * delivery (mmcs_tick_deliver below). Presets INTEVT + the fork's inject
+ * flag, then raises the CPU IRQ; superh_cpu_do_interrupt picks it up
+ * (fork hook) and the kernel trampoline @0x90822f80 dispatches
+ *   handler = *(u32*)(0x8867a000 + (evt>>3))   [BYTE offset, no scaling]
+ * i.e. slot dword = evt>>5 = id+16 for HookInterrupt id, so
+ *   EVT = 0x200 + id*0x20   (stock shexcept.src InterruptExceptionHandler
+ * arithmetic; S75/S76's "IRQ<<8, slot=code>>10" decode was WRONG - all
+ * S77 sweep codes landed outside the 0x800-byte table). Proven live:
+ * evt 0xAE0->slot87->0x9080caec (SDHI0 thunk, IISR chain[23]),
+ * evt 0xB00->slot88->0x9080cb08 (SDHI1, chain[24]),
+ * evt 0x3E0->slot31->0x9080ce70 (vendor-INTC ch ISR, sysintr 34).
+ * Waking a sleep-halted CPU works: superh_cpu_has_work is
+ * CPU_INTERRUPT_HARD, so cpu_handle_halt clears cs->halted. */
+void mmcs_inject_evt(uint32_t evt)
+{
     if (mmcs_cpu) {
         CPUSH4State *env = &mmcs_cpu->env;
-        env->intevt = mmcs_vintc_evt_code;
+        static int n;
+        env->intevt = evt;
         env->mmcs_evt_inject = 1;
         cpu_reset_interrupt(CPU(mmcs_cpu), CPU_INTERRUPT_HARD);
         cpu_interrupt(CPU(mmcs_cpu), CPU_INTERRUPT_HARD);
+        if (getenv("MMCS_TMUDEBUG") && n++ < 64) {
+            fprintf(stderr, "MMCS-TMU: inject evt=%03x halted=%d intevt=%03x\n",
+                    evt, CPU(mmcs_cpu)->halted, env->intevt);
+        }
     }
+}
+
+/* MMCS fork (L13): MMCS_TICK=1 — deliver the vendor scheduler tick.
+ * DECODE (L13, gdb park-walk of the deterministic post-kill park): the
+ * system parks in the kernel idle loop `sleep` @0x908089fc with the TMU0
+ * configured (TSTR=0x03, TCOR0=0x2b62 = OALTimerInit(1,0x2b62,0), TCR0
+ * UNIE=1) but its underflow IRQ NEVER reaches the CPU: the vendor
+ * SH7777 OAL programs no sh7750-compatible IPRA (reads 0 = TUNI0 masked
+ * forever; the real unit routes timers through the vendor INTC at
+ * 0xF4000000), so nothing wakes the halted CPU and CurMSec/SleepList
+ * freeze — every timeout-based notify (the relaunch KillThread
+ * owner-wait @0x9082954c: Sleep(500) doubling to a 30000 cap waiting
+ * for pProc+0xC4 to drop to the 0x80000000 marker) parks forever.
+ * The vendor dispatch table (@0x8867a000, handler = *(u32*)(base +
+ * (evt>>3))) holds the timer ISR 0x90809d78 (the S91 timer-ISR
+ * epilogue: clears TMU TCSR, cur-thread bookkeeping, scheduler yield)
+ * at slot 0x8867a088 => EVT 0x440 (id 18 = the stock TUNI2 vector).
+ * FIX: a 1ms QEMU_CLOCK_VIRTUAL timer (the JITFIX/DUMP timer class —
+ * these fire reliably at the park, unlike the tmu012 ptimer whose
+ * callback starves behind the halted vCPU) delivers EVT 0x440 through
+ * the shared injector; the kernel trampoline @0x90822f80 dispatches
+ * the ISR natively, the tick advances, sleepers expire, the notify
+ * fires. Delayed start (MMCS_TICK_DELAY, default 12s, the
+ * early-injection-derails-init rule from the VINTC experiments). */
+static void mmcs_tick_deliver(void *opaque)
+{
+    static uint64_t ntick;
+    mmcs_inject_evt(0x440);
+    if (getenv("MMCS_TMUDEBUG") && (ntick++ % 500) == 0) {
+        uint32_t tcnt = 0;
+        cpu_physical_memory_read(0xFFD8000C, &tcnt, 4);
+        fprintf(stderr, "MMCS-TMU: tick#%" PRIu64 " vclk=%" PRId64
+                " TCNT0=%08x\n", ntick,
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), tcnt);
+    }
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_tick_deliver, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+}
+
+static void mmcs_vintc_evt_deliver(void *opaque)
+{
+    mmcs_inject_evt(mmcs_vintc_evt_code);
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vintc_evt_deliver, NULL);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
               + atoi(getenv("MMCS_VINTC_EVT_MS") ? : "20"));
@@ -968,6 +1029,17 @@ static void mmcs_init(MachineState *machine)
                 timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
                           + atoi(vi));
                 fprintf(stderr, "MMCS: vendor-INTC IRQ injection every %sms\n", vi);
+            }
+            /* MMCS fork (L13): the scheduler-tick delivery (see
+             * mmcs_tick_deliver for the full decode) */
+            if (mmcs_env_on("MMCS_TICK")) {
+                QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                            mmcs_tick_deliver, NULL);
+                timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                          + atoi(getenv("MMCS_TICK_DELAY") ? : "12000"));
+                fprintf(stderr, "MMCS: TICK evt 0x440 every 1ms "
+                        "(delay %sms)\n",
+                        getenv("MMCS_TICK_DELAY") ? : "12000");
             }
         }
         MemoryRegion *mr = g_new(MemoryRegion, 1);
