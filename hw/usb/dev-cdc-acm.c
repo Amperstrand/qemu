@@ -329,6 +329,12 @@ static void usb_cdc_acm_pull(void *opaque)
             }
         }
     }
+    if (getenv("OHCI_DEBUG_DMA")) {
+        static unsigned long pf;
+        if (!(++pf % 1000)) {
+            fprintf(stderr, "CDC_PULL x%lu\n", pf);
+        }
+    }
     timer_mod(s->pull_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
 }
 
