@@ -60,6 +60,38 @@ static int find_utlb_entry(CPUSH4State *env, target_ulong address,
                            int use_asid);
 static void increment_urc(CPUSH4State *env);
 
+/* MMCS fork (L8): the MMCS_FILEVIEW scratch va->pa table, hoisted to
+ * file scope so diagnostics (MMCS_NULLCALL) can read a frozen stack
+ * physically — the guest UTLB entries get flushed per launch, but the
+ * backing phys pages live on in the mmcs.fileview RAM region. */
+static struct { uint32_t va, pa; } mmcs_fvmap[16384];
+static int mmcs_nfvmap;
+static uint32_t mmcs_fvmap_nxt = 0x20000000;
+
+/* MMCS fork (L8): shared ILKFIX progress latch — set when the first
+ * USER-mode KData-page fault maps VA 0x5000 (coredll PSL bind = the
+ * launches are live, the early IRQ-init walk is past). Gates (a) the
+ * kernel-mode interlocked fetch map below and (b) the exception-boundary
+ * emulation's kernel-side arming (its old function-local latch never
+ * fired: user fetches hit the mapped page and never fault). */
+static bool mmcs_ilkfix_user_seen;
+
+/* MMCS fork (L8): is this VA a plausible CODE address for this unit?
+ * Windows: KData/LOWSLOT 0x4000-0x8000, coredll user window
+ * 0x40000000-0x40100000, PSL servant module windows 0xC0000000-0xC8000000
+ * (filesys 0xc00b / fsdmgr 0xc02c / gwes... observed live), kernel XIP
+ * P1 0x90800000-0x97000000. Kernel RAM P1 0x88600000+ is DATA in this
+ * boot (KData/structs/loader tables — no relocatable kernel code ever
+ * loads), heap arenas / stack arena / MMIO / ASCII garbage = not code.
+ * Used by the KAPIFIX garbage-dispatch synthesis. */
+static bool mmcs_plausible_code(uint32_t va)
+{
+    return (va >= 0x00004000 && va < 0x00008000)
+        || (va >= 0x40000000 && va < 0x40100000)
+        || (va >= 0xC0000000 && va < 0xC8000000)
+        || (va >= 0x90800000 && va < 0x97000000);
+}
+
 void superh_cpu_do_interrupt(CPUState *cs)
 {
     SuperHCPU *cpu = SUPERH_CPU(cs);
@@ -155,9 +187,107 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * API call: r0=0, resume at PR (the thunk jmps, so PR = the
      * caller's post-jsr site). Same treatment for kernel-mode fetch
      * faults at pc=0 (NULL method from a reset table). */
+    /* MMCS_NULLCALL=1 (L8 diagnostic): the first kernel-mode fetch fault
+     * at pc=0 (the NULL-fn-call freeze entry, silently absorbed by the
+     * return-to-pr=0 loop below) dumps the full register set + stack
+     * words BEFORE the black hole — the frames at r15 name the caller
+     * chain that jumped/returned to NULL. Rate-limited: first 8 dumps,
+     * then every 100000th (loop proof). */
+    if (env->pc == 0x00000000 && getenv("MMCS_NULLCALL")
+        && (env->sr & (1u << SR_MD))) {
+        static unsigned long nseen;
+        nseen++;
+        if (nseen <= 8 || nseen % 100000 == 0) {
+            fprintf(stderr, "NULLCALL #%lu exp=%03x pr=%08x spc=%08x "
+                    "r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x "
+                    "r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x "
+                    "r12=%08x r13=%08x r14=%08x r15=%08x\n",
+                    nseen, cs->exception_index, env->pr, env->spc,
+                    env->gregs[0], env->gregs[1], env->gregs[2],
+                    env->gregs[3], env->gregs[4], env->gregs[5],
+                    env->gregs[6], env->gregs[7], env->gregs[8],
+                    env->gregs[9], env->gregs[10], env->gregs[11],
+                    env->gregs[12], env->gregs[13], env->gregs[14],
+                    env->gregs[15]);
+            fprintf(stderr, "NULLSTACK(virt):");
+            for (int i = 0; i < 32; i++) {
+                uint32_t w = 0;
+                cpu_memory_rw_debug(cs, env->gregs[15] + 4 * i,
+                                    (void *)&w, 4, 0);
+                fprintf(stderr, " %08x", w);
+            }
+            fprintf(stderr, "\n");
+            /* same words read PHYSICALLY through the FILEVIEW scratch
+             * map (the guest UTLB entry may have been flushed since) */
+            {
+                uint32_t pg = env->gregs[15] & ~0xFFFu;
+                uint32_t base_pa = 0;
+                for (int j = 0; j < mmcs_nfvmap; j++) {
+                    if (mmcs_fvmap[j].va == pg) {
+                        base_pa = mmcs_fvmap[j].pa;
+                        break;
+                    }
+                }
+                if (base_pa) {
+                    fprintf(stderr, "NULLSTACK(phys):");
+                    for (int i = 0; i < 48; i++) {
+                        uint32_t a = env->gregs[15] + 4 * i;
+                        uint32_t pa = 0;
+                        for (int j = 0; j < mmcs_nfvmap; j++) {
+                            if (mmcs_fvmap[j].va == (a & ~0xFFFu)) {
+                                pa = mmcs_fvmap[j].pa + (a & 0xFFFu);
+                                break;
+                            }
+                        }
+                        uint32_t w = 0;
+                        if (pa) {
+                            cpu_physical_memory_read(pa, &w, 4);
+                        }
+                        fprintf(stderr, " %08x", w);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
     if (env->mmcs_kapifix_active
         && (cs->exception_index == 0x040 || cs->exception_index == 0x060)
         && (env->pc == 0x908083fc || env->pc == 0x00000000)) {
+        env->gregs[0] = 0;
+        env->pc = env->pr;
+        cs->exception_index = -1;
+        return;
+    }
+    /* KAPIFIX part 1b (L8, 2026-11-16): kernel-side garbage-dispatch
+     * synthesis — the twin of the user-side MMCS_APIFIX 0xFFFFxxxx
+     * class. With ILKFIX kernel-mode interlocked ops armed (L8), the
+     * per-IRQ-source walk (callers 0x90807674/0x90807720-class) gets
+     * past the old abort points and calls the kernel API thunk table
+     * (@0x908083f8: r2=*(slot); jmp @*(r2+40)) with slots the loader
+     * never bound: *(slot) points into loader data (observed method
+     * 0x73617245 = ASCII "Ears", bytes from IPILib.dll's image) and
+     * the tail-jmp fetch-faults at the garbage VA. Because the thunk
+     * TAIL-JUMPS, pr = the original caller's post-jsr site, and those
+     * callers ignore the return value (L3-proven) — so synthesize the
+     * failed call: r0=0, resume at pr. Gated to KERNEL-mode fetch
+     * faults whose pc is outside every real code window of this unit
+     * AND whose pr is inside one (no synthesizing returns to garbage
+     * callers). */
+    if (env->mmcs_kapifix_active
+        && (cs->exception_index == 0x040 || cs->exception_index == 0x0e0
+            || cs->exception_index == 0x180
+            || cs->exception_index == 0x1a0)
+        && (env->sr & (1u << SR_MD))
+        && env->pc != 0
+        && env->pc < 0xffff0000     /* 0xFFFFxxxx = PSL syscall slots */
+        && !mmcs_plausible_code(env->pc)
+        && mmcs_plausible_code(env->pr)) {
+        static int nkd;
+        if (nkd++ < 32) {
+            fprintf(stderr, "MMCS: KAPIFIX garbage dispatch pc=%08x "
+                    "pr=%08x exp=%03x -> failed-call return\n", env->pc,
+                    env->pr, cs->exception_index);
+        }
         env->gregs[0] = 0;
         env->pc = env->pr;
         cs->exception_index = -1;
@@ -232,12 +362,11 @@ void superh_cpu_do_interrupt(CPUState *cs)
         && (cs->exception_index == 0x180
             || cs->exception_index == 0x040
             || cs->exception_index == 0x0e0)
-        && (env->pc & ~7u) >= 0x5B80 && (env->pc & ~7u) <= 0x5BF0) {
-        static bool user_seen;
+        && (env->pc & ~7u) >= 0x5B80 && (env->pc & ~7u) <= 0x5BF8) {
         bool kern = (env->sr & (1u << SR_MD)) != 0;
         if (!kern) {
-            user_seen = true;
-        } else if (!user_seen) {
+            mmcs_ilkfix_user_seen = true;
+        } else if (!(mmcs_ilkfix_user_seen && getenv("MMCS_KILK"))) {
             /* fall through to normal kernel exception handling */
             goto ilk_no_emu;
         }
@@ -324,12 +453,17 @@ ilk_no_emu:;
      *      would otherwise abort the PSL bind (x2/launch). */
     if (env->mmcs_cowfix_active
         && (((env->sr & (1u << SR_MD)) == 0
-             && (cs->exception_index == 0x060
-                 || cs->exception_index == 0x0c0)
-             && env->tea >= 0x40000000 && env->tea < 0x80000000)
+              && (cs->exception_index == 0x060
+                  || cs->exception_index == 0x0c0)
+              && env->tea >= 0x40000000 && env->tea < 0x80000000)
             || ((env->sr & (1u << SR_MD)) != 0
                 && cs->exception_index == 0x040
                 && env->tea >= 0x40074000 && env->tea < 0x40080000))) {
+        /* launched-server .data page-in misses = PSL launches live —
+         * arm the kernel-mode ILKFIX fetch map (L8, MMCS_KILK) */
+        if ((env->sr & (1u << SR_MD)) == 0 && getenv("MMCS_KILK")) {
+            mmcs_ilkfix_user_seen = true;
+        }
         uint32_t va = env->tea & ~0xFFFu;
         int n = find_utlb_entry(env, va,
                                 !(env->mmucr & MMUCR_SV)
@@ -437,27 +571,41 @@ cow_done:;
              && env->tea >= 0x00800000 && env->tea < 0x40000000)
             || ((env->sr & (1u << SR_MD)) != 0
                 && env->tea >= 0xD0600000 && env->tea < 0xDC000000))) {
+        /* user heap-arena write misses only happen once the PSL
+         * launches are live — arm the kernel-mode ILKFIX fetch map
+         * (L8, MMCS_KILK) */
+        if ((env->sr & (1u << SR_MD)) == 0 && getenv("MMCS_KILK")) {
+            mmcs_ilkfix_user_seen = true;
+        }
         uint32_t va = env->tea & ~0xFFFu;
-        static struct { uint32_t va, pa; } fvmap[16384];
-        static int nfvmap;
-        static uint32_t fv_next = 0x20000000;
         uint32_t pa = 0;
-        for (int i = 0; i < nfvmap; i++) {
-            if (fvmap[i].va == va) {
-                pa = fvmap[i].pa;
+        for (int i = 0; i < mmcs_nfvmap; i++) {
+            if (mmcs_fvmap[i].va == va) {
+                pa = mmcs_fvmap[i].pa;
                 break;
             }
         }
         if (!pa) {
-            if (fv_next + 0x1000 <= 0x24000000 && nfvmap < 16384) {
-                pa = fv_next;
-                fv_next += 0x1000;
-                fvmap[nfvmap].va = va;
-                fvmap[nfvmap].pa = pa;
-                nfvmap++;
+            if (mmcs_fvmap_nxt + 0x1000 <= 0x24000000 && mmcs_nfvmap < 16384) {
+                pa = mmcs_fvmap_nxt;
+                mmcs_fvmap_nxt += 0x1000;
+                mmcs_fvmap[mmcs_nfvmap].va = va;
+                mmcs_fvmap[mmcs_nfvmap].pa = pa;
+                mmcs_nfvmap++;
+                /* MMCS_FVLOG=1 (L8 diagnostic): every NEW scratch-page
+                 * install (va, pa) — the stack-arena march + heap-arena
+                 * leak census source, and the pa lookup for reading a
+                 * frozen stack via physical memory. */
+                if (getenv("MMCS_FVLOG")) {
+                    static int nfvl;
+                    if (nfvl++ < 4096) {
+                        fprintf(stderr, "FVMAP new va=%08x -> pa=%08x "
+                                "(n=%d)\n", va, pa, mmcs_nfvmap);
+                    }
+                }
             } else {
                 fprintf(stderr, "MMCS: FILEVIEW scratch exhausted "
-                        "(%d pages)\n", nfvmap);
+                        "(%d pages)\n", mmcs_nfvmap);
                 goto fileview_done;
             }
         }
@@ -1392,9 +1540,30 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
      * processes (coredll DllMain PSL bind/heap init in the launched
      * servers) get working interlocked ops; the kernel keeps the
      * abort-early behavior.
+     *
+     * L8 correction (2026-11-16, launch lane): the abort-early policy
+     * is right for the EARLY walk but wrong afterwards — kernel-mode
+     * fetch faults at the interlocked block were censused at x223/boot
+     * (0x5bd0 ILCmpExchange x93, 0x5bf0 ILXAdd/Decrement x127, 0x5b90
+     * ILPopList x3) once launches run: the locked-inc helper
+     * (0x908383c8, called from the thread/process-creation chain
+     * 0x90835f10) aborts MID-CREATION, a half-built thread is queued,
+     * and the scheduler later resumes its zeroed context (pc=0 pr=0 =
+     * the L8 freeze); the never-executed InterlockedDecrement x127 =
+     * the 64KB/launch stack-block leak marching the 0xD0 arena. Stock
+     * intrlock.src runs these ops in "Kernel mode or User mode". Fix:
+     * AFTER the first user-mode KData-page fault (mmcs_ilkfix_user_seen
+     * = launches live, early walk past), kernel-mode FETCH faults into
+     * [0x5B80,0x5C00) map the same seeded page. Data faults and the
+     * whole page stay user-only (loader-data holes stay hidden).
      */
     if (ret != MMU_OK && ((uint32_t)address & 0xFFFFF000u) == 0x5000
-        && mmu_idx == MMU_USER_IDX
+        && ((mmu_idx == MMU_USER_IDX)
+            || (getenv("MMCS_KILK")
+                && mmcs_ilkfix_user_seen
+                && access_type == MMU_INST_FETCH
+                && (uint32_t)address >= 0x5B80
+                && (uint32_t)address < 0x5C00))
         && getenv("MMCS_ILKFIX")) {
         static const uint8_t blk_poplist[16] = {   /* +0x390 */
             0x42, 0x60, 0x09, 0x00, 0x08, 0x20, 0x05, 0x8b,
@@ -1447,6 +1616,9 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             seeded = true;
             fprintf(stderr, "MMCS: ILKFIX seeded interlocked blocks "
                     "@phys 0x0C020B80 (KData page)\n");
+        }
+        if (mmu_idx == MMU_USER_IDX) {
+            mmcs_ilkfix_user_seen = true;
         }
         tlb_set_page(cs, 0x5000, 0x0C020000,
                      PAGE_READ | PAGE_WRITE | PAGE_EXEC, mmu_idx,
