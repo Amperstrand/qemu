@@ -2995,10 +2995,63 @@ static void mmcs_init(MachineState *machine)
              * (mov #1,r3 -> mov #0,r3 at the flash image of fsdmgr
              * .text). Env-gated, default off. */
             uint16_t mov0 = 0xE003;    /* mov #0,r3 */
-            hwaddr bpa = MMCS_FLASH_BASE + (0x90a8497e - 0x90800000);
-            cpu_physical_memory_write(bpa, &mov0, 2);
+            /* L27 fix: the old cpu_physical_memory_write here was a
+             * silent no-op — the flash MR is added to the address space
+             * only later (after set_readonly), so the write hit nothing
+             * and every BOOTFS A/B since L20 ran unpatched. Write
+             * through the RAM pointer instead (the L14 pool-patch
+             * pattern). */
+            uint8_t *fb0 = memory_region_get_ram_ptr(flash);
+            *(uint16_t *)(fb0 + (0x90a8497e - 0x90800000)) = mov0;
             fprintf(stderr, "MMCS: BOOTFS AutoLoad BootPhase default "
                     "1->0 patched @ROM 0x90a8497e\n");
+        }
+        if (getenv("MMCS_BOOTLD")) {
+            /* MMCS fork (L27/S147): loader-completion patches.
+             * DECODE: the launch handshake (the boot-continuation's
+             * launcher thread, kitl-region 0x9083e1ec = the stock
+             * RunApps/SystemStartupFunc mirror: LoadOneLibraryW
+             * "filesys.dll" flags 0x18000 -> CreateEvent(manual
+             * "SYSTEM/FSReady") -> CreateKernelThread(pMod,hFSReady) ->
+             * WaitForSingleObject(hFSReady,INFINITE)) never crosses its
+             * first step: the by-name load (0x908367a4 -> wrapper
+             * 0x908365fc -> InitModule 0x908360e8 OK -> Part2 hook
+             * [[0x8867ebec]] = k.coredll c003c690) spins at 5-10 Hz
+             * forever because Part2's completion semantics reject these
+             * modules: DoImports returning 0 (pre-bound/empty import
+             * descriptors — the FS_* dispatch ships literal targets)
+             * never sets the 0x200 flag, the 0x300 DllMain gate never
+             * passes, the LOADING bit 0x100 stays set and the free-gate
+             * (ROM 0x908e771a `bt 0x908e7738`) falls through to the
+             * FREE + NULL path — the pMod is freed, the load returns
+             * NULL, the state machine retries, and the launcher
+             * eventually parks waiting FSReady with the servant thread
+             * never created (FileSysMain zero TBs, chain[23]/[24] NULL).
+             * On HW the ROM-TOC boot walk pre-registers these modules
+             * so the by-name find matches and the fresh-load path never
+             * runs; in emulation the find misses (the list walk's name
+             * chase) so every load is a fresh load. PATCHES (2 bytes
+             * each, XIP flash, the MMCS_BOOTFS class):
+             *  1. ROM 0x908e771a: bt->bra over the Part2 free path —
+             *     Part2 always returns the pMod (never frees), so the
+             *     by-name caller's hook result is non-NULL and the
+             *     launcher receives its module.
+             *  2. ROM 0x90836818: cmp/eq r2,r3 -> cmp/eq r3,r3 — the
+             *     by-name postcheck ([pMod+14]&0x600)==0x200 accepts
+             *     the module, which links it into the global module
+             *     list so subsequent by-name finds MATCH and the 5-10
+             *     Hz re-load state machines converge.
+             * Env-gated, default off. */
+            uint16_t bra = 0xA00D;      /* bra #13 -> 0x908e7738 */
+            uint16_t cmpeqr3r3 = 0x3332;/* cmp/eq r3,r3 (always T) */
+            /* direct RAM-pointer writes: the flash MR is not yet in the
+             * address space here (see the BOOTFS note) */
+            uint8_t *fb1 = memory_region_get_ram_ptr(flash);
+            *(uint16_t *)(fb1 + (0x908e771a - 0x90800000)) = bra;
+            *(uint16_t *)(fb1 + (0x90836818 - 0x90800000)) = cmpeqr3r3;
+            fprintf(stderr, "MMCS: BOOTLD loader-completion patched "
+                    "@ROM 0x908e771a (Part2 free-gate bra) + 0x90836818 "
+                    "(byname 0x200 postcheck pass)\n");
         }
         if (getenv("MMCS_REGFIX")) {
             cpu->env.mmcs_regfix_active = 1;
