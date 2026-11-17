@@ -198,6 +198,28 @@ static size_t mmcs_srvt_blob_len;
  * in target/sh4/helper.c */
 int mmcs_iatfix_on;
 
+/* MMCS fork (L22): MMCS_C0ARM=1 — arm the C0-window module service
+ * (SRVPG .text/.data + IATFIX manifest) for the KERNEL-side servant
+ * lane. Decoded 2026-11-17 (L22): the S141 post-prgInit death — the
+ * k.coredll api-set/handle-table walk, statically the stock loader.c
+ * import/export machinery (c003c354 DoImports-loop / c003ca10
+ * ResolveImpOrd / c003c8e4 AddrFromEat, forwarder '.'-parse) — dies
+ * because EVERY C0-window miss in these boots is refused with the
+ * launch latch CLOSED: mmcs_ilkfix_user_seen only ever sets on USER-
+ * mode events (KData 0x5000 fault / user arena write), but this
+ * image's servants run entirely KERNEL-side (filesys relaunch lane)
+ * so the latch never fires (L22DBG: every unserviced miss has
+ * ilk=0, srvpg=1, iatfix=1 — e.g. the death triple: fetch
+ * va=c003c3dc acc=0 pr=c003c39e, IAT store va=c0012000 acc=2,
+ * export-dir read va=c0076470 acc=0 pr=90836a66 = the kernel's own
+ * KernelInit2 module walk). The C0 window holds REAL module pages
+ * (manifest XIP .text = flash bytes, non-XIP = decompressed init
+ * content) — serving them to the kernel from first contact is what
+ * the real pager does; the L8 early-walk hazard (loader-data holes)
+ * was about the KData interlocked page, never this window. Consumed
+ * by the SRVPG/IATFIX gates in superh_cpu_tlb_fill. */
+int mmcs_c0arm;
+
 #define MMCS_SRVPG_ROM_BASE 0x90800000
 static const struct { uint32_t va, sz, rom; } mmcs_srvpg_secs[] = {
     /* k.coredll servant .data sections (realaddr manifest, verified
@@ -300,10 +322,19 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
         *rw = false;
         return MMCS_FLASH_BASE + s->rom + ((va & ~0xFFFu) - s->va);
     }
-    /* non-XIP: deduped seeded scratch (the shared module instance copy) */
+    /* non-XIP: deduped seeded scratch (the shared module instance copy).
+     * RW decode (L22 fix): the SRP2 manifest flags field is the o32/PE
+     * section characteristics (build_srvpg_table.py passes them through
+     * raw) — writable = IMAGE_SCN_MEM_WRITE 0x80000000 (e.g. the IAT
+     * sections c0012000 flags=c0300040, c00ce000 flags=c0002040).
+     * The old `flags & 0x80` read never matched any manifest row
+     * (0x80 is not a PE bit) so EVERY non-XIP section was served RO
+     * and the loader's IAT stores bounced (the L22 death class after
+     * the latch opened). Keep the 0x80 term for any legacy SRP1
+     * table that used a host-side bit. */
     for (int i = 0; i < mmcs_nsrvpg; i++) {
         if (mmcs_srvpg_map[i].va == (va & ~0xFFFu)) {
-            *rw = !!(s->flags & 0x80);
+            *rw = !!(s->flags & 0x80000000u) || !!(s->flags & 0x80u);
             return mmcs_srvpg_map[i].pa;
         }
     }
@@ -330,7 +361,7 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
                     "-> pa=%08x (n=%d)\n", va & ~0xFFFu, pa, mmcs_nsrvpg);
         }
     }
-    *rw = !!(s->flags & 0x80);
+    *rw = !!(s->flags & 0x80000000u) || !!(s->flags & 0x80u);
     return pa;
 }
 
@@ -2471,6 +2502,13 @@ static void mmcs_init(MachineState *machine)
                         fprintf(stderr, "MMCS: IATFIX generalized C0-window "
                                 "module service armed (manifest %u secs)\n",
                                 n);
+                        if (mmcs_env_on("MMCS_C0ARM")) {
+                            mmcs_c0arm = 1;
+                            fprintf(stderr, "MMCS: C0ARM kernel-side-servant "
+                                    "lane (L22) — the SRVPG/IATFIX window "
+                                    "service ignores the user-mode launch "
+                                    "latch\n");
+                        }
                     }
                 } else {
                     fprintf(stderr, "MMCS: SRVPGTAB %s: bad magic/count - "

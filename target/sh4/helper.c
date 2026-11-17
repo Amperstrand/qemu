@@ -72,6 +72,10 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va);
  * after the .data seeding fix). */
 extern int mmcs_iatfix_on;
 hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
+/* MMCS fork (L22): MMCS_C0ARM — arm the C0-window module service in
+ * the kernel-side servant lane (the launch latch never fires there;
+ * see the full decode in hw/sh4/mmcs.c). */
+extern int mmcs_c0arm;
 
 /* MMCS fork (L21): MMCS_PGOWN — the write-sticky page-ownership table
  * (hw/sh4/mmcs.c). Consulted at every tlb_set_page site below: clean
@@ -2005,9 +2009,12 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
      * is never raised, the forward/marshal/re-raise chain never runs,
      * and the relaunched servant proceeds into its normal startup.
      * Gated on the launch-phase latch (mmcs_ilkfix_user_seen) so the
-     * early IRQ-init walk never touches the window. */
+     * early IRQ-init walk never touches the window — OR on MMCS_C0ARM
+     * (L22): the kernel-side servant lane, where no user-mode event
+     * ever fires the latch and the loader walks need the window from
+     * the kernel's own KernelInit2 module load on (the L22 decode). */
     if (ret != MMU_OK && mmu_idx != MMU_USER_IDX
-        && mmcs_ilkfix_user_seen
+        && (mmcs_ilkfix_user_seen || mmcs_c0arm)
         && env->mmcs_srvpg_active
         && (((uint32_t)address >= 0xC0021000
              && (uint32_t)address < 0xC0082B00
@@ -2057,9 +2064,10 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
      * the real pager installs — fsdmgr .text 0xc02c1000 <-> ROM
      * 0x90a82000, byte-identical), non-XIP sections map the seeded
      * decompressed-init scratch page (RW per the o32 write flag).
-     * Gated on the launch-phase latch exactly like SRVPG. */
+     * Gated on the launch-phase latch exactly like SRVPG — or on
+     * MMCS_C0ARM (L22, the kernel-side servant lane). */
     if (ret != MMU_OK && mmu_idx != MMU_USER_IDX
-        && mmcs_ilkfix_user_seen
+        && (mmcs_ilkfix_user_seen || mmcs_c0arm)
         && mmcs_iatfix_on
         && (uint32_t)address >= 0xC0000000
         && (uint32_t)address < 0xC1000000
@@ -2082,6 +2090,24 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa32,
                          iprot, mmu_idx, TARGET_PAGE_SIZE);
             return true;
+        }
+    }
+
+    /* MMCS fork (L22 diagnostic): MMCS_L22DBG=1 — log every UNserviced
+     * C0-window miss with the gate state (which condition refused the
+     * SRVPG/IATFIX service). Env-gated diagnostic only, no behavior
+     * change. */
+    if (ret != MMU_OK && getenv("MMCS_L22DBG")
+        && (uint32_t)address >= 0xC0000000
+        && (uint32_t)address < 0xC1000000) {
+        static int nl;
+        if (nl++ < 400) {
+            fprintf(stderr, "MMCS-L22DBG miss va=%08x acc=%d mmu_idx=%d "
+                    "sr=%03x ilk=%d srvpg=%d iatfix=%d c0arm=%d pr=%08x\n",
+                    (uint32_t)address, (int)access_type, mmu_idx,
+                    (uint32_t)env->sr, (int)mmcs_ilkfix_user_seen,
+                    (int)env->mmcs_srvpg_active, (int)mmcs_iatfix_on,
+                    (int)mmcs_c0arm, env->pr);
         }
     }
 
