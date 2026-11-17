@@ -45,6 +45,10 @@
 static void mmcs_vi_note(int is_w, hwaddr off, uint32_t val);
 static void mmcs_vi_census_dump(void);
 
+/* L21: the write-sticky page-ownership table (block below) */
+int mmcs_pgown_fill(CPUSH4State *env, uint32_t address, uint32_t *pa,
+                    int prot, int is_store);
+
 /* MMIO census regions (64K buckets) not covered by the sh7750 model —
  * logged as unimplemented so the OAL's dialogue with missing hardware is
  * visible instead of silent. */
@@ -368,6 +372,249 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va)
     return pa;
 }
 
+/* ---- MMCS_PGOWN (L21): the write-sticky page-ownership table ----
+ * THE VANISHING-WRITE DEFECT (S140, A/B-proven twice): the fdf hive
+ * apply, the prgInit flags|=4 (cell 0xd00bfe4c) and the AutoLoad
+ * sticky RegSetValueExW all land, execute, and are GONE one 7Hz pass
+ * later. AUDIT of every host-side page-serving path (SRVPG/SRVPGTAB/
+ * FILEVIEW/COWFIX/HBZERO/IATFIX): each one dedupes VA->PA per boot, so
+ * none of them re-seeds a page IT owns — the amnesia is the other half
+ * of the demand-pager model: the services only engage on FAULTS. The
+ * moment the guest kernel authors its own mapping for the same VA
+ * (demand-zero stack pages, hive buffer re-VirtualAlloc per pass, the
+ * pager rebuilding servant-window entries), get_physical_address
+ * resolves the FRESH guest page and the fault services step aside —
+ * the written scratch content is orphaned = "serves fresh zeroed pages
+ * on remap". (One latent re-seed also fixed by the same table: the
+ * COWFIX dedup key is va & ~(entry size-1), unstable across faults
+ * with different guest entry sizes — a re-keyed allocation seeds a
+ * fresh zero page; a PINNED entry overrides it at fill time.)
+ * FIX: one shared ownership table consulted at the single choke point
+ * where QEMU installs softmmu translations (the tlb_set_page sites in
+ * target/sh4/helper.c::superh_cpu_tlb_fill). A writable mapping in a
+ * managed window registers CLEAN and is installed WITHOUT PAGE_WRITE;
+ * the first store's permission bounce re-enters tlb_fill (the guest
+ * translation itself grants write, so no guest exception is raised),
+ * promotes the entry to PINNED with the page the store lands on, and
+ * re-installs RW. From then on the pinned phys page IS the backing:
+ * any later guest-authored remap of the VA is overridden to serve the
+ * pinned copy = "first write pins the page content; later faults
+ * serve the pinned copy". Keying (the COWFIX fidelity question, per
+ * the L8-L14 audit's per-process obligation):
+ *   per-ASID  — user windows [0x00800000,0x40000000) (heap arena) and
+ *               [0x40000000,0x80000000) (coredll .data class): the
+ *               real pager gives every process a fresh private copy;
+ *               relaunches of a DIFFERENT process must not see the
+ *               dead one's dirty pages (ASID recycle aliases are the
+ *               documented bound of this model).
+ *   shared    — [0xC0000000,0xC1000000) the kernel-side-DLL (C0)
+ *               window: k.coredll/filesys/fsdmgr .data are process-
+ *               COMMON (one kernel-side instance system-wide; servant
+ *               relaunch keeps the module loaded on real HW), so the
+ *               loader data is intentionally shared; the kernel stack
+ *               arena [0xD0000000,0xDC000000) (kernel address space,
+ *               stacks observed marching UP +0x10000/launch, never
+ *               reused); and the KData page VA 0x5000 (one global
+ *               struct). Sub-floor stack pages (0xD0000000-0xD0600000)
+ *               only register once the launches are live — mirrors the
+ *               FILEVIEW latch so the early IRQ-init walk's low-arena
+ *               writes stay untouched.
+ * P1/P2/P4 windows are excluded: their translation is identity by
+ * construction, the backing never changes, pins would be no-ops.
+ * Read-only mappings (XIP text) never register: writes to them must
+ * keep violating (fidelity), and ROM content cannot be written anyway. */
+#define MMCS_PGOWN_BITS 17
+#define MMCS_PGOWN_SLOTS (1u << MMCS_PGOWN_BITS)
+#define MMCS_PGOWN_ASID_SHARED 0x100   /* sentinel key (PTEH ASID is 8-bit) */
+struct mmcs_pgown_ent {
+    uint32_t va;       /* 4K page VA (0 = empty slot) */
+    uint32_t asid;     /* key ASID (shared windows: the sentinel) */
+    uint32_t pa;       /* registered/pinned backing phys page */
+    uint32_t pinned;   /* 0 = clean (never written), 1 = pinned */
+    uint32_t nremap;   /* remap-overrides served (diagnostics) */
+};
+static struct mmcs_pgown_ent mmcs_pgown[MMCS_PGOWN_SLOTS];
+static int mmcs_pgown_armed;
+static uint32_t mmcs_pgown_nins, mmcs_pgown_npin, mmcs_pgown_novr;
+
+/* helper.c's launch-phase latch (the first USER-mode KData fault = the
+ * PSL launches are live) — sub-floor stack registration gate */
+extern bool mmcs_ilkfix_user_seen;
+
+static int mmcs_pgown_class(uint32_t page)
+{
+    if (page == 0x5000) {
+        return 2;                                   /* KData page */
+    }
+    if (page >= 0x00800000 && page < 0x40000000) {
+        return 1;                                   /* user heap arena */
+    }
+    if (page >= 0x40000000 && page < 0x80000000) {
+        return 1;                                   /* user .data (COWFIX) */
+    }
+    if (page >= 0xC0000000 && page < 0xC1000000) {
+        return 2;                                   /* kernel-side DLL window */
+    }
+    if (page >= 0xD0000000 && page < 0xDC000000) {
+        return 2;                                   /* kernel stack arena */
+    }
+    return 0;
+}
+
+static struct mmcs_pgown_ent *mmcs_pgown_find(uint32_t page, uint32_t asid)
+{
+    uint32_t h = ((page >> 12) * 2654435761u + asid * 40503u)
+                 & (MMCS_PGOWN_SLOTS - 1);
+    for (unsigned i = 0; i < MMCS_PGOWN_SLOTS; i++) {
+        struct mmcs_pgown_ent *e = &mmcs_pgown[(h + i)
+                                               & (MMCS_PGOWN_SLOTS - 1)];
+        if (!e->va || (e->va == page && e->asid == asid)) {
+            return e->va ? e : NULL;
+        }
+    }
+    return NULL;
+}
+
+static struct mmcs_pgown_ent *mmcs_pgown_insert(uint32_t page, uint32_t asid,
+                                                uint32_t pa)
+{
+    struct mmcs_pgown_ent *e = mmcs_pgown_find(page, asid);
+    if (e) {
+        return e;                    /* lost a race within one fill: reuse */
+    }
+    uint32_t h = ((page >> 12) * 2654435761u + asid * 40503u)
+                 & (MMCS_PGOWN_SLOTS - 1);
+    for (unsigned i = 0; i < MMCS_PGOWN_SLOTS; i++) {
+        struct mmcs_pgown_ent *s = &mmcs_pgown[(h + i)
+                                               & (MMCS_PGOWN_SLOTS - 1)];
+        if (!s->va) {
+            s->va = page;
+            s->asid = asid;
+            s->pa = pa;
+            s->pinned = 0;
+            s->nremap = 0;
+            mmcs_pgown_nins++;
+            return s;
+        }
+    }
+    static bool warned;
+    if (!warned) {
+        warned = true;
+        fprintf(stderr, "MMCS-PGOWN: table full - persistence passthrough\n");
+    }
+    return NULL;
+}
+
+/* The choke point: consult/modify the ownership table for one 4K page
+ * about to be installed into the softmmu TLB. *pa may be overridden
+ * (pinned entries force their backing); the returned prot strips
+ * PAGE_WRITE for clean entries so the first store bounces back here
+ * and pins the page it lands on. Called from every tlb_set_page site
+ * in superh_cpu_tlb_fill (the ret==MMU_OK main path covers everything
+ * the do_interrupt services install as guest UTLB entries, plus every
+ * guest-kernel-authored remap). Passthrough (prot unchanged) when not
+ * armed, outside the managed windows, for read-only mappings, or when
+ * the table is full. */
+int mmcs_pgown_fill(CPUSH4State *env, uint32_t address, uint32_t *pa,
+                    int prot, int is_store)
+{
+    static int haslog = -1;
+    static int havetrace;
+    static uint32_t traceva;
+    if (haslog < 0) {
+        haslog = getenv("MMCS_PGOWNLOG") != NULL;
+        const char *tv = getenv("MMCS_PGOWN_TRACE_VA");
+        havetrace = tv && *tv;
+        traceva = tv ? (uint32_t)strtoul(tv, NULL, 16) : 0;
+    }
+    if (havetrace && (address & ~0xFFFu) == traceva) {
+        static int ntr;
+        if (ntr++ < 64) {
+            fprintf(stderr, "MMCS-PGOWN-TRACE fill va=%08x store=%d "
+                    "prot=%d pa=%08x cls-latch(user_seen)=%d armed=%d\n",
+                    (unsigned)address, is_store, prot, *pa,
+                    (int)mmcs_ilkfix_user_seen, mmcs_pgown_armed);
+        }
+    }
+    if (!mmcs_pgown_armed) {
+        return prot;
+    }
+    uint32_t page = address & ~0xFFFu;
+    int cls = mmcs_pgown_class(page);
+    if (!cls) {
+        return prot;
+    }
+    if (cls == 2 && page >= 0xD0000000 && page < 0xD0600000
+        && !mmcs_ilkfix_user_seen) {
+        return prot;    /* sub-floor stacks: launches-live latch only */
+    }
+    uint32_t key = (cls == 2) ? MMCS_PGOWN_ASID_SHARED
+                              : (env->pteh & PTEH_ASID_MASK);
+    struct mmcs_pgown_ent *e = mmcs_pgown_find(page, key);
+    if (!e) {
+        if (!(prot & PAGE_WRITE)) {
+            return prot;               /* RO mapping: nothing to pin */
+        }
+        e = mmcs_pgown_insert(page, key, *pa);
+        if (!e) {
+            return prot;
+        }
+        if (haslog && mmcs_pgown_nins <= 32) {
+            fprintf(stderr, "MMCS-PGOWN: reg va=%08x asid=%02x -> pa=%08x "
+                    "(clean)\n", page, key, *pa);
+        }
+        return prot & ~PAGE_WRITE;
+    }
+    if (e->pinned) {
+        if (*pa != e->pa) {
+            e->nremap++;
+            mmcs_pgown_novr++;
+            if (haslog && mmcs_pgown_novr <= 32) {
+                fprintf(stderr, "MMCS-PGOWN: OVERRIDE va=%08x asid=%02x "
+                        "guest pa=%08x -> pinned pa=%08x\n",
+                        page, key, *pa, e->pa);
+            }
+        }
+        *pa = e->pa;
+        return prot;
+    }
+    if (is_store && (prot & PAGE_WRITE)) {
+        e->pinned = 1;
+        e->pa = *pa;          /* pin the page this store lands on */
+        mmcs_pgown_npin++;
+        if (haslog && mmcs_pgown_npin <= 32) {
+            fprintf(stderr, "MMCS-PGOWN: PIN va=%08x asid=%02x -> pa=%08x\n",
+                    page, key, *pa);
+        }
+        return prot;
+    }
+    if (*pa != e->pa) {
+        e->pa = *pa;          /* clean remap: the guest mapping is
+                               * authoritative until the first write */
+    }
+    return prot & ~PAGE_WRITE;
+}
+
+static void mmcs_pgown_census(void)
+{
+    if (!mmcs_pgown_armed) {
+        return;
+    }
+    fprintf(stderr, "MMCS-PGOWN: registered=%u pinned=%u remap-overrides=%u "
+            "launch-latch=%d\n",
+            mmcs_pgown_nins, mmcs_pgown_npin, mmcs_pgown_novr,
+            (int)mmcs_ilkfix_user_seen);
+    int shown = 0;
+    for (unsigned i = 0; i < MMCS_PGOWN_SLOTS && shown < 24; i++) {
+        struct mmcs_pgown_ent *e = &mmcs_pgown[i];
+        if (e->va && e->pinned && e->nremap) {
+            fprintf(stderr, "  pinned va=%08x asid=%02x pa=%08x "
+                    "overrides=%u\n", e->va, e->asid, e->pa, e->nremap);
+            shown++;
+        }
+    }
+}
+
 /* ---- Framebuffer console (MMCS_FBCON=1): live screen via QEMU display ---- */
 #include "ui/console.h"
 static QemuConsole *mmcs_con;
@@ -463,6 +710,8 @@ static void mmcs_jitfix_sweep(void *opaque)
 
 static void mmcs_dump_ram(void *opaque)
 {
+    /* L21: the page-ownership census at dump time */
+    mmcs_pgown_census();
     /* L18: the vendor-INTC census snapshot at dump time */
     mmcs_vi_census_dump();
     /* MMCS_FINDPAT=<hexbytes>: scan unit RAM (0x08000000..0x10800000) for a
@@ -2238,6 +2487,15 @@ static void mmcs_init(MachineState *machine)
     }
     if (getenv("MMCS_KSLOT")) {
         cpu->env.mmcs_kslot_active = 1;
+    }
+
+    /* MMCS fork (L21): MMCS_PGOWN=1 — arm the write-sticky page-ownership
+     * table (see the pgown block above; hooks at the tlb_set_page sites in
+     * target/sh4/helper.c::superh_cpu_tlb_fill). */
+    if (mmcs_env_on("MMCS_PGOWN")) {
+        mmcs_pgown_armed = 1;
+        fprintf(stderr, "MMCS: PGOWN write-sticky page ownership armed "
+                "(user windows per-ASID, C0/stack/KData shared)\n");
     }
 
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —

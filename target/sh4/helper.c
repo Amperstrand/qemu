@@ -73,6 +73,16 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va);
 extern int mmcs_iatfix_on;
 hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
 
+/* MMCS fork (L21): MMCS_PGOWN — the write-sticky page-ownership table
+ * (hw/sh4/mmcs.c). Consulted at every tlb_set_page site below: clean
+ * writable pages install without PAGE_WRITE (the first store's
+ * permission bounce re-enters tlb_fill — the guest translation grants
+ * write, so no guest exception — and pins the page it lands on);
+ * pinned pages override any later guest-authored remap of the VA with
+ * their pinned backing. Passthrough when MMCS_PGOWN is unset. */
+int mmcs_pgown_fill(CPUSH4State *env, uint32_t address, uint32_t *pa,
+                    int prot, int is_store);
+
 /* MMCS fork (L8): the MMCS_FILEVIEW scratch va->pa table, hoisted to
  * file scope so diagnostics (MMCS_NULLCALL) can read a frozen stack
  * physically — the guest UTLB entries get flushed per launch, but the
@@ -86,8 +96,10 @@ static uint32_t mmcs_fvmap_nxt = 0x20000000;
  * launches are live, the early IRQ-init walk is past). Gates (a) the
  * kernel-mode interlocked fetch map below and (b) the exception-boundary
  * emulation's kernel-side arming (its old function-local latch never
- * fired: user fetches hit the mapped page and never fault). */
-static bool mmcs_ilkfix_user_seen;
+ * fired: user fetches hit the mapped page and never fault).
+ * L21: no longer static — hw/sh4/mmcs.c gates sub-floor stack-arena
+ * page-ownership registration on the same latch. */
+bool mmcs_ilkfix_user_seen;
 
 /* MMCS fork (L8): is this VA a plausible CODE address for this unit?
  * Windows: KData/LOWSLOT 0x4000-0x8000, coredll user window
@@ -1925,8 +1937,10 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         if (mmu_idx == MMU_USER_IDX) {
             mmcs_ilkfix_user_seen = true;
         }
-        tlb_set_page(cs, 0x5000, 0x0C020000,
-                     PAGE_READ | PAGE_WRITE | PAGE_EXEC, mmu_idx,
+        uint32_t kdpa = 0x0C020000;
+        int kdprot = mmcs_pgown_fill(env, 0x5000, &kdpa,
+                                     PAGE_READ | PAGE_WRITE | PAGE_EXEC, 0);
+        tlb_set_page(cs, 0x5000, kdpa, kdprot, mmu_idx,
                      TARGET_PAGE_SIZE);
         return true;
     }
@@ -2020,7 +2034,11 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
              * scratch page from hw/sh4/mmcs.c (deduped per VA). */
             hwaddr pa = mmcs_srvpg_data_pa(page);
             if (pa) {
-                tlb_set_page(cs, page, pa, PAGE_READ | PAGE_WRITE, mmu_idx,
+                uint32_t pa32 = (uint32_t)pa;
+                int pprot = mmcs_pgown_fill(env, page, &pa32,
+                                            PAGE_READ | PAGE_WRITE,
+                                            access_type == MMU_DATA_STORE);
+                tlb_set_page(cs, page, pa32, pprot, mmu_idx,
                              TARGET_PAGE_SIZE);
             } else {
                 fprintf(stderr, "MMCS: SRVPG servant .data scratch "
@@ -2058,7 +2076,10 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             }
             int iprot = (rw ? (PAGE_READ | PAGE_WRITE) : PAGE_READ)
                         | PAGE_EXEC;
-            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa,
+            uint32_t pa32 = (uint32_t)pa;
+            iprot = mmcs_pgown_fill(env, (uint32_t)address, &pa32, iprot,
+                                    access_type == MMU_DATA_STORE);
+            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa32,
                          iprot, mmu_idx, TARGET_PAGE_SIZE);
             return true;
         }
@@ -2107,6 +2128,14 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                         "(phys %08x)\n", (unsigned)(physical + 0x24e));
             }
         }
+        /* L21: the ownership choke point — clean writable pages install
+         * write-stripped (first store bounces back and pins); pinned
+         * pages override the guest translation's pa with their sticky
+         * backing (the S140 vanishing-write fix: the kernel's remap of
+         * a written VA serves the pinned copy, not a fresh zero page). */
+        prot = mmcs_pgown_fill(env, (uint32_t)address,
+                               (uint32_t *)&physical, prot,
+                               access_type == MMU_DATA_STORE);
         tlb_set_page(cs, address, physical, prot, mmu_idx, TARGET_PAGE_SIZE);
         return true;
     }
