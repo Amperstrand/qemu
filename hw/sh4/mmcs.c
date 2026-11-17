@@ -250,6 +250,31 @@ int mmcs_c0arm;
 int mmcs_uwarm;
 
 #define MMCS_SRVPG_ROM_BASE 0x90800000
+
+/* L25: the SRP2 manifest's rom field is the FULL ROM VA of the section
+ * content (build_srvpg_table.py: rom = the o32 dataptr, 0x908xxxxx-class),
+ * NOT a flash-relative offset. Both manifest consumers used to compute
+ * MMCS_FLASH_BASE + rom, landing at ~0xA10CA000 — an unmapped phys that
+ * reads zeros. That zero page then satisfied the oalioctl import-
+ * descriptor walk (desc[0]==0 => "no imports" => fake DoImports success)
+ * and got softmmu-cached as the c0011000 .text backing, so the later
+ * DllMain-entry fetch at c00111f0 read word 0x0000 => illegal 0x180 =>
+ * the trampoline "returns 0" => LoadOneLibraryPart2's failure-bit path
+ * frees the module and returns NULL => the resolver derefs [0+0x38]
+ * (the S144 death). Normalize any rom value (full ROM VA, legacy
+ * flash-relative, or raw phys) to its flash phys backing. */
+static inline hwaddr mmcs_rom_pa(uint32_t rom)
+{
+    if (rom >= MMCS_FLASH_BASE
+        && rom < MMCS_FLASH_BASE + MMCS_FLASH_SIZE) {
+        return rom;                        /* already flash-relative */
+    }
+    if (rom >= MMCS_SRVPG_ROM_BASE) {
+        return MMCS_FLASH_BASE + (hwaddr)(rom - MMCS_SRVPG_ROM_BASE);
+    }
+    return rom;                            /* raw phys below the ROM base */
+}
+
 static const struct { uint32_t va, sz, rom; } mmcs_srvpg_secs[] = {
     /* k.coredll servant .data sections (realaddr manifest, verified
      * against the live window: 0xc004dba2/0xc002f0a0 pages byte-equal
@@ -288,7 +313,7 @@ static bool mmcs_srvpg_seed_page(uint32_t page, uint8_t *out)
             /* XIP section: serve the flash bytes (the manifest's rom
              * pointer; both are page-aligned, verified at build) */
             cpu_physical_memory_read(
-                MMCS_FLASH_BASE + s->rom + (page - s->va), out, 0x1000);
+                mmcs_rom_pa(s->rom) + (page - s->va), out, 0x1000);
             return true;
         }
     }
@@ -339,8 +364,8 @@ static bool mmcs_srvpg_seed_page(uint32_t page, uint8_t *out)
  * content (RW for writable sections, RO for rsrc/pdata-class). Returns
  * the backing phys page (0 = not covered / out of scratch); *rw
  * receives the write permission. */
-hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
-hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
+hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw, bool kernel_side);
+hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw, bool kernel_side)
 {
     const void *sec = mmcs_srvt_find(va & ~0xFFFu);
     if (!sec) {
@@ -349,7 +374,7 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
     const struct { uint32_t va, size, rom, flags, off; } *s = sec;
     if (s->off == 0xffffffffu) {
         *rw = false;
-        return MMCS_FLASH_BASE + s->rom + ((va & ~0xFFFu) - s->va);
+        return mmcs_rom_pa(s->rom) + ((va & ~0xFFFu) - s->va);
     }
     /* non-XIP: deduped seeded scratch (the shared module instance copy).
      * RW decode (L22 fix): the SRP2 manifest flags field is the o32/PE
@@ -360,10 +385,21 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
      * (0x80 is not a PE bit) so EVERY non-XIP section was served RO
      * and the loader's IAT stores bounced (the L22 death class after
      * the latch opened). Keep the 0x80 term for any legacy SRP1
-     * table that used a host-side bit. */
+     * table that used a host-side bit.
+     *
+     * L25: for the KERNEL-SIDE window (the C0ARM/IATFIX service) a
+     * decompressed instance page is plain kernel RAM on HW — the
+     * loader's own CopyRegions writes the section content through
+     * the C0 VA (measured: pc=0x90837734 storing filesys's
+     * c00d7000 blob instance, o32 flags 0x40002040 = no write bit),
+     * and later reloc/IAT write-backs land there too. Only the XIP
+     * flash pages stay RO there. User-window (UWARM) instances keep
+     * the o32 decode (real user-mode protection). */
+    bool row_rw = kernel_side
+                  || !!(s->flags & 0x80000000u) || !!(s->flags & 0x80u);
     for (int i = 0; i < mmcs_nsrvpg; i++) {
         if (mmcs_srvpg_map[i].va == (va & ~0xFFFu)) {
-            *rw = !!(s->flags & 0x80000000u) || !!(s->flags & 0x80u);
+            *rw = row_rw;
             return mmcs_srvpg_map[i].pa;
         }
     }
@@ -390,7 +426,7 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
                     "-> pa=%08x (n=%d)\n", va & ~0xFFFu, pa, mmcs_nsrvpg);
         }
     }
-    *rw = !!(s->flags & 0x80000000u) || !!(s->flags & 0x80u);
+    *rw = row_rw;
     return pa;
 }
 

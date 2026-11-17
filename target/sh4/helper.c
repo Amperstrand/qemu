@@ -71,7 +71,7 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va);
  * the woken PNPThread dying on an fsdmgr .text page 0xc02d7000 miss
  * after the .data seeding fix). */
 extern int mmcs_iatfix_on;
-hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
+hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw, bool kernel_side);
 /* MMCS fork (L22): MMCS_C0ARM — arm the C0-window module service in
  * the kernel-side servant lane (the launch latch never fires there;
  * see the full decode in hw/sh4/mmcs.c). */
@@ -1138,6 +1138,35 @@ fileview_done:;
         qemu_log("exception 0x%03x [%s] raised\n",
                   irq_vector, expname);
         log_cpu_state(cs, 0);
+     }
+
+    /* MMCS fork (L25 diag): illegal_instruction raised while fetching
+     * in the kernel-side-DLL C0 window — dump the UTLB entry that
+     * covered the fetch page and the physical bytes it backed, so a
+     * garbage-content fetch (wrong PPN / shadowed page) is provable
+     * from the -d int stream alone. */
+    if (irq_vector == 0x180 && env->pc >= 0xC0000000 && env->pc < 0xC1000000
+        && getenv("MMCS_L25DBG")) {
+        int li;
+        for (li = 0; li < UTLB_SIZE; li++) {
+            tlb_t *e = &env->utlb[li];
+            uint32_t mask = e->size - 1;
+            if (!e->v || (env->pc & ~mask) != (e->vpn << 12)) {
+                continue;
+            }
+            hwaddr pa = ((hwaddr)e->ppn << 10) + (env->pc & mask);
+            uint8_t b[8] = { 0 };
+            cpu_physical_memory_read(pa, b, 8);
+            qemu_log("L25DBG: illegal fetch pc=%08x utlb[%d] vpn=%08x "
+                     "ppn=%08x(%08x) sz=%u pr=%u sh=%u asid=%u -> "
+                     "pa=%08x bytes=%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                     env->pc, li, e->vpn << 12, e->ppn,
+                     (uint32_t)e->ppn << 10, e->size, e->pr, e->sh,
+                     e->asid, (uint32_t)pa,
+                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+        }
+        qemu_log("L25DBG: (no covering utlb entry listed above = the "
+                 "fetch missed; bytes come from elsewhere)\n");
     }
 
     env->ssr = cpu_read_sr(env);
@@ -2078,18 +2107,38 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             || access_type == MMU_DATA_LOAD
             || access_type == MMU_DATA_STORE)) {
         bool rw = false;
-        hwaddr pa = mmcs_iatfix_page_pa((uint32_t)address, &rw);
+        hwaddr pa = mmcs_iatfix_page_pa((uint32_t)address, &rw, true);
         if (pa) {
             if (access_type == MMU_DATA_STORE && !rw) {
-                /* store to a read-only section: let the normal write
-                 * violation path run (fidelity: no silent writes) */
-                return false;
+                /* store to a read-only section: raise the guest write
+                 * violation (fidelity: no silent writes) — the vendor
+                 * handler sees exactly the HW protection fault. */
+                static int noro;
+                if (noro++ < 8) {
+                    fprintf(stderr, "MMCS-L25: RO-section store refused "
+                            "va=%08x (iatfix)\n", (uint32_t)address);
+                }
+                env->pteh = (env->pteh & PTEH_ASID_MASK)
+                            | ((uint32_t)address & PTEH_VPN_MASK);
+                env->tea = (uint32_t)address;
+                cs->exception_index = 0x0c0;   /* dtlb_violation_write */
+                cpu_loop_exit_restore(cs, retaddr);
             }
             int iprot = (rw ? (PAGE_READ | PAGE_WRITE) : PAGE_READ)
                         | PAGE_EXEC;
             uint32_t pa32 = (uint32_t)pa;
             iprot = mmcs_pgown_fill(env, (uint32_t)address, &pa32, iprot,
                                     access_type == MMU_DATA_STORE);
+            if (getenv("MMCS_L25DBG")
+                && (uint32_t)address < 0xC0020000) {
+                uint8_t b[8] = { 0 };
+                cpu_physical_memory_read(pa32, b, 8);
+                fprintf(stderr, "MMCS-L25DBG iatfix va=%08x acc=%d "
+                        "pa=%08x->%08x rw=%d bytes=%02x%02x%02x%02x "
+                        "%02x%02x%02x%02x\n", (uint32_t)address,
+                        (int)access_type, (uint32_t)pa, pa32, (int)rw,
+                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            }
             tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa32,
                          iprot, mmu_idx, TARGET_PAGE_SIZE);
             return true;
@@ -2116,12 +2165,22 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             || access_type == MMU_DATA_LOAD
             || access_type == MMU_DATA_STORE)) {
         bool rw = false;
-        hwaddr pa = mmcs_iatfix_page_pa((uint32_t)address, &rw);
+        hwaddr pa = mmcs_iatfix_page_pa((uint32_t)address, &rw, false);
         if (pa) {
             if (access_type == MMU_DATA_STORE && !rw) {
-                /* store to a read-only section: let the normal write
-                 * violation path run (fidelity: no silent writes) */
-                return false;
+                /* store to a read-only section: raise the guest write
+                 * violation (fidelity: no silent writes) — the vendor
+                 * handler sees exactly the HW protection fault. */
+                static int nuro;
+                if (nuro++ < 8) {
+                    fprintf(stderr, "MMCS-L25: RO-section store refused "
+                            "va=%08x (uwarm)\n", (uint32_t)address);
+                }
+                env->pteh = (env->pteh & PTEH_ASID_MASK)
+                            | ((uint32_t)address & PTEH_VPN_MASK);
+                env->tea = (uint32_t)address;
+                cs->exception_index = 0x0c0;   /* dtlb_violation_write */
+                cpu_loop_exit_restore(cs, retaddr);
             }
             int uprot = (rw ? (PAGE_READ | PAGE_WRITE) : PAGE_READ)
                         | PAGE_EXEC;
