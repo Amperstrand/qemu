@@ -64,6 +64,15 @@ static void increment_urc(CPUSH4State *env);
  * servant .data window (FILES-decompressed init content). */
 hwaddr mmcs_srvpg_data_pa(uint32_t va);
 
+/* MMCS fork (L17): MMCS_IATFIX — the generalized C0-window (kernel-side
+ * DLL) module service from hw/sh4/mmcs.c: XIP .text pages map the flash
+ * ROM bytes, non-XIP pages seed the decompressed init content (the
+ * lost-page-table class generalized beyond k.coredll: the L17 A/B found
+ * the woken PNPThread dying on an fsdmgr .text page 0xc02d7000 miss
+ * after the .data seeding fix). */
+extern int mmcs_iatfix_on;
+hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
+
 /* MMCS fork (L8): the MMCS_FILEVIEW scratch va->pa table, hoisted to
  * file scope so diagnostics (MMCS_NULLCALL) can read a frozen stack
  * physically — the guest UTLB entries get flushed per launch, but the
@@ -681,6 +690,60 @@ cow_done:;
         const char *sf = getenv("MMCS_STKFLOOR");
         mmcs_stkfloor = sf ? strtoul(sf, NULL, 16) : 0xD0600000;
     }
+    /* MMCS fork (L15d): MMCS_NULLTAG — a kernel-mode FETCH at pc=0
+     * (the NULL-fn-call class; live caller spc=0x908381b8, args
+     * r1=0xf4008000 vendor-INTC) loops forever on real-semantics
+     * escalation: the ITLB miss handler can't resolve VA 0 AND the
+     * vendor fault path never runs (the L2 walk dead-ends silently), so
+     * the CPU refetches 0 (600k+ NULLCALL samples). Real HW escalates
+     * the fetch to a fault the kernel understands -> the calling thread
+     * dies via the marshalled 0xC0000005 path. Re-tag the exception as
+     * 0x0e0 (data/address fault) with tea=pc so the vendor handler runs
+     * its real TerminateProcess path — no synthesis, just escalation. */
+    if (getenv("MMCS_NULLTAG")
+        && cs->exception_index == 0x040
+        && env->pc < 0x1000
+        && (env->sr & (1u << SR_MD)) != 0) {
+        env->tea = env->pc;
+        cs->exception_index = 0x0e0;
+        return;
+    }
+
+    /* MMCS fork (L15): MMCS_KPG — the kernel's low structure window
+     * (VA 0x90600000-0x90800000 = P1 aliases of the ram3 backing at phys
+     * 0x10000000-0x10800000) loses UTLB entries whose page-table refill
+     * path died with the fault-aborted constructors (S130 class): the
+     * live ring handle read at 0x90807562 (r4=0x9068fa88) faulted and
+     * re-faulted forever — the L15 exception-entry park. FINDPAT proved
+     * the backing page EXISTS (ring struct at phys 0x1068f784, identity
+     * VA&0x1FFFFFFF). Fix: on kernel-mode DATA miss (0x0a0 read / 0x0c0
+     * write) in that window, install the identity UTLB entry — no data
+     * is invented, only the lost mapping restored. */
+    if (env->mmcs_cowfix_active && getenv("MMCS_KPG")
+        && (((cs->exception_index == 0x0a0 || cs->exception_index == 0x0c0)
+            && (env->sr & (1u << SR_MD)) != 0
+            && env->tea >= 0x90600000 && env->tea < 0x90800000)
+            /* L15b: kernel .text fetch misses (excp 0x040, tea reads 0 —
+             * use pc) — the code pages at 0x908xxxxx lose ITLB entries to
+             * UTLB churn and the dead refill path can't restore them (the
+             * L15 park looped refetching 0x90807562 forever). Identity
+             * map (phys = VA & 0x1FFFFFFF = the XIP NOR window). */
+            || ((cs->exception_index == 0x040)
+                && ((env->sr & (1u << SR_MD)) != 0)
+                && (env->pc >= 0x90800000 && env->pc < 0x91000000)))) {
+        uint32_t kva = ((cs->exception_index == 0x040) ? env->pc : env->tea)
+                       & ~0xFFFu;
+        uint32_t kpa = kva & 0x1FFFFFFFu;   /* P1-alias identity */
+        env->pteh = (kva & PTEH_VPN_MASK) | (env->pteh & PTEH_ASID_MASK);
+        env->ptel = ((kpa >> 10) << 10)
+                    | (3 << 5) | PTEL_V | PTEL_SZ_LOW
+                    | PTEL_C | PTEL_D | PTEL_SH;
+        cpu_load_tlb(env);
+        increment_urc(env);
+        cs->exception_index = -1;
+        return;
+    }
+
     /* MMCS_HBZERO (S131 repair #1): heap-window DATA-READ misses
      * (exception 0x0A0 — distinct from the 0x040 instruction-fetch miss)
      * get a demand-zero page. Rationale: the coredll list-walker (S129)
@@ -721,9 +784,20 @@ cow_done:;
         }
     }
 
+    /* L15c: movca.l emulation LOADS the destination before storing (the
+     * cache-line-backup pattern in translate.c) — a READ miss (0x0a0) on
+     * a not-yet-allocated arena page froze the kernel stack-fill loop
+     * forever (pc=0x90838b8c, no fault census — the load re-faulted each
+     * re-execution). Cover arena READ misses with the same demand
+     * allocation as writes: the page is written immediately after. */
     if (env->mmcs_cowfix_active && getenv("MMCS_FILEVIEW")
         && (cs->exception_index == 0x060
-            || cs->exception_index == 0x0c0)
+            || cs->exception_index == 0x0c0
+            || (cs->exception_index == 0x0a0
+                && (env->sr & (1u << SR_MD)) != 0
+                && env->tea >= mmcs_stkfloor
+                && env->tea < 0xDC000000
+                && (env->tea >= mmcs_stkfloor || mmcs_ilkfix_user_seen)))
         && (((env->sr & (1u << SR_MD)) == 0
              && env->tea >= 0x00800000 && env->tea < 0x40000000)
             || ((env->sr & (1u << SR_MD)) != 0
@@ -732,7 +806,7 @@ cow_done:;
                 /* below the L7 default floor = the L12 march frontier:
                  * only once the launches are live (the early IRQ-init
                  * walk's own low-arena writes must reach the guest) */
-                && (env->tea >= 0xD0600000 || mmcs_ilkfix_user_seen)))) {
+                && (env->tea >= mmcs_stkfloor || mmcs_ilkfix_user_seen)))) {
         /* user heap-arena write misses only happen once the PSL
          * launches are live — arm the kernel-mode ILKFIX fetch map
          * (L8, MMCS_KILK) */
@@ -1926,6 +2000,39 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             }
         }
         return true;
+    }
+
+    /* MMCS fork (L17): MMCS_IATFIX — the generalized kernel-side-DLL
+     * window service (the SRVPG class beyond k.coredll; see the full
+     * decode in hw/sh4/mmcs.c). A KERNEL-mode fetch/load miss anywhere
+     * in the C0 window covered by the SRVPGTAB manifest: XIP .text
+     * sections map the flash ROM bytes RO+X (the kernel-side mapping
+     * the real pager installs — fsdmgr .text 0xc02c1000 <-> ROM
+     * 0x90a82000, byte-identical), non-XIP sections map the seeded
+     * decompressed-init scratch page (RW per the o32 write flag).
+     * Gated on the launch-phase latch exactly like SRVPG. */
+    if (ret != MMU_OK && mmu_idx != MMU_USER_IDX
+        && mmcs_ilkfix_user_seen
+        && mmcs_iatfix_on
+        && (uint32_t)address >= 0xC0000000
+        && (uint32_t)address < 0xC1000000
+        && (access_type == MMU_INST_FETCH
+            || access_type == MMU_DATA_LOAD
+            || access_type == MMU_DATA_STORE)) {
+        bool rw = false;
+        hwaddr pa = mmcs_iatfix_page_pa((uint32_t)address, &rw);
+        if (pa) {
+            if (access_type == MMU_DATA_STORE && !rw) {
+                /* store to a read-only section: let the normal write
+                 * violation path run (fidelity: no silent writes) */
+                return false;
+            }
+            int iprot = (rw ? (PAGE_READ | PAGE_WRITE) : PAGE_READ)
+                        | PAGE_EXEC;
+            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa,
+                         iprot, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
     }
 
     if (ret == MMU_OK) {

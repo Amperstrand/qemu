@@ -151,9 +151,44 @@ static const MemoryRegionOps mmcs_files_ops = {
  * content must be decompressed via the side table. This allocator
  * hands out seeded demand pages (deduped per VA per boot) from the
  * dedicated mmcs.srvpg RAM at phys 0x26000000. */
-static struct { uint32_t va, pa; } mmcs_srvpg_map[256];
+static struct { uint32_t va, pa; } mmcs_srvpg_map[1024];
 static int mmcs_nsrvpg;
 static uint32_t mmcs_srvpg_nxt = 0x26000000;
+
+/* MMCS fork (L17): MMCS_SRVPGTAB sidecar — the servant's TRUE non-XIP
+ * section init content. DECODE (L17, ROM TOC parse + the decompressed
+ * .data read-back): the L12 seeding path served the .data/.pdata pages
+ * from RAW FLASH — the module's .data (psize 0x2da) and .pdata (psize
+ * 0x2360) are CE-LZX-COMPRESSED in the image and are NOT covered by the
+ * FILES table (module sections, not files; the table span starts at
+ * 0x90b07550, the section blobs live at 0x912E4D14/0x944A635C), so the
+ * fallback fed COMPRESSED BYTES to the servant as init .data. Every
+ * pointer cell in .data was garbage: the woken L16 PNPThread called
+ * pc=0x40a61eb0 = the compressed bytes at .data+0x5ec read as a function
+ * pointer (the call site 0xc00280e8 "DirectHandleCall": mov.l @r2,r3;
+ * jsr @r3 with r2=0xc00835ec — a runtime-bound "direct handle call"
+ * cell whose TRUE init value is 0x00000000, filled by the lazy binder
+ * FUN_c0028010 from live server handles; the stock mirror = the CE
+ * loader's per-instance decompress of compressed sections, loader.c
+ * PageInFromRAM-class — the pass that never ran for our synthesized
+ * mapping). The kernel's own pager DOES decompress them on HW (the
+ * live launch-1 window byte-verified: RTTI strings at .data+8 match
+ * the decompressed blob). Sidecar = scripts/emul/build_srvpg_table.py
+ * (proven corpus pipeline): v1 'SRP1' {n,{va,size,off,flags},blob} =
+ * k.coredll's non-XIP sections; v2 'SRP2' {n,{va,size,rom,flags,off,
+ * pad},blob} = EVERY kernel-side-DLL (C0-window) section of the ROM
+ * TOC — the manifest MMCS_IATFIX services the whole window with. */
+#define MMCS_SRVT_MAX 320
+static struct {
+    uint32_t va, size, rom, flags, off;   /* off 0xffffffff = XIP text */
+} mmcs_srvt[MMCS_SRVT_MAX];
+static int mmcs_nsrvt;
+static uint8_t *mmcs_srvt_blob;
+static size_t mmcs_srvt_blob_len;
+/* the generalized window service is armed (MMCS_IATFIX=1 + SRVPGTAB
+ * loaded + SRVPG scratch RAM present) — consumed by the tlb_fill hook
+ * in target/sh4/helper.c */
+int mmcs_iatfix_on;
 
 #define MMCS_SRVPG_ROM_BASE 0x90800000
 static const struct { uint32_t va, sz, rom; } mmcs_srvpg_secs[] = {
@@ -165,36 +200,51 @@ static const struct { uint32_t va, sz, rom; } mmcs_srvpg_secs[] = {
     { 0xC0089000, 0x13114, 0x9092E000 }, /* raw in image */
 };
 
-/* Servant .data VA -> scratch phys page seeded with the module's init
- * content (FILES side table where the section is compressed, raw flash
- * otherwise). Returns 0 when out of pages or the VA is unknown.
- * Prototype consumed by target/sh4/helper.c (SRVPG hook). */
-hwaddr mmcs_srvpg_data_pa(uint32_t va);
-hwaddr mmcs_srvpg_data_pa(uint32_t va)
+/* section of the loaded manifest covering `va` (NULL if none) */
+static const void *mmcs_srvt_find(uint32_t va)
 {
-    va &= ~0xFFFu;
+    for (int i = 0; i < mmcs_nsrvt; i++) {
+        if (va >= mmcs_srvt[i].va && va < mmcs_srvt[i].va + mmcs_srvt[i].size) {
+            return &mmcs_srvt[i];
+        }
+    }
+    return NULL;
+}
+
+static bool mmcs_srvpg_seed_page(uint32_t page, uint8_t *out)
+{
+    /* L17: manifest first — true decompressed init content */
+    const void *sec = mmcs_srvt_find(page);
+    if (sec) {
+        const struct { uint32_t va, size, rom, flags, off; } *s = sec;
+        if (s->off != 0xffffffffu) {
+            uint32_t o = page - s->va;
+            uint32_t n = MIN(0x1000u, s->size - o);
+            if (s->off + n <= mmcs_srvt_blob_len) {
+                memset(out, 0, 0x1000);
+                memcpy(out, mmcs_srvt_blob + s->off, n);
+                return true;
+            }
+        } else if (page >= s->va && page < s->va + ((s->size + 0xFFF) & ~0xFFFu)) {
+            /* XIP section: serve the flash bytes (the manifest's rom
+             * pointer; both are page-aligned, verified at build) */
+            cpu_physical_memory_read(
+                MMCS_FLASH_BASE + s->rom + (page - s->va), out, 0x1000);
+            return true;
+        }
+    }
+    /* legacy path: FILES side table, raw flash fallback */
     uint32_t rom = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(mmcs_srvpg_secs); i++) {
-        if (va >= mmcs_srvpg_secs[i].va
-            && va < mmcs_srvpg_secs[i].va + mmcs_srvpg_secs[i].sz) {
-            rom = mmcs_srvpg_secs[i].rom + (va - mmcs_srvpg_secs[i].va);
+        if (page >= mmcs_srvpg_secs[i].va
+            && page < mmcs_srvpg_secs[i].va + mmcs_srvpg_secs[i].sz) {
+            rom = mmcs_srvpg_secs[i].rom + (page - mmcs_srvpg_secs[i].va);
             break;
         }
     }
     if (!rom) {
-        return 0;
+        return false;
     }
-    for (int i = 0; i < mmcs_nsrvpg; i++) {
-        if (mmcs_srvpg_map[i].va == va) {
-            return mmcs_srvpg_map[i].pa;
-        }
-    }
-    if (mmcs_nsrvpg >= ARRAY_SIZE(mmcs_srvpg_map)
-        || mmcs_srvpg_nxt + 0x1000 > 0x26400000) {
-        return 0;
-    }
-    uint32_t pa = mmcs_srvpg_nxt;
-    static uint8_t page[0x1000];
     for (unsigned o = 0; o < 0x1000; o++) {
         uint32_t rva = rom + o;
         uint8_t b = 0;
@@ -215,7 +265,89 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va)
             cpu_physical_memory_read(
                 MMCS_FLASH_BASE + (rva - MMCS_SRVPG_ROM_BASE), &b, 1);
         }
-        page[o] = b;
+        out[o] = b;
+    }
+    return true;
+}
+
+/* MMCS fork (L17): MMCS_IATFIX — service a kernel-mode miss in the
+ * kernel-side-DLL (C0) window from the loaded manifest. Called from the
+ * tlb_fill hook in target/sh4/helper.c (the SRVPG generalization):
+ * an XIP .text section page maps the flash ROM bytes read-only (the
+ * real kernel-side mapping: fsdmgr .text 0xc02c1000 <-> ROM 0x90a82000,
+ * byte-identical to what the kernel pager installs on HW); a non-XIP
+ * section page seeds the mmcs.srvpg scratch with the DECOMPRESSED init
+ * content (RW for writable sections, RO for rsrc/pdata-class). Returns
+ * the backing phys page (0 = not covered / out of scratch); *rw
+ * receives the write permission. */
+hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
+hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw)
+{
+    const void *sec = mmcs_srvt_find(va & ~0xFFFu);
+    if (!sec) {
+        return 0;
+    }
+    const struct { uint32_t va, size, rom, flags, off; } *s = sec;
+    if (s->off == 0xffffffffu) {
+        *rw = false;
+        return MMCS_FLASH_BASE + s->rom + ((va & ~0xFFFu) - s->va);
+    }
+    /* non-XIP: deduped seeded scratch (the shared module instance copy) */
+    for (int i = 0; i < mmcs_nsrvpg; i++) {
+        if (mmcs_srvpg_map[i].va == (va & ~0xFFFu)) {
+            *rw = !!(s->flags & 0x80);
+            return mmcs_srvpg_map[i].pa;
+        }
+    }
+    if (mmcs_nsrvpg >= ARRAY_SIZE(mmcs_srvpg_map)
+        || mmcs_srvpg_nxt + 0x1000 > 0x26400000) {
+        fprintf(stderr, "MMCS: IATFIX scratch exhausted (n=%d)\n",
+                mmcs_nsrvpg);
+        return 0;
+    }
+    uint32_t pa = mmcs_srvpg_nxt;
+    static uint8_t page[0x1000];
+    if (!mmcs_srvpg_seed_page(va & ~0xFFFu, page)) {
+        return 0;
+    }
+    cpu_physical_memory_write(pa, page, 0x1000);
+    mmcs_srvpg_map[mmcs_nsrvpg].va = va & ~0xFFFu;
+    mmcs_srvpg_map[mmcs_nsrvpg].pa = pa;
+    mmcs_nsrvpg++;
+    mmcs_srvpg_nxt += 0x1000;
+    if (getenv("MMCS_SRVPGLOG")) {
+        static int nil;
+        if (nil++ < 96) {
+            fprintf(stderr, "MMCS: IATFIX module page-in va=%08x "
+                    "-> pa=%08x (n=%d)\n", va & ~0xFFFu, pa, mmcs_nsrvpg);
+        }
+    }
+    *rw = !!(s->flags & 0x80);
+    return pa;
+}
+
+/* Servant .data VA -> scratch phys page seeded with the module's init
+ * content (L17: decompressed sidecar when MMCS_SRVPGTAB is loaded,
+ * FILES side table / raw flash otherwise). Returns 0 when out of pages
+ * or the VA is unknown.
+ * Prototype consumed by target/sh4/helper.c (SRVPG hook). */
+hwaddr mmcs_srvpg_data_pa(uint32_t va);
+hwaddr mmcs_srvpg_data_pa(uint32_t va)
+{
+    va &= ~0xFFFu;
+    for (int i = 0; i < mmcs_nsrvpg; i++) {
+        if (mmcs_srvpg_map[i].va == va) {
+            return mmcs_srvpg_map[i].pa;
+        }
+    }
+    if (mmcs_nsrvpg >= ARRAY_SIZE(mmcs_srvpg_map)
+        || mmcs_srvpg_nxt + 0x1000 > 0x26400000) {
+        return 0;
+    }
+    uint32_t pa = mmcs_srvpg_nxt;
+    static uint8_t page[0x1000];
+    if (!mmcs_srvpg_seed_page(va, page)) {
+        return 0;
     }
     cpu_physical_memory_write(pa, page, 0x1000);
     mmcs_srvpg_map[mmcs_nsrvpg].va = va;
@@ -226,8 +358,7 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va)
         static int nsl;
         if (nsl++ < 64) {
             fprintf(stderr, "MMCS: SRVPG servant .data page-in va=%08x "
-                    "rom=%08x -> pa=%08x (n=%d)\n", va, rom, pa,
-                    mmcs_nsrvpg);
+                    "-> pa=%08x (n=%d)\n", va, pa, mmcs_nsrvpg);
         }
     }
     return pa;
@@ -328,6 +459,28 @@ static void mmcs_jitfix_sweep(void *opaque)
 
 static void mmcs_dump_ram(void *opaque)
 {
+    /* MMCS_FINDPAT=<hexbytes>: scan unit RAM (0x08000000..0x10800000) for a
+     * byte pattern at dump time and log phys hits — content-based phys
+     * discovery for structures whose page tables were fault-aborted. */
+    const char *fpat = getenv("MMCS_FINDPAT");
+    if (fpat) {
+        size_t plen = strlen(fpat) / 2;
+        uint8_t pat[64];
+        for (size_t i = 0; i < plen && i < sizeof pat; i++) {
+            unsigned b; sscanf(fpat + i * 2, "%2x", &b); pat[i] = b;
+        }
+        uint8_t win[0x10000];
+        for (hwaddr pa = 0x08000000; pa < 0x10800000; pa += sizeof win) {
+            cpu_physical_memory_read(pa, win, sizeof win);
+            for (size_t o = 0; o + plen <= sizeof win; o++) {
+                if (!memcmp(win + o, pat, plen)) {
+                    fprintf(stderr, "MMCS-FINDPAT hit phys %08llx\n",
+                            (unsigned long long)(pa + o));
+                }
+            }
+        }
+    }
+
     static const struct { hwaddr pa; uint32_t len; const char *fn; } dumps[] = {
         { 0x08602000, 0x10000, "/tmp/copy0.bin" },
         { 0x0862c000, 0x10000, "/tmp/copy1.bin" },
@@ -579,6 +732,27 @@ void mmcs_inject_evt(uint32_t evt)
                     evt, CPU(mmcs_cpu)->halted, env->intevt);
         }
     }
+}
+
+/* MMCS fork (L15): MMCS_RINGNOP — unblock the uHAL exception-ring
+ * producer. DECODE (hermes S128 + this lane): FUN_9080755c's space check
+ * `fill = ring[12]-ring[8]; if (fill < r6) goto 0x908075dc` blocks the
+ * 43-byte exception-text write when nothing consumes the ring (the real
+ * consumer = the KD/sub-CPU relay lane, unmodeled); the caller retries
+ * forever = the L15 park. FIX SHAPE: NOP the `bf 0x908075dc` at kernel
+ * VA 0x90807572 (guest XIP window, phys 0x10807572; QEMU writes the RAM
+ * backing directly — no guest protections involved). The ring then wraps
+ * (a debug log overwriting itself = faithful-enough emulation; strictly
+ * better than return-synthesis: no pr/context hazards). Additive, env-
+ * gated, delayed arm like TICK/HDEVT (default 140s virtual). */
+static void mmcs_ringnop_arm(void *opaque)
+{
+    const uint16_t nops[1] = { 0x0009 };
+    /* the bf at 0x90807572 is ONE 16-bit slot; patch both it and the
+     * preceding cmp delay-slot alignment is unnecessary — single nop */
+    cpu_physical_memory_write(0x10807572, (void *)nops, 2);
+    fprintf(stderr, "MMCS: RINGNOP patched kernel ring space-check "
+            "@0x90807572 (bf -> nop)\n");
 }
 
 /* MMCS fork (L13): MMCS_TICK=1 — deliver the vendor scheduler tick.
@@ -1243,12 +1417,21 @@ static void mmcs_init(MachineState *machine)
      * stay below phys 0x20000000: the SH4 P1/P2 windows only translate
      * the low 29 bits (P1/P2 0xA5000000-class aliases phys 0x05000000,
      * NOT 0x25000000 — first cut wrote to an unmapped hole and the
-     * push-pop cycle read zeros back into pr). */
+     * push-pop cycle read zeros back into pr).
+     * L17: registered at priority 1 — the sh7750 model P1-aliases its
+     * INTC register window at 0x1F000000..+0x1000, overlapping the
+     * kill-stack's bottom page; a deep exception march on the kill
+     * stack (the L17 A/B: the woken PNPThread's 0xC00000FD march,
+     * ~0x450/level, reached 0xBF000E30) wrote into the INTC model and
+     * cpu_abort'ed the emulator. No guest code uses the P1 INTC alias
+     * in this boot (census: zero 0x1F00xxxx guest accesses; the kernel
+     * addresses on-chip regs P4-style) — the kill stack wins. */
     if (getenv("MMCS_KILLSTK")) {
         MemoryRegion *ks = g_new(MemoryRegion, 1);
         memory_region_init_ram(ks, NULL, "mmcs.killstk", 64 * KiB,
                                &error_fatal);
-        memory_region_add_subregion(get_system_memory(), 0x1F000000, ks);
+        memory_region_add_subregion_overlap(get_system_memory(), 0x1F000000,
+                                            ks, 1);
         cpu->env.mmcs_killstk_active = 1;
         fprintf(stderr, "MMCS: KILLSTK kill-stack RAM at phys 0x1F000000 "
                 "(P2 0xBF00FF00)\n");
@@ -1258,7 +1441,11 @@ static void mmcs_init(MachineState *machine)
      * target/sh4/helper.c — tlb_fill servant page-in synthesis and the
      * do_interrupt kernel-mode slot-call re-tag). SRVPG also needs its
      * scratch RAM for the seeded servant .data pages (phys 0x26000000,
-     * 4 MB, outside every unit window, inside the SH4 PPN range). */
+     * 4 MB, outside every unit window, inside the SH4 PPN range).
+     * MMCS_SRVPGTAB (L17): sidecar with the servant's TRUE decompressed
+     * non-XIP section init content (see the mmcs_srvt block above) —
+     * without it the compressed .data/.pdata sections seed from RAW
+     * flash bytes (the L17 import-garbage root cause). */
     if (getenv("MMCS_SRVPG")) {
         cpu->env.mmcs_srvpg_active = 1;
         MemoryRegion *sp = g_new(MemoryRegion, 1);
@@ -1267,6 +1454,71 @@ static void mmcs_init(MachineState *machine)
         memory_region_add_subregion(get_system_memory(), 0x26000000, sp);
         fprintf(stderr, "MMCS: SRVPG servant scratch RAM at phys 0x26000000 "
                 "(4 MB)\n");
+        const char *stab = getenv("MMCS_SRVPGTAB");
+        if (stab && *stab) {
+            gsize tlen = 0;
+            uint8_t *tbuf = NULL;
+            if (g_file_get_contents(stab, (gchar **)&tbuf, &tlen, NULL)
+                && tbuf && tlen > 8) {
+                uint32_t magic = ldl_le_p(tbuf);
+                uint32_t n = ldl_le_p(tbuf + 4);
+                bool ok = false;
+                if (magic == 0x31505253 && n > 0 && n <= MMCS_SRVT_MAX
+                    && 8 + 16u * n <= tlen) {
+                    /* v1 'SRP1': {va,size,off,flags} — non-XIP only */
+                    for (unsigned i = 0; i < n; i++) {
+                        mmcs_srvt[i].va = ldl_le_p(tbuf + 8 + 16 * i);
+                        mmcs_srvt[i].size = ldl_le_p(tbuf + 8 + 16 * i + 4);
+                        mmcs_srvt[i].rom = 0;
+                        mmcs_srvt[i].off = ldl_le_p(tbuf + 8 + 16 * i + 8);
+                        mmcs_srvt[i].flags = ldl_le_p(tbuf + 8 + 16 * i + 12);
+                    }
+                    ok = true;
+                } else if (magic == 0x32505253 && n > 0 && n <= MMCS_SRVT_MAX
+                           && 8 + 24u * n <= tlen) {
+                    /* v2 'SRP2': {va,size,rom,flags,off,pad} — the full
+                     * C0-window module manifest (XIP text: off==~0u) */
+                    for (unsigned i = 0; i < n; i++) {
+                        mmcs_srvt[i].va = ldl_le_p(tbuf + 8 + 24 * i);
+                        mmcs_srvt[i].size = ldl_le_p(tbuf + 8 + 24 * i + 4);
+                        mmcs_srvt[i].rom = ldl_le_p(tbuf + 8 + 24 * i + 8);
+                        mmcs_srvt[i].flags = ldl_le_p(tbuf + 8 + 24 * i + 12);
+                        mmcs_srvt[i].off = ldl_le_p(tbuf + 8 + 24 * i + 16);
+                    }
+                    ok = true;
+                }
+                if (ok) {
+                    mmcs_srvt_blob = tbuf;
+                    mmcs_srvt_blob_len = tlen;
+                    mmcs_nsrvt = n;
+                    fprintf(stderr, "MMCS: SRVPGTAB %s: %u sections",
+                            stab, n);
+                    for (int i = 0; i < n && i < 8; i++) {
+                        fprintf(stderr, " %08x+%x", mmcs_srvt[i].va,
+                                mmcs_srvt[i].size);
+                    }
+                    if (n > 8) {
+                        fprintf(stderr, " ...");
+                    }
+                    fprintf(stderr, "\n");
+                    if (mmcs_env_on("MMCS_IATFIX")) {
+                        mmcs_iatfix_on = 1;
+                        fprintf(stderr, "MMCS: IATFIX generalized C0-window "
+                                "module service armed (manifest %u secs)\n",
+                                n);
+                    }
+                } else {
+                    fprintf(stderr, "MMCS: SRVPGTAB %s: bad magic/count - "
+                            "IGNORED\n", stab);
+                    g_free(tbuf);
+                }
+            } else {
+                fprintf(stderr, "MMCS: SRVPGTAB %s: cannot read - IGNORED\n",
+                        stab);
+            }
+        } else if (mmcs_env_on("MMCS_IATFIX")) {
+            fprintf(stderr, "MMCS: IATFIX needs MMCS_SRVPGTAB; not arming\n");
+        }
     }
     if (getenv("MMCS_KSLOT")) {
         cpu->env.mmcs_kslot_active = 1;
@@ -1526,6 +1778,18 @@ static void mmcs_init(MachineState *machine)
                         getenv("MMCS_TICK_DELAY") ? : "12000");
                 /* MMCS fork (L14): the parked boot-thread event-set
                  * delivery (see mmcs_hdevt_fire; needs KILLSTK + TICK) */
+                /* MMCS fork (L15): MMCS_RINGNOP — unblock the uHAL
+                 * ring producer (see mmcs_ringnop_arm above) */
+                if (mmcs_env_on("MMCS_RINGNOP")) {
+                    QEMUTimer *r = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                                mmcs_ringnop_arm, NULL);
+                    timer_mod(r, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                              + atoi(getenv("MMCS_RINGNOP_DELAY")
+                                     ? : "140000"));
+                    fprintf(stderr, "MMCS: RINGNOP ring unblock "
+                            "(delay %sms)\n",
+                            getenv("MMCS_RINGNOP_DELAY") ? : "140000");
+                }
                 if (mmcs_env_on("MMCS_HDEVT")) {
                     if (!mmcs_env_on("MMCS_KILLSTK")) {
                         fprintf(stderr, "MMCS-HDEVT: needs MMCS_KILLSTK "
