@@ -41,6 +41,10 @@
 #define MMCS_FLASH_SIZE (128 * MiB)
 #define MMCS_ENTRY      0x908066b0   /* kernel entry from image first record */
 
+/* L18 vendor-INTC access census (defined near the vintc ops below) */
+static void mmcs_vi_note(int is_w, hwaddr off, uint32_t val);
+static void mmcs_vi_census_dump(void);
+
 /* MMIO census regions (64K buckets) not covered by the sh7750 model —
  * logged as unimplemented so the OAL's dialogue with missing hardware is
  * visible instead of silent. */
@@ -459,6 +463,8 @@ static void mmcs_jitfix_sweep(void *opaque)
 
 static void mmcs_dump_ram(void *opaque)
 {
+    /* L18: the vendor-INTC census snapshot at dump time */
+    mmcs_vi_census_dump();
     /* MMCS_FINDPAT=<hexbytes>: scan unit RAM (0x08000000..0x10800000) for a
      * byte pattern at dump time and log phys hits — content-based phys
      * discovery for structures whose page tables were fault-aborted. */
@@ -988,7 +994,6 @@ struct mmcs_l16_ent {
     int pending;
 };
 static struct mmcs_l16_ent mmcs_l16_ents[MMCS_L16_MAX];
-static int mmcs_l16_n;
 
 static void mmcs_tick_deliver(void *opaque)
 {
@@ -1009,8 +1014,10 @@ static void mmcs_tick_deliver(void *opaque)
          * evt consumed it) but keep the 1ms cadence alive. */
     } else {
         /* L16: service one pending event-wake per tick (after the
-         * HDEVT chain; same slot-consuming semantics, same guard) */
-        for (int i = 0; i < mmcs_l16_n; i++) {
+         * HDEVT chain; same slot-consuming semantics, same guard).
+         * L18: entries 4..7 (the v2 completion stubs) share the walk —
+         * armed = pending>0, the parse no longer packs them. */
+        for (int i = 0; i < MMCS_L16_MAX; i++) {
             struct mmcs_l16_ent *e = &mmcs_l16_ents[i];
             if (e->pending > 0) {
                 mmcs_inject_evt(e->evt_code);
@@ -1084,6 +1091,64 @@ static void mmcs_hdevt_trace(void *opaque)
     QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_hdevt_trace, NULL);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
               + atoi(getenv("MMCS_HDEVT_TRACE_MS") ? : "10"));
+}
+
+/* MMCS fork (L18): MMCS_SCHEDTRACE=1 — sample the vendor scheduler cells
+ * every 10ms of virtual time and print a line on ANY change (bounded:
+ * 512 lines). DECODE MOTIVATION: the L17 state parks with the kernel
+ * MAIN thread (0x906ff024 — the stock schedule.c alarm-loop lane,
+ * SetThreadBasePrio(self, dwNKAlarmThrdPrio) + WaitForSingleObject
+ * (hAlarmThreadWakeup, ONE_DAY=0x5265C00)) stuck INSIDE the
+ * SetThreadBasePrio KCall (resume pc 0x908382ca), while the switcher's
+ * pick cell *(0x8867efa4) and pCurTh *(0x88679894) still name the kill-
+ * era CORPSE thread 0x9068f0c0 (state16=8=dead, ctx sp=0xbeffff5c
+ * unmapped). The L15/L16 stub chain resumes waiters from tick context
+ * without a switcher pass, so the current-thread bookkeeping never
+ * advanced — this tracer catches the wake->MakeRun->pick->switch
+ * dynamics ground-truth. */
+static void mmcs_sched_trace(void *opaque)
+{
+    struct { uint32_t phys; const char *name; } cells[] = {
+        { 0x0867EFA0, "q0" },       /* run-queue band0 head / pick input */
+        { 0x0867EFA4, "pick" },     /* switcher's next-thread cell */
+        { 0x08679894, "pCurTh" },   /* KData+0x94 (current thread) */
+        { 0x08679884, "kcallflags" },
+        { 0x08679888, "kcalldrain" },
+        { 0x08679810, "pCurPrc" },
+        { 0x106FF030, "boot.state16" },   /* 0x906ff024 +0xc */
+        { 0x106FF0D4, "boot.ctxpc" },     /* +0xb4 */
+        { 0x086CA24C, "q0th.state16" },   /* 0x906ca240 +0xc */
+        { 0x086CA2F4, "q0th.ctxpc" },     /* +0xb4 */
+        { 0x1068F0CC, "corpse.state16" }, /* 0x9068f0c0 +0xc */
+        { 0x1068F0D4, "corpse.ctxpc" },   /* +0xb4 */
+    };
+    static uint32_t prev[12];
+    static int lines;
+    uint32_t cur[12];
+    bool changed = false;
+    for (unsigned i = 0; i < 12; i++) {
+        cur[i] = 0;
+        cpu_physical_memory_read(cells[i].phys, &cur[i], 4);
+        if (cur[i] != prev[i]) {
+            changed = true;
+        }
+    }
+    if (changed && lines < 512) {
+        fprintf(stderr, "MMCS-SCHED t=%" PRId64 "ms",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+        for (unsigned i = 0; i < 12; i++) {
+            if (cur[i] != prev[i]) {
+                fprintf(stderr, " %s=%08x->%08x", cells[i].name,
+                        prev[i], cur[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+        lines++;
+    }
+    memcpy(prev, cur, sizeof prev);
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_sched_trace, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+              + atoi(getenv("MMCS_SCHEDTRACE_MS") ? : "10"));
 }
 
 /* MMCS fork (L16): MMCS_L16EV=<eventVA>@<delay_ms>[,...] — wake the
@@ -1190,6 +1255,155 @@ static void mmcs_l16_slot_restore(void *opaque)
             e->evt_code);
 }
 
+/* MMCS fork (L18): the v3 wake-completion stub (MMCS_L18EV). DECODE
+ * (L18: SCHEDTRACE cell tracer + gdb bps at the switcher 0x90822b68 /
+ * MRI 0x908278e8 / MakeRun 0x90825ee4 + Z2 pick-watchpoints): the
+ * system has run WITHOUT its scheduler since t~3s — the servant death
+ * while current froze pick (0x8867efa4) and pCurTh (KData+0x94) on the
+ * corpse, and the CPU fell into the pc=0 kill-stack loop; every wake
+ * since executes through the tick-interrupt context (the trampoline's
+ * ctx load) WITHOUT the scheduler bookkeeping: the vendor walker
+ * (0x90827f68) unlinks the waitblock and leaves the waiter
+ * RUNNABLE(1)-not-queued, and the stub's MRI (0x908278e8) SKIPS it
+ * (MRI MakeRuns only NEEDSRUN(3) — stock mirror schedule.c:967).
+ * Z2 GROUND TRUTH on the pick cell 0x8867efa4: its writers = the
+ * MakeRun-family enqueue (0x9082601c-class) and 0x90827452 — the
+ * next-thread RECOMPUTE, called from drain2 (0x90827148), called from
+ * the switcher entry (0x90822ba0) ONLY when word 0x88679888 == 1; the
+ * switcher itself is only entered from a KCall-exit when BYTE
+ * 0x88679884 == 1 (the KCall-thunk tail check: mov.b @r1; cmp/eq #1 ->
+ * save-ctx -> bra 0x90822b68). The recompute walks the run-queue bands
+ * from band 0, so it naturally replaces the stale corpse pick with the
+ * highest live queued thread. v3 = v1 (walker + MRI) + MakeRun(hWake)
+ * (the enqueue half MRI would have done for a NEEDSRUN waiter) + the
+ * vendor's paired resched protocol: BYTE 0x88679884=1 (switcher entry)
+ * and WORD 0x88679888=1 (drain2 pick recompute). Markers: 10 delivery,
+ * 11 walker returned, 13 MRI done, 14 MakeRun done, 15 flag byte set,
+ * 16 drain word set (cell at block+0xF0, same as v1/v2). */
+static uint8_t mmcs_l18_stub[] = {
+    0x22, 0x4f,                /* sts.l pr,@-r15 */
+    0xe6, 0x2f,                /* mov.l r14,@-r15 */
+    0x21, 0xd4,                /* mov.l .Le,r4        (@+140) */
+    0x42, 0x50,                /* mov.l @(8,r4),r0 (proxy head) */
+    0x08, 0x20,                /* tst r0,r0 */
+    0x37, 0x89,                /* bt Lret124 (already delivered) */
+    0x0a, 0xe1,                /* mov #10,r1 */
+    0x1e, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x03, 0xe5,                /* mov #3,r5 (EVENT_SET) */
+    0x1e, 0xd3,                /* mov.l .Lw,r3        (@+144) */
+    0x0b, 0x43,                /* jsr @r3 */
+    0x09, 0x00,                /* nop */
+    0x03, 0x6e,                /* mov r0,r14 (hWake = pTh) */
+    0x0b, 0xe1,                /* mov #11,r1 */
+    0x1a, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xe8, 0x2e,                /* tst r14,r14 */
+    0x2a, 0x89,                /* bt Lret124 */
+    0xe3, 0x64,                /* mov r14,r4 */
+    0x1a, 0xd3,                /* mov.l .Lmri,r3      (@+148) */
+    0x0b, 0x43,                /* jsr @r3 */
+    0x09, 0x00,                /* nop */
+    0x0d, 0xe1,                /* mov #13,r1 (MRI done) */
+    0x15, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xe3, 0x64,                /* mov r14,r4 */
+    0x18, 0xd3,                /* mov.l .Lmk,r3       (@+152) */
+    0x0b, 0x43,                /* jsr @r3 (MakeRun) */
+    0x09, 0x00,                /* nop */
+    0x0e, 0xe1,                /* mov #14,r1 (MakeRun done) */
+    0x12, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x01, 0xe1,                /* mov #1,r1 */
+    0x15, 0xd2,                /* mov.l .Lf,r2        (@+156) */
+    0x10, 0x22,                /* mov.b r1,@r2 (switcher-entry flag) */
+    0x0f, 0xe1,                /* mov #15,r1 (flag byte set) */
+    0x0f, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x01, 0xe1,                /* mov #1,r1 */
+    0x13, 0xd2,                /* mov.l .Lf2,r2       (@+160) */
+    0x12, 0x22,                /* mov.l r1,@r2 (drain2 pick-recompute) */
+    0x10, 0xe1,                /* mov #16,r1 (drain word set) */
+    0x0c, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xe3, 0x64,                /* mov r14,r4 (hWake) */
+    0x11, 0xd2,                /* mov.l .Lpick,r2     (@+164) */
+    0x42, 0x22,                /* mov.l r4,@r2 (pick = hWake — the
+                                 * vendor pick-set write class; the
+                                 * switcher's drain2 recompute may
+                                 * override it with the band walk) */
+    0x11, 0xe1,                /* mov #17,r1 (pick set) */
+    0x09, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x10, 0xd2,                /* mov.l .Lpcur,r2     (@+168) */
+    0x20, 0x5e,                /* mov.l @r2,r14 (r14 = pCurTh — the
+                                 * switcher's "current" it saves) */
+    0x12, 0xe1,                /* mov #18,r1 (r14 set) */
+    0x06, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0x0e, 0xd3,                /* mov.l .Lsw,r3       (@+172) */
+    0x0b, 0x43,                /* jsr @r3 (the vendor switcher
+                                 * 0x90822b68: saves r14's ctx, drains
+                                 * (drain2 = the pick recompute), loads
+                                 * the pick's ctx — execution continues
+                                 * THERE; the marker 19 below only runs
+                                 * if no switch happened) */
+    0x09, 0x00,                /* nop */
+    0x13, 0xe1,                /* mov #19,r1 (switcher returned = no
+                                 * switch — the pick equaled current) */
+    0x03, 0xd2,                /* mov.l .Lm,r2        (@+136) */
+    0x12, 0x22,                /* mov.l r1,@r2 */
+    0xf6, 0x6f,                /* Lret124: mov.l @r15+,r14 */
+    0x26, 0x4f,                /* lds.l @r15+,pr */
+    0x00, 0xe0,                /* mov #0,r0 (SYSINTR_NOP) */
+    0x0b, 0x00,                /* rts */
+    0x09, 0x00,                /* nop */
+    0x09, 0x00,                /* nop (pad) */
+    0x00, 0xff, 0x00, 0xbf,    /* +136 .Lm: marker cell */
+    0x34, 0xc2, 0x6d, 0x90,    /* +140 .Le: pEvent (patched) */
+    0x68, 0x7f, 0x82, 0x90,    /* +144 .Lw: 0x90827f68 walker */
+    0xe8, 0x78, 0x82, 0x90,    /* +148 .Lmri: 0x908278e8 MRI */
+    0xe4, 0x5e, 0x82, 0x90,    /* +152 .Lmk: 0x90825ee4 MakeRun */
+    0x84, 0x98, 0x67, 0x88,    /* +156 .Lf: 0x88679884 resched BYTE */
+    0x88, 0x98, 0x67, 0x88,    /* +160 .Lf2: 0x88679888 drain2 WORD */
+    0xa4, 0xef, 0x67, 0x88,    /* +164 .Lpick: 0x8867efa4 pick cell */
+    0x94, 0x98, 0x67, 0x88,    /* +168 .Lpcur: 0x88679894 pCurTh */
+    0x68, 0x2b, 0x82, 0x90,    /* +172 .Lsw: 0x90822b68 switcher */
+};
+
+static void mmcs_l18ev_fire(void *opaque)
+{
+    struct mmcs_l16_ent *e = opaque;
+    uint32_t slot_cur = 0;
+    cpu_physical_memory_read(e->slot_pa, &slot_cur, 4);
+    if (slot_cur != 0x90822e40) {
+        fprintf(stderr, "MMCS-L18: evt %03x slot busy (%08x) - SKIPPED\n",
+                e->evt_code, slot_cur);
+        return;
+    }
+    uint8_t stub[sizeof mmcs_l18_stub];
+    memcpy(stub, mmcs_l18_stub, sizeof stub);
+    uint8_t *le = (uint8_t *)memmem(stub, sizeof stub, "\x34\xc2\x6d\x90", 4);
+    uint8_t *lm = (uint8_t *)memmem(stub, sizeof stub, "\x00\xff\x00\xbf", 4);
+    if (!le || !lm) {
+        fprintf(stderr, "MMCS-L18: stub literal locate FAILED\n");
+        return;
+    }
+    stl_le_p(le, e->evt_va);
+    stl_le_p(lm, e->stub_va + MMCS_L16_STUB_MARK);
+    cpu_physical_memory_write(e->stub_va - 0xA0000000, stub,
+                              sizeof stub);
+    cpu_physical_memory_write(e->slot_pa, &e->stub_va, 4);
+    e->pending = 8;    /* chain the next ticks (guard = no-op re-fires) */
+    fprintf(stderr, "MMCS-L18: v2 stub @%08x for event %08x, slot evt %03x "
+            "wired (walker+MRI+MakeRun+resched), chained to next ticks\n",
+            e->stub_va, e->evt_va, e->evt_code);
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_l16_slot_restore,
+                                e);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+}
+
+
 static void mmcs_l16ev_fire(void *opaque)
 {
     struct mmcs_l16_ent *e = opaque;
@@ -1229,31 +1443,48 @@ static void mmcs_l16ev_fire(void *opaque)
 
 static void mmcs_l16_boot_parse(void)
 {
-    const char *spec = getenv("MMCS_L16EV");
-    if (!spec) {
-        return;
-    }
-    char buf[256];
-    snprintf(buf, sizeof buf, "%s", spec);
-    for (char *tok = strtok(buf, ","); tok && mmcs_l16_n < MMCS_L16_MAX;
-         tok = strtok(NULL, ",")) {
-        unsigned long va = 0, ms = 0;
-        if (sscanf(tok, "%lx@%lu", &va, &ms) != 2 || !va) {
-            fprintf(stderr, "MMCS-L16: bad spec '%s'\n", tok);
+    /* L18: MMCS_L18EV parses identically but arms the v2 completion
+     * stubs on the FREE dispatch slots (indices 4..7: evt
+     * 0x2C0/0x2E0/0x300/0x320 — the L16 census verified only the
+     * default handler there) at 0xBF00E800+n*0x100 (clear of the L16
+     * stubs below and the L14 hdevt stub at 0xF000). */
+    const struct { const char *env; int first, base; int v2; } lists[] = {
+        { "MMCS_L16EV", 0, MMCS_L16_STUB_BASE, 0 },
+        { "MMCS_L18EV", 4, 0xBF00E800, 1 },
+    };
+    for (unsigned li = 0; li < ARRAY_SIZE(lists); li++) {
+        const char *spec = getenv(lists[li].env);
+        if (!spec) {
             continue;
         }
-        struct mmcs_l16_ent *e = &mmcs_l16_ents[mmcs_l16_n];
-        e->evt_va = va;
-        e->stub_va = MMCS_L16_STUB_BASE + mmcs_l16_n * 0x100;
-        e->evt_code = mmcs_l16_evts[mmcs_l16_n];
-        e->slot_pa = mmcs_l16_slots[mmcs_l16_n];
-        e->pending = 0;
-        fprintf(stderr, "MMCS-L16: event %08x scheduled @%lums "
-                "(stub %08x slot evt %03x)\n",
-                e->evt_va, ms, e->stub_va, e->evt_code);
-        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_l16ev_fire, e);
-        timer_mod(t, ms);
-        mmcs_l16_n++;
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s", spec);
+        int n_list = 0;
+        for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+            unsigned long va = 0, ms = 0;
+            if (sscanf(tok, "%lx@%lu", &va, &ms) != 2 || !va
+                || lists[li].first + n_list >= MMCS_L16_MAX) {
+                fprintf(stderr, "MMCS-L16: bad spec '%s'\n", tok);
+                continue;
+            }
+            int idx = lists[li].first + n_list;
+            struct mmcs_l16_ent *e = &mmcs_l16_ents[idx];
+            e->evt_va = va;
+            e->stub_va = lists[li].base + n_list * 0x100;
+            e->evt_code = mmcs_l16_evts[idx];
+            e->slot_pa = mmcs_l16_slots[idx];
+            e->pending = 0;
+            fprintf(stderr, "MMCS-%s: event %08lx scheduled @%lums "
+                    "(stub %08x slot evt %03x v%d)\n",
+                    lists[li].v2 ? "L18" : "L16", va, ms,
+                    e->stub_va, e->evt_code, lists[li].v2 ? 2 : 1);
+            QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        lists[li].v2 ? mmcs_l18ev_fire
+                                                     : mmcs_l16ev_fire,
+                                        e);
+            timer_mod(t, ms);
+            n_list++;
+        }
     }
 }
 
@@ -1284,6 +1515,7 @@ static uint64_t mmcs_vintc_read(void *opaque, hwaddr off, unsigned size)
         fprintf(stderr, "MMCS-VINTC R off=%05llx -> %08llx\n",
                 (unsigned long long)off, (unsigned long long)v);
     }
+    mmcs_vi_note(0, off, (uint32_t)v);
     return v;
 }
 static void mmcs_vintc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
@@ -1292,6 +1524,7 @@ static void mmcs_vintc_write(void *opaque, hwaddr off, uint64_t val, unsigned si
         fprintf(stderr, "MMCS-VINTC W off=%05llx <- %08llx\n",
                 (unsigned long long)off, (unsigned long long)val);
     }
+    mmcs_vi_note(1, off, (uint32_t)val);
     if (off / 4 < 64) memcpy((uint8_t *)mmcs_vintc_regs + off, &val, size);
 }
 static const MemoryRegionOps mmcs_vintc_ops = {
@@ -1299,6 +1532,114 @@ static const MemoryRegionOps mmcs_vintc_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid.min_access_size = 1, .valid.max_access_size = 4,
 };
+
+/* MMCS fork (L18): vendor-INTC access census (env MMCS_VINTC_CENSUS=1).
+ * DECODE MOTIVATION (S134/L17): the NULL-call caller at 0x908381b8
+ * computes r1 = *0x8867ed64 + 0xB8 and the parked dump showed
+ * r1 = 0xf4008000 — the vendor global-struct base is 0xF4007F48-class
+ * and the register block at +0xB8 = 0xF4008000 is the LIVE interrupt
+ * controller (distinct from the loader's 0xF4000000 zero-sweep page and
+ * the 0xF4001000/3000 kernel data refs). MMCS_TRACE per-access logging
+ * is useless there (the S73 sweeps were 4.3M zero-writes), so this is a
+ * bounded per-register histogram: read/write counts, first distinct
+ * written values, and a ring of the most recent events — dumped every
+ * 60s of virtual time and at MMCS_DUMP time. Ground truth for the
+ * status/ack/mask decode without the flood. */
+#define MMCS_VI_NT (0x10000u / 4)
+static uint32_t mmcs_vi_nr[MMCS_VI_NT], mmcs_vi_nw[MMCS_VI_NT];
+static uint32_t mmcs_vi_fv[MMCS_VI_NT][3];   /* first 3 distinct writes */
+static uint8_t mmcs_vi_nv[MMCS_VI_NT];
+static struct { uint32_t off, val; uint8_t is_w; } mmcs_vi_ring[256];
+static int mmcs_vi_ring_i;
+static int mmcs_vi_census;
+
+static void mmcs_vi_note(int is_w, hwaddr off, uint32_t val)
+{
+    if (!mmcs_vi_census) {
+        return;
+    }
+    unsigned i = off >> 2;
+    if (i < MMCS_VI_NT) {
+        if (is_w) {
+            mmcs_vi_nw[i]++;
+            if (mmcs_vi_nv[i] < 3) {
+                for (int k = 0; k < mmcs_vi_nv[i]; k++) {
+                    if (mmcs_vi_fv[i][k] == val) {
+                        goto ring;
+                    }
+                }
+                mmcs_vi_fv[i][mmcs_vi_nv[i]++] = val;
+            }
+        } else {
+            mmcs_vi_nr[i]++;
+        }
+    }
+ring:
+    mmcs_vi_ring[mmcs_vi_ring_i].off = (uint32_t)off;
+    mmcs_vi_ring[mmcs_vi_ring_i].val = val;
+    mmcs_vi_ring[mmcs_vi_ring_i].is_w = (uint8_t)is_w;
+    mmcs_vi_ring_i = (mmcs_vi_ring_i + 1) % ARRAY_SIZE(mmcs_vi_ring);
+}
+
+static void mmcs_vi_census_dump(void)
+{
+    if (!mmcs_vi_census) {
+        return;
+    }
+    fprintf(stderr, "MMCS-VI-CENSUS t=%" PRId64 "ms\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+    /* per-4K-block summary */
+    for (unsigned b = 0; b < 0x10000u / 0x1000u; b++) {
+        uint64_t r = 0, w = 0;
+        for (unsigned k = 0; k < 0x1000 / 4; k++) {
+            r += mmcs_vi_nr[b * 0x400 + k];
+            w += mmcs_vi_nw[b * 0x400 + k];
+        }
+        if (r || w) {
+            fprintf(stderr, "  block +%04x: R=%llu W=%llu\n", b * 0x1000,
+                    (unsigned long long)r, (unsigned long long)w);
+        }
+    }
+    /* per-register detail, capped */
+    int shown = 0, more = 0;
+    for (unsigned i = 0; i < MMCS_VI_NT; i++) {
+        if (!mmcs_vi_nr[i] && !mmcs_vi_nw[i]) {
+            continue;
+        }
+        if (shown++ < 48) {
+            fprintf(stderr, "  reg +%04x: R=%u W=%u vals {", i * 4,
+                    mmcs_vi_nr[i], mmcs_vi_nw[i]);
+            for (int k = 0; k < mmcs_vi_nv[i]; k++) {
+                fprintf(stderr, "%s%08x", k ? "," : "", mmcs_vi_fv[i][k]);
+            }
+            fprintf(stderr, "}\n");
+        } else {
+            more++;
+        }
+    }
+    if (more) {
+        fprintf(stderr, "  (%d more registers with traffic)\n", more);
+    }
+    /* ring tail: the most recent 24 events, oldest first */
+    fprintf(stderr, "  ring:");
+    for (int k = ARRAY_SIZE(mmcs_vi_ring) - 24;
+         k < ARRAY_SIZE(mmcs_vi_ring); k++) {
+        if (k < 0) {
+            continue;
+        }
+        int idx = (mmcs_vi_ring_i + k) % ARRAY_SIZE(mmcs_vi_ring);
+        fprintf(stderr, " %c%04x=%08x", mmcs_vi_ring[idx].is_w ? 'W' : 'R',
+                mmcs_vi_ring[idx].off, mmcs_vi_ring[idx].val);
+    }
+    fprintf(stderr, "\n");
+}
+
+static void mmcs_vi_census_tick(void *opaque)
+{
+    mmcs_vi_census_dump();
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_vi_census_tick, NULL);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 60000);
+}
 
 
 
@@ -1806,8 +2147,8 @@ static void mmcs_init(MachineState *machine)
                     }
                 }
                 /* L16: servant-side waiter wakes (MMCS_L16EV list;
-                 * needs the KILLSTK stub page + the TICK delivery
-                 * chain, exactly like HDEVT) */
+                  * needs the KILLSTK stub page + the TICK delivery
+                  * chain, exactly like HDEVT) */
                 if (getenv("MMCS_L16EV")) {
                     if (!mmcs_env_on("MMCS_KILLSTK")
                         || !mmcs_env_on("MMCS_TICK")) {
@@ -1817,12 +2158,29 @@ static void mmcs_init(MachineState *machine)
                         mmcs_l16_boot_parse();
                     }
                 }
+                /* L18: scheduler-cell change tracer (see above) */
+                if (mmcs_env_on("MMCS_SCHEDTRACE")) {
+                    QEMUTimer *st = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                                 mmcs_sched_trace, NULL);
+                    timer_mod(st, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                              + 1000);
+                    fprintf(stderr, "MMCS: SCHEDTRACE scheduler-cell "
+                            "tracer armed\n");
+                }
             }
         }
         MemoryRegion *mr = g_new(MemoryRegion, 1);
         memory_region_init_io(mr, NULL, &mmcs_vintc_ops, NULL,
                               "mmcs.vintc", 0x10000);
         memory_region_add_subregion(get_system_memory(), 0xF4000000, mr);
+        /* L18: the vendor-INTC census (see the block above) */
+        if (mmcs_env_on("MMCS_VINTC_CENSUS")) {
+            mmcs_vi_census = 1;
+            QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        mmcs_vi_census_tick, NULL);
+            timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 60000);
+            fprintf(stderr, "MMCS: vendor-INTC census armed (60s cadence)\n");
+        }
     }
 
     /* The kernel addresses on-chip regs P4-style (0xFFxxxxxx). qemu's INTC
