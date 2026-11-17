@@ -1856,6 +1856,83 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     ret = get_physical_address(env, &physical, &prot, address, access_type);
 
+    /* MMCS fork (L26): P1 KERNEL-ALIAS of the C0 servant window.
+     *
+     * Decoded 2026-11-17 (L26 park walk): this image's own pre-bound
+     * dispatch tables call kernel-side servants through their P1
+     * aliases — filesys.dll's FS_* dispatch block (decompressed .data
+     * at c00ce2bc-c00ce2e4, 54 words) ships LITERAL 0x802cxxxx
+     * targets (fsdmgr!FS_MoveFileW = 0x802c7668 = the servant
+     * c02c7668 with the P1-window base), and six more modules carry
+     * the same class (c0243000/c0253000/c0276000/c029b000/c02a5000/
+     * c02b4000/c00e3000 rows). On HW the vendor loader places the
+     * servant's pages at phys 0x02c1000-class and maps BOTH views
+     * (UTLB P3 c02c1000 + the always-valid P1 0x802c1000 direct
+     * alias) — the pre-bound tables call through P1 precisely
+     * because it needs no UTLB entry. The emulated crash: the filesys
+     * FUN_c00cb96c dispatch jsr'd 0x802c7668, P1 identity-resolved
+     * to phys 0x02c7668 (free RAM = garbage bytes), the fetch raised
+     * illegal 0x180 and the KAPIFIX failed-call synthesis retired
+     * the whole filesys init lane -> the park (empty run queue,
+     * arena recycled, chain[23]/[24] NULL).
+     *
+     * Fix: a KERNEL-mode fetch/load/store miss in [0x80000000,
+     * 0x81000000) whose +0x40000000 alias falls in the manifest's C0
+     * window maps THE SAME backing the C0 service serves (XIP .text
+     * = flash bytes RO+X, non-XIP = the SAME deduped instance
+     * scratch page, RW per the L22 decode) — one shared instance
+     * across both views, exactly the HW dual mapping. The manifest
+     * gate keeps the claim narrow: only the phys range the servant
+     * itself occupies on HW (the heap can never hold objects there),
+     * everything else in P1 keeps the identity path. PGOWN keys the
+     * normalized C0 VA so P1/P3 views share one ownership entry. */
+    if (mmu_idx != MMU_USER_IDX
+        && (mmcs_ilkfix_user_seen || mmcs_c0arm)
+        && mmcs_iatfix_on
+        && (uint32_t)address >= 0x80000000
+        && (uint32_t)address < 0x81000000
+        && (access_type == MMU_INST_FETCH
+            || access_type == MMU_DATA_LOAD
+            || access_type == MMU_DATA_STORE)) {
+        bool arw = false;
+        hwaddr apa = mmcs_iatfix_page_pa(
+            (uint32_t)address + 0x40000000u, &arw, true);
+        if (apa) {
+            static int nal;
+            if (nal++ < 24) {
+                fprintf(stderr, "MMCS-L26: P1 servant alias va=%08x "
+                        "-> c0 va=%08x pa=%08" HWADDR_PRIx " acc=%d "
+                        "rw=%d\n", (uint32_t)address,
+                        (uint32_t)address + 0x40000000u, apa,
+                        (int)access_type, (int)arw);
+            }
+            if (access_type == MMU_DATA_STORE && !arw) {
+                /* store to a read-only section through the alias:
+                 * raise the guest write violation at the faulting
+                 * (alias) VA — same fidelity as the C0/IATFIX path. */
+                static int naro;
+                if (naro++ < 8) {
+                    fprintf(stderr, "MMCS-L26: RO-section store refused "
+                            "va=%08x (p1 alias)\n", (uint32_t)address);
+                }
+                env->pteh = (env->pteh & PTEH_ASID_MASK)
+                            | ((uint32_t)address & PTEH_VPN_MASK);
+                env->tea = (uint32_t)address;
+                cs->exception_index = 0x0c0;
+                cpu_loop_exit_restore(cs, retaddr);
+            }
+            int ap = ((arw ? (PAGE_READ | PAGE_WRITE) : PAGE_READ)
+                      | PAGE_EXEC);
+            uint32_t apa32 = (uint32_t)apa;
+            ap = mmcs_pgown_fill(env, (uint32_t)address + 0x40000000u,
+                                 &apa32, ap,
+                                 access_type == MMU_DATA_STORE);
+            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, apa32,
+                         ap, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
+    }
+
     /* MMCS fork: MMCS_ILKFIX — the WinCE5 SH4 KData user page (VA 0x5800).
      *
      * Decoded 2026-11-15 (driver-init lane): stock mdsh3.c MDInitialize

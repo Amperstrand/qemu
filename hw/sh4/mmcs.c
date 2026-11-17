@@ -99,6 +99,49 @@ static const MemoryRegionOps mmcs_syscon_c080_ops = {
     .valid.min_access_size = 4, .valid.max_access_size = 4,
 };
 
+/* MMCS fork (L26): the [UsbCommonInit] PFC USB handshake — the OTHER
+ * polled register block the vendor kernel hits at boot.
+ *
+ * Decoded 2026-11-17 (L26 park walk): the kernel's USB common init
+ * (nk.exe 0x908098c0-lane) writes the PFC USB mux config at
+ * 0xFFE70804 (|= 1, then |= 3), then POLLS 0xFFE70808 for
+ * (val & 0xC0000000) == 0xC0000000 with a 0x515900-try timeout;
+ * on timeout it takes the error lane — the wide-string print
+ * '//// [UsbCommonInit] register(USBST=0x%X) check error ////'
+ * (ROM 0x90802750) — whose printer-thunk loop (0x90809b40 jsr +
+ * 0x90809b48 lds.l @r15+,pr) was the KData-IST-stack ASCII caught
+ * by the L26 bp probe, the serial '//\r\n' remnant, and the
+ * return-to-garbage deaths that end the kernel launch cascade
+ * before filesys's phase chain ever runs. On HW the USBST status
+ * bits (+0x808 top two bits) come up once the port pins are muxed
+ * (+0x804 low bits) — model exactly that: read-back storage for
+ * the block, +0x808 reads OR ((stored+0x804 & 3) << 30).
+ * Env MMCS_USBST=1, default off. */
+static uint32_t pfc_usb_st[4];
+static uint64_t mmcs_pfc_usb_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == 0x808) {
+        return pfc_usb_st[2] | ((pfc_usb_st[1] & 3) << 30);
+    }
+    if (addr / 4 < 4) {
+        return pfc_usb_st[addr / 4];
+    }
+    return 0;
+}
+static void mmcs_pfc_usb_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    if (addr / 4 < 4) {
+        pfc_usb_st[addr / 4] = (uint32_t)val;
+    }
+}
+static const MemoryRegionOps mmcs_pfc_usb_ops = {
+    .read = mmcs_pfc_usb_read,
+    .write = mmcs_pfc_usb_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4, .valid.max_access_size = 4,
+};
+
 /* deterministic post-boot RAM dump (env MMCS_DUMP=<seconds>):
  * writes the ROMHDR copy-entry destinations + RAMStart to /tmp for
  * verifying kernel-side ROM→RAM copies. */
@@ -1349,11 +1392,17 @@ static struct mmcs_l16_ent mmcs_l16_ents[MMCS_L16_MAX];
 static void mmcs_l19_scan(void);
 static int mmcs_l19_armed;
 static uint32_t mmcs_l19_cadence_ms = 1000;
+/* L26: the DoWait-orphan wake daemon (full block + decode below) */
+static void mmcs_l26_scan(void);
+static int mmcs_l26_armed;
+static uint32_t mmcs_l26_cadence_ms = 2000;
+static uint32_t mmcs_l26_max_deliv = 64;
 
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
     static uint64_t l19_ticks;
+    static uint64_t l26_ticks;
     bool hdevt = mmcs_hdevt_pending > 0;
     bool l16 = false;
     if (hdevt) {
@@ -1375,6 +1424,11 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l19_armed && ++l19_ticks >= mmcs_l19_cadence_ms) {
             l19_ticks = 0;
             mmcs_l19_scan();
+        }
+        /* L26: the DoWait-orphan wake daemon (same cadence class) */
+        if (mmcs_l26_armed && ++l26_ticks >= mmcs_l26_cadence_ms) {
+            l26_ticks = 0;
+            mmcs_l26_scan();
         }
         /* L16: service one pending event-wake per tick (after the
          * HDEVT chain; same slot-consuming semantics, same guard).
@@ -1832,6 +1886,159 @@ static void mmcs_l19_signature(uint8_t *out)
     }
 }
 
+/* MMCS fork (L26): MMCS_L26EV — the DoWait-orphan wake daemon (the
+ * v6 thread-completion stub).
+ *
+ * Decoded 2026-11-17 (L26 park census, l26_probe10): with the L25
+ * loader lane clean + the L26 P1-alias dispatch fix, the boot parks
+ * with the ENTIRE system = five threads ALL blocked at the vendor
+ * DoWait loop 0x90837cf6 (ctx pc), state16 runstate BLOCKED(2):
+ * MAIN 0x906ff024 (wait-obj 0 — the stock RunApps FSReady wait, the
+ * LEGIT gate: filesys must earn it) plus FOUR orphaned servant
+ * waiters (0x906feb58/0x906dd000/0x906dd7a4/0x906ddacc, kstacks
+ * d006/d007/d009/d00a) whose wait objects live ON THEIR OWN STACKS
+ * (thread+0x14c in [0xD0000000,0xDC000000)) and whose waitblocks were
+ * NEVER LINKED (thread+0x1f8 == 0 — the BlockWithHelper half
+ * completed the dequeue but the wake side was lost): NO stock
+ * mechanism holds them, the run queue is empty, the L19 event daemon
+ * finds nothing (they are not signaled+linked EVNTs) and the L19TH
+ * v5 guard rejects BLOCKED targets. The class is address-independent
+ * (each relaunch re-creates its stack events), so the daemon SCANS:
+ * every cadence, bulk-read the object arena (P1 0x90680000-0x90700000,
+ * phys 0x10680000) for a THREAD struct with the probe10 signature
+ * (+0x20 kstack base in the D0 window, +0x24 == 0x10000, +0x2c kstack
+ * low, ctx pc (+0xb4) == 0x90837cf6, state16 runstate == 2, wait-obj
+ * (+0x14c) in the D0 stack window, waitblk (+0x1f8) == 0) and deliver
+ * the v6 completion for the first: MakeRun(thread) + the resched
+ * protocol stores + pick=thread + r14=pCurTh + the vendor switcher.
+ * NO event-set: the stack wait structs are not EVNT-class (layout
+ * unknown — the walker would corrupt fields); the woken thread re-
+ * checks its own wait condition (the DoWait loop reads state16, finds
+ * 0x4000 clear, exits the loop into its post-wait path). In-stub
+ * guard: only MakeRun when the target is STILL BLOCKED(2) — chained
+ * re-deliveries no-op; a thread that re-enters the wait is re-served
+ * next cadence. MAIN's wait (wait-obj 0) is EXCLUDED (the FSReady
+ * gate must be earned). Bounds: one delivery per cadence, 60 quiet
+ * scans park, movement re-arms (the L19 discipline), hard cap
+ * MMCS_L26EV_MAX (default 64). Stub at KILLSTK 0xBF00E200 (idx 2,
+ * evt 0x280 — free when MMCS_L16EV is not armed), slot stays wired
+ * (daemon mode). Needs MMCS_KILLSTK + MMCS_TICK (the delivery rides
+ * the tick chain). */
+static uint8_t mmcs_l26_stub[] = {
+    0x22, 0x4f, 0xe6, 0x2f, 0x0f, 0xd4, 0x43, 0x50,
+    0x03, 0xc9, 0x02, 0x88, 0x01, 0x8b, 0x14, 0xa0,
+    0x09, 0x00, 0x09, 0x00, 0x0c, 0xd3, 0x0b, 0x43,
+    0x09, 0x00, 0x01, 0xe1, 0x0b, 0xd2, 0x12, 0x22,
+    0x01, 0xe1, 0x09, 0x00, 0x0a, 0xd2, 0x12, 0x22,
+    0x06, 0xd4, 0x09, 0x00, 0x09, 0xd2, 0x42, 0x22,
+    0x09, 0xd2, 0x20, 0x5e, 0x09, 0xd3, 0x0b, 0x43,
+    0x09, 0x00, 0xf6, 0x6e, 0x26, 0x4f, 0x00, 0xe0,
+    0x0b, 0x00, 0x09, 0x00, 0x00, 0xd0, 0x6d, 0x90,
+    0xe4, 0x5e, 0x82, 0x90, 0x84, 0x98, 0x67, 0x88,
+    0x88, 0x98, 0x67, 0x88, 0xa4, 0xef, 0x67, 0x88,
+    0x94, 0x98, 0x67, 0x88, 0x68, 0x2b, 0x82, 0x90,
+};
+#define MMCS_L26_STUB_VA   0xBF00E200
+#define MMCS_L26_SLOT_PA   0x0867A050   /* evt 0x280, idx 2 */
+#define MMCS_L26_QUIET_PARK 60
+static uint32_t mmcs_l26_total;
+
+static void mmcs_l26_scan(void)
+{
+    static uint8_t prev_sig[MMCS_L19_NSIG];
+    static int have_prev;
+    static uint32_t quiet_scans;
+    uint8_t sig[MMCS_L19_NSIG];
+
+    if (mmcs_l26_total >= mmcs_l26_max_deliv) {
+        if (mmcs_l26_armed) {
+            fprintf(stderr, "MMCS-L26: hard cap %u deliveries reached - "
+                    "daemon parked\n", mmcs_l26_total);
+            mmcs_l26_armed = 0;
+        }
+        return;
+    }
+    mmcs_l19_signature(sig);
+    bool moved = have_prev && memcmp(sig, prev_sig, MMCS_L19_NSIG) != 0;
+    memcpy(prev_sig, sig, MMCS_L19_NSIG);
+    have_prev = 1;
+    if (moved) {
+        quiet_scans = 0;
+        if (!mmcs_l26_armed) {
+            mmcs_l26_armed = 1;
+            fprintf(stderr, "MMCS-L26: t=%" PRId64 "ms movement while "
+                    "parked - re-armed (%u deliveries used)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l26_total);
+        }
+    } else if (mmcs_l26_armed && ++quiet_scans >= MMCS_L26_QUIET_PARK) {
+        fprintf(stderr, "MMCS-L26: t=%" PRId64 "ms %u quiet scans - "
+                "daemon parked at %u deliveries\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), quiet_scans,
+                mmcs_l26_total);
+        mmcs_l26_armed = 0;
+        quiet_scans = 0;
+    }
+    if (!mmcs_l26_armed) {
+        return;
+    }
+    /* the arena scan: find the first orphaned DoWait waiter */
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj, wblk;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        memcpy(&wblk, arena + o + 0x1f8, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || wblk != 0
+            || tva == pcur) {
+            continue;
+        }
+        /* deliver: patch .Lt (+0x44) with the thread VA, install the
+         * stub, wire the slot once, arm one delivery */
+        cpu_physical_memory_write(0x1F00E200 + 0x44, &tva, 4);
+        cpu_physical_memory_write(0x1F00E200, mmcs_l26_stub,
+                                  sizeof mmcs_l26_stub);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L26_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L26_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L26: slot evt 0x280 busy (%08x) - "
+                        "scan skipped\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L26_SLOT_PA,
+                                      &(uint32_t){ MMCS_L26_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[2];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L26_STUB_VA;
+        e->evt_code = 0x280;
+        e->slot_pa = MMCS_L26_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l26_total++;
+        fprintf(stderr, "MMCS-L26: t=%" PRId64 "ms DoWait-orphan wake "
+                "thread %08x (wait-obj %08x, kstk %08x, delivery "
+                "%u/%u)\n", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                tva, wobj, kbase, mmcs_l26_total, mmcs_l26_max_deliv);
+        return;                     /* one per cadence */
+    }
+}
+
+
 /* MMCS fork (L19): MMCS_L19TH=threadVA@ms[,threadVA@ms] — the THREAD-
  * level enqueue completion (v5 stub). L19 r3 finding: with the L18-era
  * scheduler resurrection but no wake deliveries at all, the system
@@ -2141,6 +2348,30 @@ static void mmcs_l16_boot_parse(void)
         fprintf(stderr, "MMCS-L19TH: shares slots 0-1 with MMCS_L16EV — "
                 "drop L16EV; not arming L19TH\n");
         return;
+    }
+    /* L26: the DoWait-orphan wake daemon — slot idx 2 (evt 0x280)
+     * would collide with MMCS_L16EV list entries >= 2 */
+    if (getenv("MMCS_L26EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L26: shares slot idx 2 (evt 0x280) "
+                    "with MMCS_L16EV — drop L16EV; not arming L26\n");
+        } else {
+            mmcs_l26_cadence_ms =
+                atoi(getenv("MMCS_L26EV_MS") ? : "2000");
+            if (!mmcs_l26_cadence_ms) {
+                mmcs_l26_cadence_ms = 2000;
+            }
+            mmcs_l26_max_deliv = atoi(getenv("MMCS_L26EV_MAX") ? : "64");
+            if (!mmcs_l26_max_deliv) {
+                mmcs_l26_max_deliv = 64;
+            }
+            mmcs_l26_armed = 1;
+            fprintf(stderr, "MMCS-L26: DoWait-orphan wake daemon armed "
+                    "(cadence %ums, cap %u; stub %08x slot evt 0x280 "
+                    "wired on first delivery)\n",
+                    mmcs_l26_cadence_ms, mmcs_l26_max_deliv,
+                    MMCS_L26_STUB_VA);
+        }
     }
     mmcs_l19_cadence_ms = atoi(getenv("MMCS_L19EV_MS") ? : "1000");
     if (!mmcs_l19_cadence_ms) {
@@ -3020,6 +3251,17 @@ static void mmcs_init(MachineState *machine)
         memory_region_init_io(mr, NULL, &mmcs_syscon_c080_ops, NULL,
                               "mmcs.syscon-c080", 0x1000);
         memory_region_add_subregion(get_system_memory(), 0xFFC08000, mr);
+    }
+    /* L26: the [UsbCommonInit] PFC handshake block (see ops above) —
+     * a 16-byte carve at 0xFFE70800 over the census stub, priority 1 */
+    if (getenv("MMCS_USBST")) {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+        memory_region_init_io(mr, NULL, &mmcs_pfc_usb_ops, NULL,
+                              "mmcs.pfc-usb", 0x10);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            0xFFE70800, mr, 1);
+        fprintf(stderr, "MMCS: USBST PFC handshake block at 0xFFE70800 "
+                "(env MMCS_USBST)\n");
     }
     /* 0xFFD80000 = SH7750 TMU (real qemu model, real IRQs) — do NOT
      * overlay it. Kernel programs TMU1 (TSTR=2) + TCOR/TCNT=0xFFFFFFFF. */
