@@ -338,6 +338,37 @@ static const void *mmcs_srvt_find(uint32_t va)
     return NULL;
 }
 
+/* MMCS fork (L28): MMCS_FSVT — the k.coredll api-set CELL rescue
+ * (hooks in target/sh4/helper.c do_interrupt). The kernel-side coredll
+ * calls kernel APIs through runtime-bound .data cells — [c00835c0] the
+ * FILESYS set, [c0083600] the WIN32 set — which ship 0 in the SRP2
+ * blob and never get bound in emulation (the synthetic servant launch
+ * skips the HW bind lane, and the loader's CopyRegions re-zeroes any
+ * seed-time patch), so the thunk derefs fault at NULL+0xXX and the
+ * vendor exception march killed every servant relaunch. The rescue
+ * drives the derefs at REGISTER level (immune to the backing
+ * flip-flop): the FS thunks jump straight to fsdmgr's FSINT_*
+ * kernel-direct implementations (RegisterAFSName c02c8c60,
+ * RegisterAFSEx c02c8ca4, DeregisterAFS c02c8db0, DeregisterAFSName
+ * c02c8e50 — same ABI, identified from fsdmgr.functions.json; the tea
+ * of the fault = the method offset), the WIN32 thunks re-base on the
+ * ROM methods table 0x90821028 (CINFO 'Wn32' @90821848, cMethods 130:
+ * CreateAPISet +0x08, GetLastError +0x178), and unmapped FS offsets
+ * land here — on a 4KB all-stub table (slot -> `mov #-1,r0; rts`, the
+ * guarded failure path). */
+#define MMCS_FSVT_PAGE   0x1F020000u
+#define MMCS_FSVT_P1     0x9F020000u
+#define MMCS_FSVT_STUB   (MMCS_FSVT_P1 + 0xF00u)
+static int mmcs_fsvt_armed;
+
+/* Consumed by the do_interrupt FSVT hook in target/sh4/helper.c: the
+ * all-stub fallback table's P1 address (0 when FSVT is not armed). */
+uint32_t mmcs_fsvt_p1(void);
+uint32_t mmcs_fsvt_p1(void)
+{
+    return mmcs_fsvt_armed ? MMCS_FSVT_P1 : 0;
+}
+
 static bool mmcs_srvpg_seed_page(uint32_t page, uint8_t *out)
 {
     /* L17: manifest first — true decompressed init content */
@@ -2824,6 +2855,36 @@ static void mmcs_init(MachineState *machine)
         } else if (mmcs_env_on("MMCS_IATFIX")) {
             fprintf(stderr, "MMCS: IATFIX needs MMCS_SRVPGTAB; not arming\n");
         }
+    }
+
+    /* MMCS_FSVT (L28): the api-set cell binds (see the mmcs_fsvt block
+     * above) + a small fallback table carve (all-stub; the real binds
+     * use the vendor tables directly). 4KB at phys 0x1F020000 — inside
+     * the P1/P2 29-bit window, clear of the KILLSTK carve
+     * (0x1F000000+64K) and its L14-L26 stubs. Placed after the
+     * SRVPGTAB load. */
+    if (getenv("MMCS_FSVT") && mmcs_srvt_blob_len) {
+        MemoryRegion *ft = g_new(MemoryRegion, 1);
+        memory_region_init_ram(ft, NULL, "mmcs.fsvt", 4 * KiB,
+                               &error_fatal);
+        memory_region_add_subregion(get_system_memory(), MMCS_FSVT_PAGE, ft);
+        static const uint32_t stubfill[0xE0 / 4] = { 0 };
+        for (unsigned i = 0; i < ARRAY_SIZE(stubfill); i++) {
+            uint32_t v = MMCS_FSVT_STUB;
+            /* all-stub fallback fill */
+            cpu_physical_memory_write(MMCS_FSVT_PAGE + 4 * i, &v, 4);
+        }
+        (void)stubfill;
+        static const uint8_t stub[8] = {
+            0xff, 0xe0,       /* mov #-1,r0 */
+            0x0b, 0x00,       /* rts */
+            0x09, 0x00, 0x09, 0x00,   /* nop; nop */
+        };
+        cpu_physical_memory_write(MMCS_FSVT_PAGE + 0xF00, stub, sizeof stub);
+        mmcs_fsvt_armed = 1;
+        fprintf(stderr, "MMCS: FSVT api-set cell rescue armed "
+                "(FSINT direct + Wn32 ROM table; stub table @P1 %08x)\n",
+                MMCS_FSVT_P1);
     }
     if (getenv("MMCS_KSLOT")) {
         cpu->env.mmcs_kslot_active = 1;

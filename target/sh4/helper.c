@@ -72,6 +72,13 @@ hwaddr mmcs_srvpg_data_pa(uint32_t va);
  * after the .data seeding fix). */
 extern int mmcs_iatfix_on;
 hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw, bool kernel_side);
+/* MMCS fork (L28): MMCS_FSVT — the api-set cell binds (hw/sh4/mmcs.c).
+ * mmcs_fsvt_bind_cells: one-shot physical write of the FILESYS/WIN32
+ * method-table cells; returns the number written. mmcs_fsvt_p1: the
+ * fallback table's P1 address (0 when not armed). */
+int mmcs_fsvt_bind_cells(CPUState *cs);
+uint32_t mmcs_fsvt_cell_debug(uint32_t cell);
+uint32_t mmcs_fsvt_p1(void);
 /* MMCS fork (L22): MMCS_C0ARM — arm the C0-window module service in
  * the kernel-side servant lane (the launch latch never fires there;
  * see the full decode in hw/sh4/mmcs.c). */
@@ -378,6 +385,87 @@ void superh_cpu_do_interrupt(CPUState *cs)
         env->pc = env->pr;
         cs->exception_index = -1;
         return;
+    }
+    /* MMCS fork (L28): MMCS_FSVT — the k.coredll api-set CELL rescue.
+     * The kernel-side coredll loads api-set method-table bases from
+     * runtime-bound .data cells ([c00835c0] FILESYS, [c0083600] WIN32)
+     * that ship 0 and never get bound in emulation (the loader's
+     * CopyRegions also re-zeroes any seed-time patch), so the thunk
+     * derefs fault at NULL+0xXX. Rescue (register-level, immune to the
+     * backing-flipflop): point the deref base at the REAL table — the
+     * FS thunks jump straight to fsdmgr's FSINT_* kernel-direct
+     * implementations (same ABI; the tea names the method offset) —
+     * or, for the WIN32 cell, the ROM methods table at 0x90821028
+     * (CINFO 'Wn32' @90821848: CreateAPISet +0x08, GetLastError
+     * +0x178). Unmapped FS offsets fall to the all-stub FSVT table
+     * (mov #-1,r0; rts — the guarded failure path). */
+    if ((cs->exception_index == 0x040 || cs->exception_index == 0x0a0)
+        && (env->sr & (1u << SR_MD))
+        && env->tea < 0x1000
+        && env->pc >= 0xc0020000 && env->pc < 0xc0082b00) {
+        bool hit = false;
+        bool adv = true;
+        if (env->pc >= 0xc0030988 && env->pc <= 0xc0030da0
+            && !(env->pc & 3)) {
+            /* FS thunk cluster: `mov.l @(r0,r3),r3` with r0=NULL and
+             * r3=extu.b(-imm)=method offset => tea = the offset. Jump
+             * straight to fsdmgr's FSINT_* kernel-direct
+             * implementations (same ABI); unmapped offsets fall to
+             * the all-stub FSVT table (returns -1, the guarded
+             * failure path). Skip the deref (pc+2 = the jmp). */
+            static const struct { uint16_t off; uint32_t fn; } fsint[] = {
+                { 0xb4, 0xc02c8ca4 },   /* RegisterAFSEx  */
+                { 0xb8, 0xc02c8db0 },   /* DeregisterAFS  */
+                { 0xd0, 0xc02c8c60 },   /* RegisterAFSName */
+                { 0xd4, 0xc02c8e50 },   /* DeregisterAFSName */
+            };
+            uint32_t tgt = 0;
+            for (unsigned i = 0; i < ARRAY_SIZE(fsint); i++) {
+                if (fsint[i].off == env->tea) {
+                    tgt = fsint[i].fn;
+                    break;
+                }
+            }
+            if (!tgt) {
+                tgt = mmcs_fsvt_p1() + env->tea;   /* stub table */
+            }
+            env->gregs[3] = tgt;
+            hit = true;
+        } else if (env->pc == 0xc0030b92) {
+            /* RegisterAFSEx (jsr variant): the fault surfaces AT the
+             * jsr (delay-slot reporting); re-drive the jsr itself with
+             * r3 preloaded — do NOT advance past it (the L28 lesson:
+             * advancing skipped the call and the epilogue unwound a
+             * live frame with r15 += 20 -> the c0032b86 r15=0x10
+             * garbage read). */
+            env->gregs[3] = 0xc02c8ca4;   /* FSINT_RegisterAFSEx */
+            adv = false;
+            hit = true;
+        } else if (env->pc == 0xc002f5d8) {
+            /* CreateAPISet: `mov.l @(8,r2),r3` — base r2, offset
+             * re-applied by the instruction */
+            env->gregs[2] = 0x90821028;
+            hit = true;
+        } else if (env->pc == 0xc002ec04) {
+            /* GetLastError: `add #80,r2; mov.l @r2,r3` — the offset is
+             * already folded into r2 (=tea); the table base must be
+             * added back */
+            env->gregs[2] = 0x90821028 + env->tea;
+            hit = true;
+        }
+        if (hit) {
+            static int nfs;
+            if (nfs++ < 24) {
+                fprintf(stderr, "MMCS: FSVT api-set rescue pc=%08x "
+                        "tea=%08x pr=%08x -> %08x\n", env->pc, env->tea,
+                        env->pr, env->gregs[3]);
+            }
+            if (adv) {
+                env->pc += 2;      /* execute the jmp @r3 */
+            }
+            cs->exception_index = -1;
+            return;             /* re-execute with the table */
+        }
     }
     /* KAPIFIX part 1b (L8, 2026-11-16): kernel-side garbage-dispatch
      * synthesis — the twin of the user-side MMCS_APIFIX 0xFFFFxxxx
@@ -2267,6 +2355,55 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa32,
                          uprot, mmu_idx, TARGET_PAGE_SIZE);
             return true;
+        }
+        /* MMCS fork (L28): MMCS_UWHEAP — the CURRENT-PROCESS-SLOT demand
+         * pages. The manifest rows cover only the ROM TOC's fixed-slot
+         * modules; everything the running servants allocate DYNAMICALLY
+         * in the process slots (the L28 decode: filesys's HeapCreate ->
+         * the kernel-side constructor c0034840 building the 'HeaP'-signed
+         * object -> the kernel heap allocator c00343fc returns 0x70010000
+         * = the filesys process-slot heap; the constructor's stores at
+         * +0x34 faulted, the vendor exception march killed every servant
+         * relaunch at 5-10Hz) has no manifest row and no guest page
+         * table entry (the synthetic launch never built the process).
+         * On HW the kernel maps those pages itself when it services its
+         * own allocation; serve the same semantics host-side: a
+         * demand-zero RW page from the FILEVIEW pool, VA-deduped per
+         * boot, PGOWN-integrated (write-pins, remap-sticky). */
+        static int uwheap = -1;
+        if (uwheap < 0) {
+            uwheap = getenv("MMCS_UWHEAP") && getenv("MMCS_FILEVIEW");
+        }
+        if (uwheap) {
+            uint32_t va = (uint32_t)address & ~0xFFFu;
+            uint32_t npa = 0;
+            for (int i = 0; i < mmcs_nfvmap; i++) {
+                if (mmcs_fvmap[i].va == va) {
+                    npa = mmcs_fvmap[i].pa;
+                    break;
+                }
+            }
+            if (!npa && mmcs_fvmap_nxt + 0x1000 <= 0x24000000
+                && mmcs_nfvmap < 16384) {
+                npa = mmcs_fvmap_nxt;
+                mmcs_fvmap_nxt += 0x1000;
+                mmcs_fvmap[mmcs_nfvmap].va = va;
+                mmcs_fvmap[mmcs_nfvmap].pa = npa;
+                mmcs_nfvmap++;
+                static int nuw;
+                if (nuw++ < 32) {
+                    fprintf(stderr, "MMCS: UWHEAP demand-zero slot page "
+                            "va=%08x -> pa=%08x\n", va, npa);
+                }
+            }
+            if (npa) {
+                int hprot = mmcs_pgown_fill(env, va, &npa,
+                                            PAGE_READ | PAGE_WRITE | PAGE_EXEC,
+                                            access_type == MMU_DATA_STORE);
+                tlb_set_page(cs, va, npa, hprot, mmu_idx,
+                             TARGET_PAGE_SIZE);
+                return true;
+            }
         }
     }
 
