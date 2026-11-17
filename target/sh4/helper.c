@@ -79,6 +79,28 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw, bool kernel_side);
 int mmcs_fsvt_bind_cells(CPUState *cs);
 uint32_t mmcs_fsvt_cell_debug(uint32_t cell);
 uint32_t mmcs_fsvt_p1(void);
+/* MMCS fork (L29): MMCS_REGVT — the FileSys api-set REGISTRY methods
+ * service (hw/sh4/mmcs.c parses the real default.reg hive; the hook
+ * below synthesizes the registered set's method answers at register
+ * level when the [c00835c0] methods-cell derefs fault). */
+int mmcs_regvt_is_armed(void);
+uint32_t mmcs_regvt_open(uint32_t hkey, const char *subkey);
+uint32_t mmcs_regvt_query(uint32_t hkey, const char *name,
+                          uint32_t *type, uint32_t *len,
+                          const uint8_t **data);
+int mmcs_regvt_enum_key(uint32_t hkey, uint32_t idx, const char **name);
+int mmcs_regvt_enum_value(uint32_t hkey, uint32_t idx,
+                          const char **name, uint32_t *type,
+                          uint32_t *len, const uint8_t **data);
+int mmcs_regvt_query_info(uint32_t hkey, uint32_t *nsub,
+                          uint32_t *maxsub, uint32_t *nvals,
+                          uint32_t *maxvalname, uint32_t *maxval);
+void mmcs_regvt_set(uint32_t hkey, const char *name, uint32_t type,
+                    const uint8_t *data, uint32_t len);
+int mmcs_regvt_bind(CPUState *cs);
+uint32_t mmcs_regvt_method(uint32_t off);
+uint32_t mmcs_regvt_stubs_p1(void);
+int mmcs_regvt_read(CPUState *cs, uint32_t va, uint8_t *buf, int len);
 /* MMCS fork (L22): MMCS_C0ARM — arm the C0-window module service in
  * the kernel-side servant lane (the launch latch never fires there;
  * see the full decode in hw/sh4/mmcs.c). */
@@ -446,15 +468,15 @@ void superh_cpu_do_interrupt(CPUState *cs)
              * re-applied by the instruction */
             env->gregs[2] = 0x90821028;
             hit = true;
-        } else if (env->pc == 0xc002ec04) {
-            /* GetLastError: `add #80,r2; mov.l @r2,r3` — the offset is
-             * already folded into r2 (=tea); the table base must be
-             * added back */
-            env->gregs[2] = 0x90821028 + env->tea;
-            hit = true;
-        }
-        if (hit) {
-            static int nfs;
+         } else if (env->pc == 0xc002ec04) {
+             /* GetLastError: `add #80,r2; mov.l @r2,r3` — the offset is
+              * already folded into r2 (=tea); the table base must be
+              * added back */
+             env->gregs[2] = 0x90821028 + env->tea;
+             hit = true;
+         }
+         if (hit) {
+             static int nfs;
             if (nfs++ < 24) {
                 fprintf(stderr, "MMCS: FSVT api-set rescue pc=%08x "
                         "tea=%08x pr=%08x -> %08x\n", env->pc, env->tea,
@@ -466,6 +488,283 @@ void superh_cpu_do_interrupt(CPUState *cs)
             cs->exception_index = -1;
             return;             /* re-execute with the table */
         }
+    }
+    /* MMCS fork (L29): MMCS_REGVT v2 — synthesize the REGISTERED
+     * FileSys api set at first FS-cell fault. DECODE: the k.coredll
+     * registry thunks (EAT RegCloseKey c0032a0c, RegCreateKeyExW
+     * c0032a30, RegEnumValueW c0032a88, RegEnumKeyExW c0032afc,
+     * RegQueryInfoKeyW c0032b98, RegOpenKeyExW c0032b78,
+     * RegQueryValueExW c0032c0c, RegSetValueExW c0032c3c — and the
+     * wider cell-thunk family, e.g. method-7 site c0032750) all
+     * dispatch `jsr/jmp [[[c00835c0]] + method*4]` with the STOCK
+     * kmisc.c numbering (17/18/21/22/23/24/25/26); the cell ships 0
+     * because the HW filesys CreateAPISet("FileSys")+RegisterAPISet
+     * bind (which needs the registry — circular) never ran in
+     * emulation. On the deref fault (tea = the method byte offset),
+     * build the methods table + `trapa #0x73` stubs in the FSVT page,
+     * bind the cell (fault-time writes survive — the loader's
+     * CopyRegions re-zero only killed the L28 seed-time binds), load
+     * r3 with the method target and execute the jsr/jmp. Registry
+     * stubs trap into the handler below with the FULL ABI intact
+     * (args r4-r7 + [r15+16..] — the out-param pointers the v1
+     * fault-site synthesis could not recover, e.g. RegEnumKeyExW's
+     * lpcbName, whose stale value made the vendor hive-copy tree
+     * self-link and loop the flush walk 1.17M times). FS methods
+     * (0xb4/0xb8/0xd0/0xd4) route straight to fsdmgr's FSINT_*
+     * implementations; unknown offsets to the all-stub (-1). */
+    if (mmcs_regvt_is_armed()
+        && (cs->exception_index == 0x040 || cs->exception_index == 0x0a0)
+        && (env->sr & (1u << SR_MD))
+        && env->tea < 0x1000
+        && !(env->tea & 3)
+        && env->pc >= 0xc0020000 && env->pc < 0xc0082b00
+        && mmcs_regvt_method(env->tea)) {
+        uint32_t tgt = mmcs_regvt_method(env->tea);
+        mmcs_regvt_bind(cs);
+        env->gregs[3] = tgt;
+        static int nrb;
+        if (nrb++ < 12) {
+            fprintf(stderr, "MMCS: REGVT cell bind + dispatch pc=%08x "
+                    "tea=%08x -> %08x\n", env->pc, env->tea, tgt);
+        }
+        env->pc += 2;      /* skip the deref; execute the jsr/jmp @r3 */
+        cs->exception_index = -1;
+        return;
+    }
+    /* MMCS fork (L29): the REGVT registry-method stubs (trapa #0x73,
+     * TRA=0x1CC). The stub is the api-set METHOD: it receives the full
+     * WinCE SH4 ABI (r4-r7 + stack args at [r15+16], [r15+20], ... in
+     * the CALLING thunk's frame — verified against the thunks' own
+     * arg-staging code) and returns to the thunk's epilogue via pr.
+     * Answer from the real default.reg hive; all out-params written
+     * through the softmmu. */
+    if (cs->exception_index == 0x160
+        && env->tra == (0x73u << 2)
+        && mmcs_regvt_is_armed()
+        && (env->sr & (1u << SR_MD))
+        && env->pc >= mmcs_regvt_stubs_p1()
+        && env->pc < mmcs_regvt_stubs_p1() + 8 * 8) {
+        /* env->pc at the trapa exception = the trapa insn address =
+         * the 8-aligned stub base (verified live) */
+        uint32_t api = (env->pc - mmcs_regvt_stubs_p1()) >> 3;
+        uint32_t r4 = env->gregs[4], r5 = env->gregs[5];
+        uint32_t r6 = env->gregs[6], r7 = env->gregs[7];
+        uint32_t rc = 2;
+        char name[280];
+        uint32_t a[8] = { 0 };
+        for (int i = 0; i < 8; i++) {
+            cpu_memory_rw_debug(cs, env->gregs[15] + 16 + 4 * i,
+                                (uint8_t *)&a[i], 4, 0);
+        }
+        if (r5 > 0x10000 && r5 < 0xFFFF0000u) {
+            uint8_t w[560];
+            if (mmcs_regvt_read(cs, r5, w, sizeof w) == 0) {
+                int i;
+                for (i = 0; i < 279; i++) {
+                    if (!w[2 * i] && !w[2 * i + 1]) {
+                        break;
+                    }
+                    name[i] = (w[2 * i] < 0x80 && w[2 * i + 1] == 0)
+                                  ? (char)w[2 * i] : '?';
+                }
+                name[i] = 0;
+            } else {
+                name[0] = 0;
+            }
+        } else {
+            name[0] = 0;
+        }
+        switch (api) {
+        case 4: {   /* RegOpenKeyExW(hk, sub, opt, sam, phk=a[0]) */
+            uint32_t hk = mmcs_regvt_open(r4, name);
+            if (hk) {
+                if (a[0]) {
+                    cpu_memory_rw_debug(cs, a[0], (uint8_t *)&hk, 4, 1);
+                }
+                rc = 0;
+            } else {
+                rc = 2;
+            }
+            break;
+        }
+        case 6: {   /* RegQueryValueExW(hk, name, resv, lpType=r7,
+                     * lpData=a[0], lpcbData=a[1]) */
+            uint32_t type = 0, len = 0;
+            const uint8_t *data = NULL;
+            rc = mmcs_regvt_query(r4, name, &type, &len, &data);
+            if (rc == 0) {
+                uint32_t cb = 0;
+                if (a[1]) {
+                    cpu_memory_rw_debug(cs, a[1], (uint8_t *)&cb, 4, 0);
+                }
+                if (r7) {
+                    cpu_memory_rw_debug(cs, r7, (uint8_t *)&type, 4, 1);
+                }
+                if (!a[0] || cb < len) {
+                    rc = a[0] ? 234 : 0;   /* size query vs short buf */
+                } else {
+                    cpu_memory_rw_debug(cs, a[0], (void *)data, len, 1);
+                }
+                if (a[1]) {
+                    cpu_memory_rw_debug(cs, a[1], (uint8_t *)&len, 4, 1);
+                }
+            }
+            break;
+        }
+        case 1: {   /* RegCreateKeyExW(..., phk=a[4], pdisp=a[5]) */
+            uint32_t hk = mmcs_regvt_open(r4, name);
+            if (hk) {
+                if (a[4]) {
+                    cpu_memory_rw_debug(cs, a[4], (uint8_t *)&hk, 4, 1);
+                }
+                if (a[5]) {
+                    uint32_t disp = 2;   /* REG_OPENED_EXISTING_KEY */
+                    cpu_memory_rw_debug(cs, a[5], (uint8_t *)&disp, 4, 1);
+                }
+                rc = 0;
+            } else {
+                rc = 2;
+            }
+            break;
+        }
+        case 7: {   /* RegSetValueExW(hk, name, resv, type=r7,
+                     * lpData=a[0] ptr, cbData=a[1] VALUE) */
+            uint8_t data[512];
+            uint32_t cb = a[1];
+            if (a[0] && cb && cb <= sizeof data
+                && cpu_memory_rw_debug(cs, a[0], data, cb, 0) == 0) {
+                mmcs_regvt_set(r4, name, r7, data, cb);
+            }
+            rc = 0;
+            break;
+        }
+        case 0: {   /* RegCloseKey(hk) */
+            rc = 0;
+            break;
+        }
+        case 3: {   /* RegEnumKeyExW(hk, idx=r5, lpName=r6,
+                     * lpcbName=a[0] PTR, lpClass=a[2], lpcbClass=a[3]) */
+            const char *kn = NULL;
+            rc = mmcs_regvt_enum_key(r4, r5, &kn);
+            if (rc == 0 && kn) {
+                uint32_t chars = strlen(kn);
+                uint32_t cb = 0;
+                if (a[0]) {
+                    cpu_memory_rw_debug(cs, a[0], (uint8_t *)&cb, 4, 0);
+                }
+                if (r6 && (cb ? cb : chars + 1) >= chars + 1) {
+                    uint8_t w[560];
+                    for (uint32_t i = 0; i < chars; i++) {
+                        w[2 * i] = (uint8_t)kn[i];
+                        w[2 * i + 1] = 0;
+                    }
+                    w[2 * chars] = w[2 * chars + 1] = 0;
+                    cpu_memory_rw_debug(cs, r6, w, (chars + 1) * 2, 1);
+                    if (a[3]) {
+                        uint32_t cz = 0;
+                        cpu_memory_rw_debug(cs, a[3], (uint8_t *)&cz, 4, 1);
+                    }
+                } else {
+                    rc = 234;
+                }
+                if (a[0]) {
+                    cpu_memory_rw_debug(cs, a[0], (uint8_t *)&chars, 4, 1);
+                }
+            }
+            break;
+        }
+        case 2: {   /* RegEnumValueW(hk, idx=r5, lpName=r6,
+                     * lpcbName=a[0] PTR, lpResv=a[1], lpType=a[2],
+                     * lpData=a[3], lpcbData=a[4] PTR) */
+            const char *vn = NULL;
+            uint32_t type = 0, len = 0;
+            const uint8_t *data = NULL;
+            rc = mmcs_regvt_enum_value(r4, r5, &vn, &type, &len, &data);
+            if (rc == 0 && vn) {
+                uint32_t chars = strlen(vn);
+                if (r6) {
+                    uint8_t w[560];
+                    for (uint32_t i = 0; i < chars; i++) {
+                        w[2 * i] = (uint8_t)vn[i];
+                        w[2 * i + 1] = 0;
+                    }
+                    w[2 * chars] = w[2 * chars + 1] = 0;
+                    cpu_memory_rw_debug(cs, r6, w, (chars + 1) * 2, 1);
+                }
+                if (a[0]) {
+                    cpu_memory_rw_debug(cs, a[0], (uint8_t *)&chars, 4, 1);
+                }
+                if (a[2]) {
+                    cpu_memory_rw_debug(cs, a[2], (uint8_t *)&type, 4, 1);
+                }
+                uint32_t cb = 0;
+                if (a[4]) {
+                    cpu_memory_rw_debug(cs, a[4], (uint8_t *)&cb, 4, 0);
+                }
+                if (a[3] && data && cb >= len) {
+                    cpu_memory_rw_debug(cs, a[3], (void *)data, len, 1);
+                }
+                if (a[4]) {
+                    cpu_memory_rw_debug(cs, a[4], (uint8_t *)&len, 4, 1);
+                }
+            }
+            break;
+        }
+        case 5: {   /* RegQueryInfoKeyW(hk, lpClass=r5, lpcbClass=r6,
+                     * lpResv=r7, lpcSubKeys=a[0], lpcbMaxSubKeyLen=a[1],
+                     * lpcbMaxClassLen=a[2], lpcValues=a[3],
+                     * lpcbMaxValueNameLen=a[4], lpcbMaxValueLen=a[5],
+                     * lpcbSD=a[6], lpft=a[7]) */
+            uint32_t nsub = 0, ms = 0, nv = 0, mvn = 0, mvl = 0;
+            rc = mmcs_regvt_query_info(r4, &nsub, &ms, &nv, &mvn, &mvl);
+            if (rc == 0) {
+                uint32_t zero = 0;
+                if (a[0]) {
+                    cpu_memory_rw_debug(cs, a[0], (uint8_t *)&nsub, 4, 1);
+                }
+                if (a[1]) {
+                    cpu_memory_rw_debug(cs, a[1], (uint8_t *)&ms, 4, 1);
+                }
+                if (a[2]) {
+                    cpu_memory_rw_debug(cs, a[2], &zero, 4, 1);
+                }
+                if (a[3]) {
+                    cpu_memory_rw_debug(cs, a[3], (uint8_t *)&nv, 4, 1);
+                }
+                if (a[4]) {
+                    cpu_memory_rw_debug(cs, a[4], (uint8_t *)&mvn, 4, 1);
+                }
+                if (a[5]) {
+                    cpu_memory_rw_debug(cs, a[5], (uint8_t *)&mvl, 4, 1);
+                }
+                if (a[6]) {
+                    cpu_memory_rw_debug(cs, a[6], &zero, 4, 1);
+                }
+                if (a[7]) {
+                    cpu_memory_rw_debug(cs, a[7], &zero, 4, 1);
+                    cpu_memory_rw_debug(cs, a[7] + 4, &zero, 4, 1);
+                }
+            }
+            break;
+        }
+        default:
+            rc = 87;    /* ERROR_INVALID_PARAMETER */
+            break;
+        }
+        static int nrt;
+        static int rtcap = -1;
+        if (rtcap < 0) {
+            const char *c = getenv("MMCS_REGVT_LOG");
+            rtcap = c ? atoi(c) : 40;
+        }
+        if (nrt++ < rtcap) {
+            fprintf(stderr, "MMCS: REGVT api=%u pc=%08x hk=%08x '%s' "
+                    "idx=%08x -> rc=%d\n", api, env->pc, r4, name, r5, rc);
+        }
+        env->gregs[0] = rc;
+        env->pc = env->pr;
+        cs->exception_index = -1;
+        return;
     }
     /* KAPIFIX part 1b (L8, 2026-11-16): kernel-side garbage-dispatch
      * synthesis — the twin of the user-side MMCS_APIFIX 0xFFFFxxxx
