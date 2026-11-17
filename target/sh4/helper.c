@@ -76,6 +76,9 @@ hwaddr mmcs_iatfix_page_pa(uint32_t va, bool *rw);
  * the kernel-side servant lane (the launch latch never fires there;
  * see the full decode in hw/sh4/mmcs.c). */
 extern int mmcs_c0arm;
+/* MMCS fork (L23): MMCS_UWARM — kernel-mode user-window manifest
+ * service (see hw/sh4/mmcs.c for the decode). */
+extern int mmcs_uwarm;
 
 /* MMCS fork (L21): MMCS_PGOWN — the write-sticky page-ownership table
  * (hw/sh4/mmcs.c). Consulted at every tlb_set_page site below: clean
@@ -2089,6 +2092,44 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                                     access_type == MMU_DATA_STORE);
             tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa32,
                          iprot, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
+    }
+
+    /* MMCS fork (L23): MMCS_UWARM — the CURRENT-PROCESS USER-window
+     * module service (the full decode in hw/sh4/mmcs.c). A KERNEL-mode
+     * fetch/load/store miss in [0x40000000,0x80000000) covered by the
+     * SRP2 manifest's user rows (this fixed-slot image bakes absolute
+     * 0x4xxxxxxx realaddrs into the ROM TOC: coredll .text XIP at
+     * 0x40011000<->ROM 0x90853000, RW at 0x40074000+): XIP .text maps
+     * the flash ROM bytes RO+X, non-XIP maps the decompressed-init
+     * scratch page (RW per the o32 write flag) — exactly the mapping
+     * the real pager installs for the current process (kernel access
+     * to the user window is legal on HW; the oalioctl import walk and
+     * its pre-bound 0x4001xxxx IAT targets depend on it). */
+    if (ret != MMU_OK && mmu_idx != MMU_USER_IDX
+        && mmcs_uwarm
+        && mmcs_iatfix_on
+        && (uint32_t)address >= 0x40000000
+        && (uint32_t)address < 0x80000000
+        && (access_type == MMU_INST_FETCH
+            || access_type == MMU_DATA_LOAD
+            || access_type == MMU_DATA_STORE)) {
+        bool rw = false;
+        hwaddr pa = mmcs_iatfix_page_pa((uint32_t)address, &rw);
+        if (pa) {
+            if (access_type == MMU_DATA_STORE && !rw) {
+                /* store to a read-only section: let the normal write
+                 * violation path run (fidelity: no silent writes) */
+                return false;
+            }
+            int uprot = (rw ? (PAGE_READ | PAGE_WRITE) : PAGE_READ)
+                        | PAGE_EXEC;
+            uint32_t pa32 = (uint32_t)pa;
+            uprot = mmcs_pgown_fill(env, (uint32_t)address, &pa32, uprot,
+                                    access_type == MMU_DATA_STORE);
+            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa32,
+                         uprot, mmu_idx, TARGET_PAGE_SIZE);
             return true;
         }
     }

@@ -186,7 +186,7 @@ static uint32_t mmcs_srvpg_nxt = 0x26000000;
  * k.coredll's non-XIP sections; v2 'SRP2' {n,{va,size,rom,flags,off,
  * pad},blob} = EVERY kernel-side-DLL (C0-window) section of the ROM
  * TOC — the manifest MMCS_IATFIX services the whole window with. */
-#define MMCS_SRVT_MAX 320
+#define MMCS_SRVT_MAX 640
 static struct {
     uint32_t va, size, rom, flags, off;   /* off 0xffffffff = XIP text */
 } mmcs_srvt[MMCS_SRVT_MAX];
@@ -219,6 +219,35 @@ int mmcs_iatfix_on;
  * was about the KData interlocked page, never this window. Consumed
  * by the SRVPG/IATFIX gates in superh_cpu_tlb_fill. */
 int mmcs_c0arm;
+
+/* MMCS fork (L23): MMCS_UWARM=1 — serve KERNEL-mode misses in the
+ * CURRENT-PROCESS USER window [0x40000000,0x80000000) from the SRP2
+ * manifest's user-window rows. Decoded 2026-11-17 (L23): the kd-class
+ * module lane (ROM TOC[4] oalioctl.dll at c0011000, entry c00111f0)
+ * runs the stock loader.c import walk (c003ca8a/c003caa0 =
+ * ResolveImpOrd's export-dir/EAT loads) against the USER-mode coredll
+ * instance — this image is a fully fixed-slot build: coredll.dll's o32
+ * rows are absolute (real 0x40011000 XIP ROM 0x90853000, RW sections
+ * at 0x40074000+; export dir 0x40066460, EAT/names through
+ * 0x4006b000; the oalioctl IAT ships PRE-BOUND to 0x4001xxxx-class
+ * user-coredll addresses and DllMain calls those targets). The walk's
+ * kernel-mode loads at tea=40066f10/40068628/400696f0 (all inside the
+ * 0x40011000 XIP span) were refused by every tlb_fill service (COWFIX
+ * shape (b) covers only [40074000,40080000); the C0 lanes stop at
+ * 0xC0000000) -> excp 0x040 -> marshalled PSL forward -> servant
+ * death loop. On real HW the kernel maps the current process at
+ * 0x40000000+ and kernel-mode access to user memory is legal
+ * (PerformCallBack/marshalling semantics) — serving the manifest rows
+ * (XIP .text from flash RO+X, non-XIP from the decompressed blob RW
+ * per the L22 PE-bit decode) is what the real pager installs. The
+ * oalioctl DllMain itself is fail-soft BY DESIGN (returns TRUE
+ * unconditionally, mov #1,r0 in the rts delay slot) — the retail
+ * no-debugger unit takes exactly this path with the window mapped;
+ * the death was only the missing mapping, never a debugger-transport
+ * need. Consumed by the UWARM gate in superh_cpu_tlb_fill; needs
+ * MMCS_IATFIX + MMCS_SRVPGTAB (the user rows ship in the SRP2 table
+ * since build_srvpg_table.py L23). */
+int mmcs_uwarm;
 
 #define MMCS_SRVPG_ROM_BASE 0x90800000
 static const struct { uint32_t va, sz, rom; } mmcs_srvpg_secs[] = {
@@ -2508,6 +2537,12 @@ static void mmcs_init(MachineState *machine)
                                     "lane (L22) — the SRVPG/IATFIX window "
                                     "service ignores the user-mode launch "
                                     "latch\n");
+                        }
+                        if (mmcs_env_on("MMCS_UWARM")) {
+                            mmcs_uwarm = 1;
+                            fprintf(stderr, "MMCS: UWARM current-process "
+                                    "user-window service armed (L23, "
+                                    "kernel-mode manifest rows)\n");
                         }
                     }
                 } else {
