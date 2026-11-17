@@ -992,12 +992,23 @@ struct mmcs_l16_ent {
     uint32_t evt_code;
     uint32_t slot_pa;
     int pending;
+    /* L19: daemon-mode entries (MMCS_L19EV) — the wake-cadence engine
+     * re-arms per pump iteration instead of a one-shot chain. */
+    int daemon;
+    int strikes;
+    uint32_t ndeliv;
 };
 static struct mmcs_l16_ent mmcs_l16_ents[MMCS_L16_MAX];
+
+/* L19: the wake-cadence daemon (full block + decode below) */
+static void mmcs_l19_scan(void);
+static int mmcs_l19_armed;
+static uint32_t mmcs_l19_cadence_ms = 1000;
 
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
+    static uint64_t l19_ticks;
     bool hdevt = mmcs_hdevt_pending > 0;
     bool l16 = false;
     if (hdevt) {
@@ -1013,6 +1024,13 @@ static void mmcs_tick_deliver(void *opaque)
          * printed). We still skip this slot's 0x440 inject (the stub
          * evt consumed it) but keep the 1ms cadence alive. */
     } else {
+        /* L19: the daemon scan runs on the tick chain — one scan per
+         * cadence period (default every 1000th tick), each delivery
+         * replaces this tick's 0x440 exactly like the L16/L18 chains */
+        if (mmcs_l19_armed && ++l19_ticks >= mmcs_l19_cadence_ms) {
+            l19_ticks = 0;
+            mmcs_l19_scan();
+        }
         /* L16: service one pending event-wake per tick (after the
          * HDEVT chain; same slot-consuming semantics, same guard).
          * L18: entries 4..7 (the v2 completion stubs) share the walk —
@@ -1021,7 +1039,7 @@ static void mmcs_tick_deliver(void *opaque)
             struct mmcs_l16_ent *e = &mmcs_l16_ents[i];
             if (e->pending > 0) {
                 mmcs_inject_evt(e->evt_code);
-                if (--e->pending == 0) {
+                if (--e->pending == 0 && !e->daemon) {
                     fprintf(stderr, "MMCS-L16: evt %03x deliveries done\n",
                             e->evt_code);
                 }
@@ -1403,6 +1421,314 @@ static void mmcs_l18ev_fire(void *opaque)
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 }
 
+/* MMCS fork (L19): MMCS_L19EV=va@ms[,va@ms..] — the wake-CADENCE engine
+ * (the L18 one-shot leaves the pump starved after its first consumed
+ * auto-reset wake). DECODE (L19, re_tools on the vendor fsdmgr + the
+ * stock CE5 mirror PRIVATE/WINCEOS/COREOS/STORAGE/STOREMGR/storemain.cpp
+ * + schedule.c:7151): the pump = the fsdmgr STOREMGR PNPThread
+ * 0x906a36f4 (start 0xc02c5da0, ROM 0x90a86da0), and the vendor loop is
+ * the stock PNPThread VERBATIM: WaitForMultipleObjects(3, {g_hPNPQueue,
+ * g_hPNPUpdateEvent, g_hAutoLoadEvent}) then switch — case 0 = ONE
+ * ReadMsgQueue(INFINITE) per wake (vendor 0x90a86f30 block: r4=@g_hPNPQ
+ * cell 0xc02db380, INFINITE at sp+16 — one message per iteration), case
+ * 1 = the g_dwUpdateState refresh walk, case 2 = ResetEvent(g_hAutoLoad
+ * Event)+AutoLoadFileSystems(2,ASYNC) (0x90a86ef0-0x90a86f04). THE
+ * LEGITIMATE PER-ITERATION WAKE SOURCE on real HW = the msgqueue
+ * ARRIVAL event (WriteMsgQueue sets the queue's auto-reset data event
+ * per notification — the waitable-handle "signaled iff non-empty"
+ * invariant), plus SetEvent(g_hPNPUpdateEvent) from the
+ * RefreshStore/UnmountStore paths (auto-reset) and the one-shot phase-2
+ * SetEvent(g_hAutoLoadEvent) (manual, reset by the pump's own case 2).
+ * The MAIN thread's alarm loop (0x908381b8, hAlarmThreadWakeup,
+ * ONE_DAY) is the RTC-ALARM lane (IntrEvents[SYSINTR_RTC_ALARM]) — not
+ * the device.exe pump; its 1s-class cadence justifies the DELIVERY
+ * phase, not the wake source. In emulation the two device-interface
+ * notifications were POSTED while the scheduler was dead — their
+ * arrival sets are the pending wakes the vendor kernel never delivered
+ * (the walker runs but MRI leaves waiters RUNNABLE-not-queued = the L18
+ * lost-enqueue). FIX: a daemon on the 1ms tick chain (MMCS_L19EV_MS
+ * cadence, default 1000ms = every 1000th tick, deliveries tied to the
+ * tick phase exactly like the L16/L18 chains) scans the armed events
+ * host-side and delivers the v4 completion stub (walker+MRI+MakeRun+
+ * resched+switcher = 100% vendor code) when an event still has a LINKED
+ * WAITER (proxy head @event+0x8 != 0 — the vendor walker itself owns
+ * the auto-reset semantics: one wake per pump cycle). NOT permanent
+ * spam: (a) at most one delivery per cadence period across ALL armed
+ * events, (b) a movement signature over the scheduler/queue/event cells
+ * — 3 consecutive no-movement deliveries park the daemon (the pump
+ * idled through its pending set), (c) a hard cap MMCS_L19EV_MAX
+ * (default 600). */
+static uint32_t mmcs_l19_max_deliv = 600;
+static uint32_t mmcs_l19_total;
+
+/* the movement signature cells (phys): the three pump events'
+ * waitblock/state pairs, the PNP queue struct, the runqueue pick/pth,
+ * pCurTh, and the four frontier threads' state16/ctx pc cells. */
+static const struct { uint32_t pa; } mmcs_l19_sig_cells[] = {
+    { 0x1069C6B4 }, { 0x1069C738 },   /* 9069c6ac +0x8/+0x8c */
+    { 0x106A35A0 }, { 0x106A3624 },   /* 906a3598 +0x8/+0x8c */
+    { 0x106A363C }, { 0x106A36C0 },   /* 906a3634 +0x8/+0x8c */
+    { 0x0867AB14 }, { 0x0867AB34 },   /* the PNP queue struct (0x20) */
+    { 0x0867EFA4 }, { 0x0867EFA0 },   /* pick / pRunnable */
+    { 0x08679894 },                   /* pCurTh */
+    { 0x106A3700 }, { 0x106A37A8 },   /* PNPThread state16/ctx pc */
+    { 0x106DCAD8 },                   /* waiter C state16 */
+    { 0x106FF030 },                   /* MAIN thread state16 */
+    { 0x106CA24C },                   /* LaunchXX walker state16 */
+};
+#define MMCS_L19_NSIG (ARRAY_SIZE(mmcs_l19_sig_cells) * 4)
+
+static void mmcs_l19_signature(uint8_t *out)
+{
+    unsigned o = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(mmcs_l19_sig_cells); i++) {
+        cpu_physical_memory_read(mmcs_l19_sig_cells[i].pa, out + o, 4);
+        o += 4;
+    }
+}
+
+/* MMCS fork (L19): MMCS_L19TH=threadVA@ms[,threadVA@ms] — the THREAD-
+ * level enqueue completion (v5 stub). L19 r3 finding: with the L18-era
+ * scheduler resurrection but no wake deliveries at all, the system
+ * self-drives ONE context (the filesys phase-1 AutoLoadFileSystems
+ * retry loop — bp-proven 5723 calls (1,SYNC), pr=c02c3de2) while the
+ * PUMP 0x906a36f4 froze mid-init at t~3s as ANOTHER RUNNABLE(1)-not-
+ * queued zombie (ctx pc c003c9e0 = mid k.coredll API, state16 0x41,
+ * never linked on its wait events again) and the MAIN thread
+ * 0x906ff024 equally zombie in the SetThreadBasePrio KCall (resume
+ * 0x908382ca). The event-wake daemon cannot repair these (no linked
+ * waitblock); the repair = the L18 v4 machinery applied to the THREAD:
+ * MakeRun(pThread) (the enqueue half the vendor walker+MRI omit) +
+ * the paired resched protocol stores + pick=pThread + r14=pCurTh +
+ * jsr the vendor switcher. GUARD (in-stub): MakeRun only when the
+ * thread's state16 runstate (+0xc) is RUNNABLE(1) or NEEDSRUN(3) —
+ * chained tick re-deliveries no-op on running/blocked/dead targets.
+ * Layout capstone-verified (builder: corpus scripts/emul/l19_stub_
+ * build.py; pools @+0x48: .Lt(patched at fire) .Lmk=MakeRun 0x90825ee4
+ * .Lf 0x88679884 .Lf2 0x88679888 .Lpick 0x8867efa4 .Lpcur 0x88679894
+ * .Lsw = the switcher 0x90822b68). Stubs at KILLSTK 0xBF00EC00+n*0x100
+ * (n <= 1 — 0xEF00 would collide with the L14 hdevt stub at 0xF000),
+ * dispatched on the L16-era free slots evt 0x220/0x260 (indices 0-1;
+ * skip when MMCS_L16EV owns them). */
+static uint8_t mmcs_l19th_stub[] = {
+    0x22, 0x4f, 0xe6, 0x2f,        /* sts.l pr,@-r15; mov.l r14,@-r15 */
+    0x10, 0xd4, 0x43, 0x50,        /* mov.l .Lt,r4; mov.l @(12,r4),r0 */
+    0x03, 0xc9, 0x01, 0x88,        /* and #3,r0; cmp/eq #1,r0 */
+    0x03, 0x89, 0x03, 0x88,        /* bt mk; cmp/eq #3,r0 */
+    0x01, 0x89, 0x14, 0xa0,        /* bt mk; bra Lret */
+    0x09, 0x00, 0x09, 0x00,        /* nop; nop (mk: + align pad) */
+    0x0c, 0xd3, 0x0b, 0x43,        /* mk: mov.l .Lmk,r3; jsr @r3 */
+    0x09, 0x00, 0x01, 0xe1,        /* nop; mov #1,r1 */
+    0x0b, 0xd2, 0x12, 0x22,        /* mov.l .Lf,r2; mov.l r1,@r2 */
+    0x01, 0xe1, 0x09, 0x00,        /* mov #1,r1; nop (align) */
+    0x0a, 0xd2, 0x12, 0x22,        /* mov.l .Lf2,r2; mov.l r1,@r2 */
+    0x06, 0xd4, 0x09, 0x00,        /* mov.l .Lt,r4; nop (align) */
+    0x09, 0xd2, 0x42, 0x22,        /* mov.l .Lpick,r2; mov.l r4,@r2 */
+    0x09, 0xd2, 0x20, 0x5e,        /* mov.l .Lpcur,r2; mov.l @r2,r14 */
+    0x09, 0xd3, 0x0b, 0x43,        /* mov.l .Lsw,r3; jsr @r3 */
+    0x09, 0x00, 0xf6, 0x6e,        /* nop; Lret: mov.l @r15+,r14 */
+    0x26, 0x4f, 0x00, 0xe0,        /* lds.l @r15+,pr; mov #0,r0 */
+    0x0b, 0x00, 0x09, 0x00,        /* rts; nop */
+    0x34, 0xc2, 0x6d, 0x90,        /* +0x48 .Lt: thread VA (patched) */
+    0xe4, 0x5e, 0x82, 0x90,        /* .Lmk: 0x90825ee4 MakeRun */
+    0x84, 0x98, 0x67, 0x88,        /* .Lf: 0x88679884 resched byte */
+    0x88, 0x98, 0x67, 0x88,        /* .Lf2: 0x88679888 drain2 word */
+    0xa4, 0xef, 0x67, 0x88,        /* .Lpick: 0x8867efa4 */
+    0x94, 0x98, 0x67, 0x88,        /* .Lpcur: 0x88679894 */
+    0x68, 0x2b, 0x82, 0x90,        /* .Lsw: 0x90822b68 switcher */
+};
+
+static void mmcs_l19th_fire(void *opaque)
+{
+    struct mmcs_l16_ent *e = opaque;
+    uint32_t slot_cur = 0;
+    cpu_physical_memory_read(e->slot_pa, &slot_cur, 4);
+    if (slot_cur != 0x90822e40) {
+        fprintf(stderr, "MMCS-L19TH: evt %03x slot busy (%08x) - SKIPPED\n",
+                e->evt_code, slot_cur);
+        return;
+    }
+    uint8_t stub[sizeof mmcs_l19th_stub];
+    memcpy(stub, mmcs_l19th_stub, sizeof stub);
+    uint8_t *lt = (uint8_t *)memmem(stub, sizeof stub, "\x34\xc2\x6d\x90", 4);
+    if (!lt) {
+        fprintf(stderr, "MMCS-L19TH: stub literal locate FAILED\n");
+        return;
+    }
+    stl_le_p(lt, e->evt_va);
+    cpu_physical_memory_write(e->stub_va - 0xA0000000, stub,
+                              sizeof stub);
+    cpu_physical_memory_write(e->slot_pa, &e->stub_va, 4);
+    e->pending = 8;    /* chain the next ticks (guard = no-op re-fires) */
+    fprintf(stderr, "MMCS-L19TH: thread-completion stub @%08x for thread "
+            "%08x, slot evt %03x wired (MakeRun+resched+switcher), "
+            "chained\n", e->stub_va, e->evt_va, e->evt_code);
+    QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_l16_slot_restore,
+                                e);
+    timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+}
+
+static void mmcs_l19ev_fire(void *opaque)
+{
+    struct mmcs_l16_ent *e = opaque;
+    uint32_t slot_cur = 0;
+    cpu_physical_memory_read(e->slot_pa, &slot_cur, 4);
+    if (slot_cur != 0x90822e40) {
+        fprintf(stderr, "MMCS-L19: evt %03x slot busy (%08x) - SKIPPED\n",
+                e->evt_code, slot_cur);
+        return;
+    }
+    uint8_t stub[sizeof mmcs_l18_stub];
+    memcpy(stub, mmcs_l18_stub, sizeof stub);
+    uint8_t *le = (uint8_t *)memmem(stub, sizeof stub, "\x34\xc2\x6d\x90", 4);
+    uint8_t *lm = (uint8_t *)memmem(stub, sizeof stub, "\x00\xff\x00\xbf", 4);
+    if (!le || !lm) {
+        fprintf(stderr, "MMCS-L19: stub literal locate FAILED\n");
+        return;
+    }
+    stl_le_p(le, e->evt_va);
+    stl_le_p(lm, e->stub_va + MMCS_L16_STUB_MARK);
+    cpu_physical_memory_write(e->stub_va - 0xA0000000, stub,
+                              sizeof stub);
+    cpu_physical_memory_write(e->slot_pa, &e->stub_va, 4);
+    /* no 100ms slot restore: the daemon keeps its slot wired for the
+     * session — the in-stub guard (event+0x8 proxy head) makes idle
+     * dispatches no-ops, and a vendor ISR claiming the slot simply
+     * takes the evt over (the L18 self-registered ISR took 0x300,
+     * which is why L19 skips that index) */
+    e->daemon = 1;
+    e->pending = 0;
+    mmcs_l19_armed = 1;
+    fprintf(stderr, "MMCS-L19: daemon stub @%08x for event %08x, slot evt "
+            "%03x wired (walker+MRI+MakeRun+resched), cadence %ums\n",
+            e->stub_va, e->evt_va, e->evt_code, mmcs_l19_cadence_ms);
+}
+
+/* one scan per cadence period, from the tick chain. r1/r2 lessons:
+ * BOTH list cells matter — the +0x8 cell (the stub's guard list)
+ * produced r1's real queue-event wake (marker 0x12, full switch) while
+ * the +0x88 cell tracks the waitblock the walker unlinks; r2's
+ * +0x88-only gate starved those lanes. Gate = EITHER cell non-zero;
+ * the in-stub guard + the walker's own list check no-op a stale fire
+ * (r1 marker 0x0b = harmless). Bound: the movement signature is
+ * sampled EVERY scan (armed or parked) — 60 consecutive quiet scans
+ * park the daemon, ANY movement re-arms it (r1 showed 176s dead zones
+ * followed by late scheduler blips; the pump's own dry-well case-1
+ * iterations reset nothing). */
+#define MMCS_L19_QUIET_PARK 60
+static void mmcs_l19_scan(void)
+{
+    static uint8_t prev_sig[MMCS_L19_NSIG];
+    static int have_prev;
+    static uint32_t quiet_scans, no_pick_scans;
+    uint8_t sig[MMCS_L19_NSIG];
+    if (mmcs_l19_total >= mmcs_l19_max_deliv) {
+        if (mmcs_l19_armed) {
+            fprintf(stderr, "MMCS-L19: hard cap %u deliveries reached - "
+                    "daemon parked\n", mmcs_l19_total);
+            mmcs_l19_armed = 0;
+        }
+        return;
+    }
+    mmcs_l19_signature(sig);
+    bool moved = have_prev && memcmp(sig, prev_sig, MMCS_L19_NSIG) != 0;
+    memcpy(prev_sig, sig, MMCS_L19_NSIG);
+    have_prev = 1;
+    if (moved) {
+        quiet_scans = 0;
+        if (!mmcs_l19_armed) {
+            mmcs_l19_armed = 1;
+            fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms movement while "
+                    "parked - re-armed (%u deliveries used)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l19_total);
+        }
+    } else if (mmcs_l19_armed && ++quiet_scans >= MMCS_L19_QUIET_PARK) {
+        fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms %u quiet scans - "
+                "daemon parked at %u deliveries\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), quiet_scans,
+                mmcs_l19_total);
+        mmcs_l19_armed = 0;
+        quiet_scans = 0;
+    }
+    if (!mmcs_l19_armed) {
+        return;
+    }
+    /* the arena scan: the static L16-era event addresses go STALE the
+     * moment the pump resumes (r4: its init re-created the msgqueue/
+     * events, freeing the old slots — the daemon then fired 60x on
+     * recycled junk). The faithful generalization: scan the kernel
+     * object arena (P1 0x90680000-0x90700000, bulk-read) for ANY
+     * EVNT-class object (event+0x94 -> HDATA, HDATA+0xc == the EVNT
+     * CINFO 0x90822040) that sits SIGNALED (+0x8d == 1) with a linked
+     * kstack waitblock (+0x8 / +0x88 in 0xd0000000-0xd1000000) = a
+     * pending lost wake, wherever the arena put it. The delivery stub
+     * (entry 0, evt 0x2C0) gets its .Le pool patched to the found
+     * object per delivery. */
+    static uint8_t arena[0x80000];
+    static uint32_t pick_obj, pick_w8, pick_w88;
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    pick_obj = 0;
+    for (uint32_t o = 0; o + 0x98 <= sizeof arena; o += 4) {
+        uint32_t w8, w88, w8c, hdata;
+        memcpy(&w8, arena + o + 0x8, 4);
+        memcpy(&w88, arena + o + 0x88, 4);
+        if (((w8 | w88) & 0xff000000) != 0xd0000000) {
+            continue;
+        }
+        memcpy(&w8c, arena + o + 0x8c, 4);
+        if (((w8c >> 8) & 0xff) != 1) {
+            continue;                   /* not signaled */
+        }
+        memcpy(&hdata, arena + o + 0x94, 4);
+        if (hdata < 0x90680000 || hdata >= 0x90700000) {
+            continue;
+        }
+        uint32_t pci;
+        uint32_t po = hdata - 0x90680000;
+        if (po + 0x10 > sizeof arena) {
+            continue;
+        }
+        memcpy(&pci, arena + po + 0xc, 4);
+        if (pci != 0x90822040) {
+            continue;                   /* not EVNT */
+        }
+        pick_obj = 0x90680000 + o;
+        pick_w8 = w8;
+        pick_w88 = w88;
+        break;                          /* first hit: one per cycle */
+    }
+    if (!pick_obj) {
+        /* census: bounded no-pick sample so a silent pump lane is
+         * diagnosable from the log alone */
+        if (++no_pick_scans % 60 == 1) {
+            fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms no lost wake in "
+                    "the arena (scan %u)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), no_pick_scans);
+        }
+        return;               /* nothing wake-pending: stay silent */
+    }
+    no_pick_scans = 0;
+    /* patch the generic delivery stub's event literal (.Le at +140)
+     * and arm the delivery */
+    for (int i = 0; i < MMCS_L16_MAX; i++) {
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[i];
+        if (!e->daemon || e->pending) {
+            continue;
+        }
+        uint32_t le = e->stub_va - 0xA0000000 + 140;
+        cpu_physical_memory_write(le, &pick_obj, 4);
+        e->pending = 1;
+        e->ndeliv++;
+        mmcs_l19_total++;
+        fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms deliver evt %03x "
+                "ARENA event %08x (+0x8=%08x +0x88=%08x, delivery "
+                "%u/%u)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), e->evt_code,
+                pick_obj, pick_w8, pick_w88, mmcs_l19_total,
+                mmcs_l19_max_deliv);
+        break;
+    }
+}
 
 static void mmcs_l16ev_fire(void *opaque)
 {
@@ -1447,11 +1773,38 @@ static void mmcs_l16_boot_parse(void)
      * stubs on the FREE dispatch slots (indices 4..7: evt
      * 0x2C0/0x2E0/0x300/0x320 — the L16 census verified only the
      * default handler there) at 0xBF00E800+n*0x100 (clear of the L16
-     * stubs below and the L14 hdevt stub at 0xF000). */
+     * stubs below and the L14 hdevt stub at 0xF000).
+     * L19: MMCS_L19EV shares the L18 slots/stubs but arms the
+     * wake-cadence daemon (mmcs_l19ev_fire + the tick-chain scan);
+     * indices {4,5,7} — index 6 (evt 0x300) stays FREE because the
+     * real vendor ISR 0x9080cf0c self-registers there by t=210s.
+     * L19TH: the thread-level enqueue completion (mmcs_l19th_fire)
+     * on the L16-era slots 0-1 (evt 0x220/0x260), stubs at
+     * 0xBF00EC00+n*0x100 (max 2 — 0xEF00 collides with hdevt). */
     const struct { const char *env; int first, base; int v2; } lists[] = {
         { "MMCS_L16EV", 0, MMCS_L16_STUB_BASE, 0 },
         { "MMCS_L18EV", 4, 0xBF00E800, 1 },
+        { "MMCS_L19EV", 4, 0xBF00E800, 2 },
+        { "MMCS_L19TH", 0, 0xBF00EC00, 3 },
     };
+    if (getenv("MMCS_L18EV") && getenv("MMCS_L19EV")) {
+        fprintf(stderr, "MMCS-L19: supersedes MMCS_L18EV — drop L18EV "
+                "from the combo; not arming L19\n");
+        return;
+    }
+    if (getenv("MMCS_L16EV") && getenv("MMCS_L19TH")) {
+        fprintf(stderr, "MMCS-L19TH: shares slots 0-1 with MMCS_L16EV — "
+                "drop L16EV; not arming L19TH\n");
+        return;
+    }
+    mmcs_l19_cadence_ms = atoi(getenv("MMCS_L19EV_MS") ? : "1000");
+    if (!mmcs_l19_cadence_ms) {
+        mmcs_l19_cadence_ms = 1000;
+    }
+    mmcs_l19_max_deliv = atoi(getenv("MMCS_L19EV_MAX") ? : "600");
+    if (!mmcs_l19_max_deliv) {
+        mmcs_l19_max_deliv = 600;
+    }
     for (unsigned li = 0; li < ARRAY_SIZE(lists); li++) {
         const char *spec = getenv(lists[li].env);
         if (!spec) {
@@ -1462,25 +1815,47 @@ static void mmcs_l16_boot_parse(void)
         int n_list = 0;
         for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
             unsigned long va = 0, ms = 0;
+            int maxn = lists[li].v2 == 2 ? 3
+                     : lists[li].v2 == 3 ? 2 : MMCS_L16_MAX;
             if (sscanf(tok, "%lx@%lu", &va, &ms) != 2 || !va
-                || lists[li].first + n_list >= MMCS_L16_MAX) {
+                || n_list >= maxn) {
                 fprintf(stderr, "MMCS-L16: bad spec '%s'\n", tok);
                 continue;
             }
+            /* L19 skips index 6 (evt 0x300 — reserved for the real
+             * self-registered vendor ISR) */
             int idx = lists[li].first + n_list;
+            if (lists[li].v2 == 2 && n_list >= 2) {
+                idx = 7;
+            }
             struct mmcs_l16_ent *e = &mmcs_l16_ents[idx];
             e->evt_va = va;
-            e->stub_va = lists[li].base + n_list * 0x100;
+            e->stub_va = lists[li].base + (idx - lists[li].first) * 0x100;
             e->evt_code = mmcs_l16_evts[idx];
             e->slot_pa = mmcs_l16_slots[idx];
             e->pending = 0;
+            e->daemon = lists[li].v2 == 2;
+            e->strikes = 0;
+            e->ndeliv = 0;
             fprintf(stderr, "MMCS-%s: event %08lx scheduled @%lums "
-                    "(stub %08x slot evt %03x v%d)\n",
-                    lists[li].v2 ? "L18" : "L16", va, ms,
-                    e->stub_va, e->evt_code, lists[li].v2 ? 2 : 1);
+                    "(stub %08x slot evt %03x v%s)\n",
+                    lists[li].v2 == 2 ? "L19" : (lists[li].v2 == 3
+                                                     ? "L19TH"
+                                                     : (lists[li].v2
+                                                            ? "L18"
+                                                            : "L16")),
+                    va, ms, e->stub_va, e->evt_code,
+                    lists[li].v2 == 2 ? "daemon"
+                    : (lists[li].v2 == 3 ? "thread" : (lists[li].v2
+                                                       ? "2" : "1")));
             QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                        lists[li].v2 ? mmcs_l18ev_fire
-                                                     : mmcs_l16ev_fire,
+                                        lists[li].v2 == 2
+                                            ? mmcs_l19ev_fire
+                                            : (lists[li].v2 == 3
+                                                   ? mmcs_l19th_fire
+                                                   : (lists[li].v2
+                                                          ? mmcs_l18ev_fire
+                                                          : mmcs_l16ev_fire)),
                                         e);
             timer_mod(t, ms);
             n_list++;
@@ -2148,8 +2523,12 @@ static void mmcs_init(MachineState *machine)
                 }
                 /* L16: servant-side waiter wakes (MMCS_L16EV list;
                   * needs the KILLSTK stub page + the TICK delivery
-                  * chain, exactly like HDEVT) */
-                if (getenv("MMCS_L16EV")) {
+                  * chain, exactly like HDEVT). L18/L19/L19TH share
+                  * the parse (the v2 completion stub / the wake-cadence
+                  * daemon / the thread enqueue completion) with the
+                  * same requirements. */
+                if (getenv("MMCS_L16EV") || getenv("MMCS_L18EV")
+                    || getenv("MMCS_L19EV") || getenv("MMCS_L19TH")) {
                     if (!mmcs_env_on("MMCS_KILLSTK")
                         || !mmcs_env_on("MMCS_TICK")) {
                         fprintf(stderr, "MMCS-L16: needs MMCS_KILLSTK"
