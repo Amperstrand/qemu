@@ -897,7 +897,30 @@ fileview_done:;
             { "AutoFormat", 0 },
             { "PnPWaitIoDelay", 0x1f4 },
             { "PNPUnloadDelay", 0x12c },
+            /* L20 (S140): the AutoLoad boot-FS phase value. Ground truth
+             * = the real default.fdf hive (tree/Registry/default.reg):
+             * [HKLM\System\StorageManager\AutoLoad\ObjectStore] carries
+             * BootPhase=0 (Dll=filesys.dll, MountAsBootable=1) — the
+             * object store IS the phase-0 boot filesystem on this unit,
+             * mounted by StartBootPhase(0)'s AutoLoadFileSystems before
+             * any block device exists (the documented CE boot order:
+             * object store -> ROM files -> registry -> phase 1 FSDs
+             * (Relfsd, BootPhase=1) -> LaunchXX/device.dll at phase 2).
+             * Our synthetic registry only ever enumerates the compiled-in
+             * 'Relfs' subkey (BootPhase-less), so every AutoLoad(0)
+             * pass skips the mount and the filesys init sequence re-runs
+             * StartBootPhase(0) forever (~7 Hz, the L20 gate). Answering
+             * BootPhase=0 makes the enumerated entry mount at phase 0 =
+             * the real ObjectStore mechanism. Gated: only while the
+             * phase-0 loop is still spinning (first answers), so later
+             * phases read their real values. */
+            { "BootPhase", 0 },
         };
+        /* L20: stop answering BootPhase after the phase-0 loop has had
+         * 64 chances (a mounted boot FS stops the loop; a real phase-2
+         * query later must see the live value, not our synthesis). */
+        static int mmcs_l20_bootphase_n;
+        uint32_t l20_bootphase = (mmcs_l20_bootphase_n++ < 64);
         uint32_t r5 = env->gregs[5];
         uint32_t hit = 0;
         if (r5 > 0x10000) {
@@ -911,7 +934,13 @@ fileview_done:;
                 name[i + 1] = 0;
             }
             for (unsigned k = 0; k < ARRAY_SIZE(vals); k++) {
-                if (strcmp(name, vals[k].name) == 0) { hit = vals[k].dword; break; }
+                if (strcmp(name, vals[k].name) == 0) {
+                    if (strcmp(name, "BootPhase") == 0 && !l20_bootphase) {
+                        break;  /* L20 gate: phase-0 window closed */
+                    }
+                    hit = vals[k].dword;
+                    break;
+                }
             }
         }
         if (hit) {

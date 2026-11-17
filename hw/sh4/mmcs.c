@@ -2373,6 +2373,35 @@ static void mmcs_init(MachineState *machine)
             }
             g_free(sbuf);
         }
+        if (getenv("MMCS_BOOTFS")) {
+            /* MMCS fork (L20/S140): AutoLoad phase-0 boot-FS semantics.
+             * DECODE: the filesys init sequence loops StartBootPhase(0)
+             * at ~7 Hz because AutoLoadFileSystems(0) never mounts: the
+             * live registry's AutoLoad subkeys enumerate the compiled-in
+             * 'Relfs' entry only (BootPhase-less), and the vendor
+             * per-entry processor (fsdmgr c02c390c, stock
+             * storemain.cpp AutoLoadFileSystems body) defaults a MISSING
+             * BootPhase to 1 (ROM 0x90a8497e `mov #1,r3`) -> 1 != 0 ->
+             * skip -> no boot FS -> the init caller never accepts the
+             * completion. GROUND TRUTH: the real default.fdf hive
+             * (tree/Registry/default.reg) carries
+             * [HKLM\System\StorageManager\AutoLoad\ObjectStore]
+             * BootPhase=0 (Dll=filesys.dll, MountAsBootable=1,
+             * MountAsRoot=1) — the object store IS the phase-0 boot
+             * filesystem per the documented CE boot order (object store
+             * -> ROM files -> registry -> phase-1 FSDs (Relfsd) ->
+             * LaunchXX/device.dll at phase 2). The fdf apply is not
+             * visible to the AutoLoad enumeration in emulation, so we
+             * apply the ObjectStore semantics to the phase-0
+             * enumeration instead: patch the sticky default 1 -> 0
+             * (mov #1,r3 -> mov #0,r3 at the flash image of fsdmgr
+             * .text). Env-gated, default off. */
+            uint16_t mov0 = 0xE003;    /* mov #0,r3 */
+            hwaddr bpa = MMCS_FLASH_BASE + (0x90a8497e - 0x90800000);
+            cpu_physical_memory_write(bpa, &mov0, 2);
+            fprintf(stderr, "MMCS: BOOTFS AutoLoad BootPhase default "
+                    "1->0 patched @ROM 0x90a8497e\n");
+        }
         if (getenv("MMCS_REGFIX")) {
             cpu->env.mmcs_regfix_active = 1;
             /* Phase-0 bootstrap: patch the ordinal-461 stub (RegQueryValueExW
