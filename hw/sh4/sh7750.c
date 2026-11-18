@@ -29,6 +29,8 @@
 #include "hw/irq.h"
 #include "hw/sh4/sh.h"
 #include "sysemu/sysemu.h"
+#include "migration/vmstate.h"
+#include "migration/register.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "sh7750_regs.h"
@@ -81,6 +83,11 @@ typedef struct SH7750State {
     uint32_t ccr;
 
     struct intc_desc intc;
+
+    /* MMCS fork (savestate lane): shadow copies of the file-static
+     * intc register descriptor values (see vmstate_sh7750) */
+    uint64_t mask_values[1];    /* == ARRAY_SIZE(mask_registers) */
+    uint64_t prio_values[5];    /* == ARRAY_SIZE(prio_registers) */
 } SH7750State;
 
 static inline int has_bcr3_and_bcr4(SH7750State *s)
@@ -421,7 +428,35 @@ static void sh7750_mem_writel(void *opaque, hwaddr addr,
         return;
     case SH7750_MMUCR_A7:
         if (mem_value & MMUCR_TI) {
+            /* MMCS fork (L34, env MMCS_TIFLUSH): TI invalidates the
+             * ENTIRE UTLB/ITLB on real silicon — every cached
+             * translation dies and the next access re-translates (the
+             * CE5 SH4 kernel's slot-0 process switch relies on this:
+             * the new process's page tables only become visible because
+             * the old entries are gone). QEMU's
+             * cpu_sh4_invalidate_tlb only clears env->{u,it}lb — the
+             * softmmu's already-installed VA->PA entries survived the
+             * guest's full invalidate, so the DEAD process's private
+             * pages (slot-0 .data with its critsec/CRT state) kept
+             * serving the newcomer after an ASID recycle — the L34
+             * critsec-park root cause. Flush the softmmu too. Env-gated
+             * (default off) to keep the default boots byte-identical. */
+            static int tiflush = -1;
+            if (tiflush < 0) {
+                tiflush = getenv("MMCS_TIFLUSH") != NULL;
+            }
+            if (getenv("MMCS_TICENSUS")) {
+                static int nti;
+                if (nti++ < 64) {
+                    fprintf(stderr, "MMCS-TI full TLB invalidate #%d "
+                            "(pc below retranslates, flush=%d)\n",
+                            nti, tiflush);
+                }
+            }
             cpu_sh4_invalidate_tlb(&s->cpu->env);
+            if (tiflush) {
+                tlb_flush(CPU(s->cpu));
+            }
         }
         s->cpu->env.mmucr = mem_value & ~MMUCR_TI;
         return;
@@ -763,6 +798,110 @@ static const MemoryRegionOps sh7750_mmct_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/* MMCS fork (savestate lane): the SH7750 core + its INTC had no
+ * migration state at all (a plain g_new0 struct, not a qdev). For the
+ * fork's snapshot harness the whole SoC register file is streamed:
+ * the BSC/PCMCIA/ports/cache regs, and the sh_intc register values +
+ * per-source enable/assert/pending state (the MMCS vendor kernel
+ * programs IPRs/ICR early and leaves them; losing them would change
+ * IRQ demux after restore). `unsigned long` reg values are stored as
+ * uint64 (LP64 host). Pointers (cpu, devices, iomem) are runtime
+ * wiring rebuilt by sh7750_init on the incoming side; the sources
+ * array is pre-allocated by sh_intc_init and streamed in place so
+ * source->parent stays valid. */
+static const VMStateDescription vmstate_intc_source = {
+    .name = "intc_source",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT16(vect, struct intc_source),
+        VMSTATE_UINT8(next_enum_id, struct intc_source),
+        VMSTATE_INT32(asserted, struct intc_source),
+        VMSTATE_INT32(enable_count, struct intc_source),
+        VMSTATE_INT32(enable_max, struct intc_source),
+        VMSTATE_INT32(pending, struct intc_source),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* MMCS fork (savestate lane): the intc register descriptor values
+ * live in the file-static descriptor tables; pre_save copies them
+ * into the SH7750State shadow members, post_load applies them back. */
+static int sh7750_pre_save(void *opaque)
+{
+    SH7750State *s = opaque;
+    for (unsigned i = 0; i < ARRAY_SIZE(mask_registers); i++) {
+        s->mask_values[i] = mask_registers[i].value;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(prio_registers); i++) {
+        s->prio_values[i] = prio_registers[i].value;
+    }
+    if (s->intc.nr_sources > NR_SOURCES) {
+        return -1;
+    }
+    return 0;
+}
+
+static int sh7750_post_load(void *opaque, int version_id)
+{
+    SH7750State *s = opaque;
+    for (unsigned i = 0; i < ARRAY_SIZE(mask_registers); i++) {
+        mask_registers[i].value = s->mask_values[i];
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(prio_registers); i++) {
+        prio_registers[i].value = s->prio_values[i];
+    }
+    s->intc.nr_sources = NR_SOURCES;
+    return 0;
+}
+
+static const VMStateDescription vmstate_sh7750 = {
+    .name = "sh7750",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(periph_freq, SH7750State),
+        VMSTATE_UINT32(bcr1, SH7750State),
+        VMSTATE_UINT16(bcr2, SH7750State),
+        VMSTATE_UINT16(bcr3, SH7750State),
+        VMSTATE_UINT32(bcr4, SH7750State),
+        VMSTATE_UINT16(rfcr, SH7750State),
+        VMSTATE_UINT16(pcr, SH7750State),
+        VMSTATE_UINT16(gpioic, SH7750State),
+        VMSTATE_UINT32(pctra, SH7750State),
+        VMSTATE_UINT32(pctrb, SH7750State),
+        VMSTATE_UINT16(portdira, SH7750State),
+        VMSTATE_UINT16(portpullupa, SH7750State),
+        VMSTATE_UINT16(portdirb, SH7750State),
+        VMSTATE_UINT16(portpullupb, SH7750State),
+        VMSTATE_UINT16(pdtra, SH7750State),
+        VMSTATE_UINT16(pdtrb, SH7750State),
+        VMSTATE_UINT16(periph_pdtra, SH7750State),
+        VMSTATE_UINT16(periph_portdira, SH7750State),
+        VMSTATE_UINT16(periph_pdtrb, SH7750State),
+        VMSTATE_UINT16(periph_portdirb, SH7750State),
+        VMSTATE_UINT32(ccr, SH7750State),
+        VMSTATE_INT32(intc.pending, SH7750State),
+        /* register descriptor value latches (topology is const) */
+        VMSTATE_UINT64_ARRAY_V(mask_values, SH7750State,
+                               ARRAY_SIZE(mask_registers), 1),
+        VMSTATE_UINT64_ARRAY_V(prio_values, SH7750State,
+                               ARRAY_SIZE(prio_registers), 1),
+        /* intc sources, streamed in place over the init allocation */
+        {
+            .name         = "sources",
+            .num          = NR_SOURCES,
+            .vmsd         = &vmstate_intc_source,
+            .size         = sizeof(struct intc_source),
+            .flags        = VMS_ARRAY | VMS_POINTER | VMS_STRUCT,
+            .offset       = offsetof(SH7750State, intc.sources),
+        },
+        VMSTATE_END_OF_LIST()
+    },
+    .pre_save = sh7750_pre_save,
+    .post_load = sh7750_post_load,
+};
+
 SH7750State *sh7750_init(SuperHCPU *cpu, MemoryRegion *sysmem)
 {
     SH7750State *s;
@@ -894,6 +1033,7 @@ SH7750State *sh7750_init(SuperHCPU *cpu, MemoryRegion *sysmem)
     sh_intc_register_sources(&s->intc,
                                 _INTC_ARRAY(vectors_irl),
                                 _INTC_ARRAY(groups_irl));
+    vmstate_register(NULL, 0, &vmstate_sh7750, s);
     return s;
 }
 

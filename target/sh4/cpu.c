@@ -24,9 +24,16 @@
 #include "qemu/qemu-print.h"
 #include "cpu.h"
 #include "migration/vmstate.h"
+#include "migration/qemu-file.h"
+#include "qapi/qmp/json-writer.h"
 #include "exec/exec-all.h"
+#include "exec/tb-flush.h"
 #include "fpu/softfloat-helpers.h"
 #include "tcg/tcg.h"
+
+/* target/sh4/op_helper.c (helper.h cannot be included here — its TCG
+ * generator context conflicts with the cpu.h includes) */
+void helper_ld_fpscr(CPUSH4State *env, uint32_t val);
 
 static void superh_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -240,9 +247,207 @@ static void superh_cpu_initfn(Object *obj)
 }
 
 #ifndef CONFIG_USER_ONLY
+/* MMCS fork (savestate lane): the SH4 CPU was shipped upstream as
+ * {.unmigratable = 1}, which hard-blocks savevm/migrate for every
+ * machine built on this target (qemu_savevm_state_blocked fails on
+ * any registered vmsd with the flag). This is a full field-faithful
+ * VMStateDescription for CPUSH4State so the fork's snapshot harness
+ * (corpus scripts/emul/snapshot.sh, migrate exec: + -incoming) works.
+ *
+ * Field notes:
+ *  - tlb_t packs its per-entry attributes into compiler-laid-out
+ *    bitfields; a custom VMStateInfo serializes them explicitly
+ *    (host-layout independent).
+ *  - env.fp_status is DERIVED state (helper_ld_fpscr recomputes it
+ *    from fpscr) — rebuilt in post_load instead of streamed.
+ *  - env.intc_handle / movcal_backup_tail are host pointers — the
+ *    former is re-wired by machine init (sh7750_init) before load,
+ *    the latter is rebuilt by the movcal deserializer.
+ *  - the env.mmcs_*_active latches are env-knob mirrors set at
+ *    machine init; they are streamed anyway (cheap, and keeps the
+ *    snapshot self-consistent if a knob was armed mid-boot).
+ */
+static int sh4_tlb_put(QEMUFile *f, void *pv, size_t size,
+                       const VMStateField *field, JSONWriter *vmdesc)
+{
+    const tlb_t *t = pv;
+    uint16_t bits = (t->v & 1u) | ((t->sz & 3u) << 1) |
+                    ((t->sh & 1u) << 3) | ((t->c & 1u) << 4) |
+                    ((t->pr & 3u) << 5) | ((t->d & 1u) << 7) |
+                    ((t->wt & 1u) << 8) | ((t->sa & 7u) << 9) |
+                    ((t->tc & 1u) << 12);
+    qemu_put_be32(f, t->vpn);
+    qemu_put_be32(f, t->ppn);
+    qemu_put_be32(f, t->size);
+    qemu_put_byte(f, t->asid);
+    qemu_put_be16(f, bits);
+    return 0;
+}
+
+static int sh4_tlb_get(QEMUFile *f, void *pv, size_t size,
+                       const VMStateField *field)
+{
+    tlb_t *t = pv;
+    uint16_t bits;
+    t->vpn = qemu_get_be32(f);
+    t->ppn = qemu_get_be32(f);
+    t->size = qemu_get_be32(f);
+    t->asid = qemu_get_byte(f);
+    bits = qemu_get_be16(f);
+    t->v = bits & 1u;
+    t->sz = (bits >> 1) & 3u;
+    t->sh = (bits >> 3) & 1u;
+    t->c = (bits >> 4) & 1u;
+    t->pr = (bits >> 5) & 3u;
+    t->d = (bits >> 7) & 1u;
+    t->wt = (bits >> 8) & 1u;
+    t->sa = (bits >> 9) & 7u;
+    t->tc = (bits >> 12) & 1u;
+    return 0;
+}
+
+static const VMStateInfo vmstate_info_sh4_tlb = {
+    .name = "tlb_t",
+    .get = sh4_tlb_get,
+    .put = sh4_tlb_put,
+};
+
+static int sh4_movcal_put(QEMUFile *f, void *pv, size_t size,
+                          const VMStateField *field, JSONWriter *vmdesc)
+{
+    CPUSH4State *env = container_of(pv, CPUSH4State, movcal_backup);
+    memory_content *n;
+    unsigned cnt = 0;
+    for (n = env->movcal_backup; n; n = n->next) {
+        cnt++;
+    }
+    qemu_put_be32(f, cnt);
+    for (n = env->movcal_backup; n; n = n->next) {
+        qemu_put_be32(f, n->address);
+        qemu_put_be32(f, n->value);
+    }
+    return 0;
+}
+
+static int sh4_movcal_get(QEMUFile *f, void *pv, size_t size,
+                          const VMStateField *field)
+{
+    CPUSH4State *env = container_of(pv, CPUSH4State, movcal_backup);
+    memory_content *list = NULL;
+    memory_content **tail = &list;
+    unsigned cnt = qemu_get_be32(f);
+    while (cnt--) {
+        memory_content *n = g_new(memory_content, 1);
+        n->address = qemu_get_be32(f);
+        n->value = qemu_get_be32(f);
+        *tail = n;
+        tail = &n->next;
+    }
+    *tail = NULL;
+    env->movcal_backup = list;
+    env->movcal_backup_tail = list ? tail : &env->movcal_backup;
+    return 0;
+}
+
+static const VMStateInfo vmstate_info_sh4_movcal = {
+    .name = "movcal_backup",
+    .get = sh4_movcal_get,
+    .put = sh4_movcal_put,
+};
+
+static int superh_cpu_post_load(void *opaque, int version_id)
+{
+    SuperHCPU *cpu = opaque;
+    CPUSH4State *env = &cpu->env;
+
+    /* fp_status is derived from fpscr (see helper_ld_fpscr) */
+    helper_ld_fpscr(env, env->fpscr);
+    /* TCG may hold translations keyed on the pre-load CPU state */
+    tb_flush(env_cpu(env));
+    return 0;
+}
+
+static bool sh4_movcal_needed(void *opaque, int version_id)
+{
+    SuperHCPU *cpu = opaque;
+    return cpu->env.movcal_backup != NULL;
+}
+
 static const VMStateDescription vmstate_sh_cpu = {
     .name = "cpu",
-    .unmigratable = 1,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = superh_cpu_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_CPU(),
+        VMSTATE_UINT32(env.flags, SuperHCPU),
+        VMSTATE_UINT32_ARRAY(env.gregs, SuperHCPU, 24),
+        VMSTATE_UINT32_ARRAY(env.fregs, SuperHCPU, 32),
+        VMSTATE_UINT32(env.sr, SuperHCPU),
+        VMSTATE_UINT32(env.sr_m, SuperHCPU),
+        VMSTATE_UINT32(env.sr_q, SuperHCPU),
+        VMSTATE_UINT32(env.sr_t, SuperHCPU),
+        VMSTATE_UINT32(env.ssr, SuperHCPU),
+        VMSTATE_UINT32(env.spc, SuperHCPU),
+        VMSTATE_UINT32(env.gbr, SuperHCPU),
+        VMSTATE_UINT32(env.vbr, SuperHCPU),
+        VMSTATE_UINT32(env.sgr, SuperHCPU),
+        VMSTATE_UINT32(env.dbr, SuperHCPU),
+        VMSTATE_UINT32(env.pc, SuperHCPU),
+        VMSTATE_UINT32(env.delayed_pc, SuperHCPU),
+        VMSTATE_UINT32(env.delayed_cond, SuperHCPU),
+        VMSTATE_UINT32(env.mach, SuperHCPU),
+        VMSTATE_UINT32(env.macl, SuperHCPU),
+        VMSTATE_UINT32(env.pr, SuperHCPU),
+        VMSTATE_UINT32(env.fpscr, SuperHCPU),
+        VMSTATE_UINT32(env.fpul, SuperHCPU),
+        VMSTATE_UINT32(env.mmucr, SuperHCPU),
+        VMSTATE_UINT32(env.pteh, SuperHCPU),
+        VMSTATE_UINT32(env.ptel, SuperHCPU),
+        VMSTATE_UINT32(env.ptea, SuperHCPU),
+        VMSTATE_UINT32(env.ttb, SuperHCPU),
+        VMSTATE_UINT32(env.tea, SuperHCPU),
+        VMSTATE_UINT32(env.tra, SuperHCPU),
+        VMSTATE_UINT32(env.expevt, SuperHCPU),
+        VMSTATE_UINT32(env.intevt, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_evt_inject, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_regfix_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_ilkfix_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_ringfix_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_kapifix_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_apiret_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_cbret_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_killstk_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_srvpg_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_kslot_active, SuperHCPU),
+        VMSTATE_UINT32(env.mmcs_cowfix_active, SuperHCPU),
+        /* tlb_t entries: custom info (bitfield layout is host-specific) */
+        {
+            .name         = "itlb",
+            .info         = &vmstate_info_sh4_tlb,
+            .size         = sizeof(tlb_t),
+            .num          = ITLB_SIZE,
+            .flags        = VMS_ARRAY,
+            .offset       = offsetof(SuperHCPU, env.itlb),
+        },
+        {
+            .name         = "utlb",
+            .info         = &vmstate_info_sh4_tlb,
+            .size         = sizeof(tlb_t),
+            .num          = UTLB_SIZE,
+            .flags        = VMS_ARRAY,
+            .offset       = offsetof(SuperHCPU, env.utlb),
+        },
+        VMSTATE_UINT32(env.lock_addr, SuperHCPU),
+        VMSTATE_UINT32(env.lock_value, SuperHCPU),
+        VMSTATE_INT32(env.id, SuperHCPU),
+        VMSTATE_UINT32(env.features, SuperHCPU),
+        VMSTATE_INT32(env.in_sleep, SuperHCPU),
+        VMSTATE_POINTER_TEST(env.movcal_backup, SuperHCPU,
+                             sh4_movcal_needed,
+                             vmstate_info_sh4_movcal, memory_content *),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 #include "hw/core/sysemu-cpu-ops.h"

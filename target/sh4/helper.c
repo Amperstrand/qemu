@@ -28,6 +28,8 @@
 #if !defined(CONFIG_USER_ONLY)
 #include "hw/sh4/sh_intc.h"
 #include "sysemu/runstate.h"
+#include "migration/vmstate.h"
+#include "migration/register.h"
 #endif
 
 #define MMU_OK                   0
@@ -127,6 +129,17 @@ int mmcs_pgown_fill(CPUSH4State *env, uint32_t address, uint32_t *pa,
 static struct { uint32_t va, pa; } mmcs_fvmap[16384];
 static int mmcs_nfvmap;
 static uint32_t mmcs_fvmap_nxt = 0x20000000;
+
+/* MMCS fork (savestate lane): the COWFIX dedup map + bump allocator
+ * (was function-static inside superh_cpu_do_interrupt's COWFIX block;
+ * hoisted so the "mmcs/helper" vmstate can stream it — the scratch
+ * pages themselves live in migrated RAM, but a lost map would
+ * allocate FRESH pages on the first post-restore fault and lose the
+ * COW content). */
+struct mmcs_cowfix_ent { uint32_t va, pa; };
+static struct mmcs_cowfix_ent mmcs_cowfix_map[512];
+static int mmcs_cowfix_nmap;
+static uint32_t mmcs_cowfix_next = 0x10710000;
 
 /* MMCS fork (L32): va->pa lookup over the FILEVIEW dedup table, for
  * the hw-side wake daemons that must read a parked thread's stack
@@ -1233,9 +1246,11 @@ ilk_no_emu:;
         tlb_t *e = (n >= 0) ? &env->utlb[n] : NULL;
         uint32_t mask = e ? (e->size - 1) : 0xFFF;
         uint32_t base = va & ~mask;
-        /* dedup table + bump allocator over the scratch margin */
-        static struct { uint32_t va, pa; } map[512];
-        static int nmap;
+        /* dedup table + bump allocator over the scratch margin
+         * (savestate lane: hoisted to file scope — the snapshot
+         * streams it as part of "mmcs/helper") */
+        struct mmcs_cowfix_ent *map = mmcs_cowfix_map;
+        int nmap = mmcs_cowfix_nmap;
         uint32_t pa = 0;
         bool reused = false;
         for (int i = 0; i < nmap; i++) {
@@ -1246,13 +1261,15 @@ ilk_no_emu:;
             }
         }
         if (!reused) {
-            static uint32_t next = 0x10710000;
+            uint32_t next = mmcs_cowfix_next;
             if (next + mask + 1 <= 0x10800000 && nmap < 512) {
                 pa = next;
                 next += mask + 1;
                 map[nmap].va = base;
                 map[nmap].pa = pa;
                 nmap++;
+                mmcs_cowfix_next = next;
+                mmcs_cowfix_nmap = nmap;
             } else {
                 fprintf(stderr, "MMCS: COWFIX scratch exhausted\n");
                 goto cow_done;
@@ -3084,4 +3101,82 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     }
     cpu_loop_exit_restore(cs, retaddr);
 }
+
+/* ===================== savestate (snapshot lane) =====================
+ * MMCS fork: "mmcs/helper" — the helper-side host tables that gate
+ * execution MUST survive a snapshot: the FILEVIEW va->pa dedup table
+ * (+ allocator cursor — a lost cursor would hand out FRESH pages over
+ * the migrated ones' addresses), the COWFIX map (same discipline, its
+ * scratch is the SDRAM top margin), and the ILKFIX launch latch
+ * (gates sub-floor PGOWN registration; a lost latch changes post-
+ * restore page-ownership behavior). Env-derived lazy caches
+ * (MMCS_STKFLOOR floor, UWHEAP latch, one-shot seed guards) are
+ * deliberately NOT streamed: they re-derive from the same env, and
+ * the ILKFIX seed is read-before-write (never stomps migrated RAM).
+ */
+#if !defined(CONFIG_USER_ONLY)
+struct MmcsHelperSnap {
+    uint32_t fvmap[16384][2];
+    int32_t nfvmap;
+    uint32_t fvmap_nxt;
+    uint32_t cowmap[512][2];
+    int32_t cown;
+    uint32_t cownext;
+    int32_t user_seen;
+};
+static struct MmcsHelperSnap mmcs_helper_snap;
+
+static int mmcs_helper_pre_save(void *opaque)
+{
+    struct MmcsHelperSnap *s = opaque;
+    memcpy(s->fvmap, mmcs_fvmap, sizeof s->fvmap);
+    s->nfvmap = mmcs_nfvmap;
+    s->fvmap_nxt = mmcs_fvmap_nxt;
+    memcpy(s->cowmap, mmcs_cowfix_map, sizeof s->cowmap);
+    s->cown = mmcs_cowfix_nmap;
+    s->cownext = mmcs_cowfix_next;
+    s->user_seen = mmcs_ilkfix_user_seen;
+    return 0;
+}
+
+static int mmcs_helper_post_load(void *opaque, int version_id)
+{
+    struct MmcsHelperSnap *s = opaque;
+    memcpy(mmcs_fvmap, s->fvmap, sizeof s->fvmap);
+    mmcs_nfvmap = s->nfvmap;
+    mmcs_fvmap_nxt = s->fvmap_nxt;
+    memcpy(mmcs_cowfix_map, s->cowmap, sizeof s->cowmap);
+    mmcs_cowfix_nmap = s->cown;
+    mmcs_cowfix_next = s->cownext;
+    mmcs_ilkfix_user_seen = s->user_seen;
+    fprintf(stderr, "MMCS-SNAP: helper tables restored (fvmap=%d "
+            "cowmap=%d launch-latch=%d)\n",
+            mmcs_nfvmap, mmcs_cowfix_nmap, (int)mmcs_ilkfix_user_seen);
+    return 0;
+}
+
+static const VMStateDescription vmstate_mmcs_helper = {
+    .name = "mmcs/helper",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = mmcs_helper_pre_save,
+    .post_load = mmcs_helper_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32_2DARRAY(fvmap, struct MmcsHelperSnap, 16384, 2),
+        VMSTATE_INT32(nfvmap, struct MmcsHelperSnap),
+        VMSTATE_UINT32(fvmap_nxt, struct MmcsHelperSnap),
+        VMSTATE_UINT32_2DARRAY(cowmap, struct MmcsHelperSnap, 512, 2),
+        VMSTATE_INT32(cown, struct MmcsHelperSnap),
+        VMSTATE_UINT32(cownext, struct MmcsHelperSnap),
+        VMSTATE_INT32(user_seen, struct MmcsHelperSnap),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+void mmcs_helper_vmstate_register(void)
+{
+    vmstate_register(NULL, 0, &vmstate_mmcs_helper, &mmcs_helper_snap);
+}
+#endif /* !CONFIG_USER_ONLY */
+
 #endif /* !CONFIG_USER_ONLY */

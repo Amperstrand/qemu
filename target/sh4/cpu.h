@@ -214,6 +214,10 @@ typedef struct CPUArchState {
 /* MMCS fork (L32): FILEVIEW va->pa lookup for the hw-side daemons */
 uint32_t mmcs_fv_va2pa(uint32_t va);
 
+/* MMCS fork (savestate lane): register the helper-side host tables
+ * (FILEVIEW/COWFIX dedup maps, launch latch) for savevm/migrate. */
+void mmcs_helper_vmstate_register(void);
+
 /* MMCS fork (L33): PGOWN/FILEVIEW stack va->pa for the CBRET completion */
 uint32_t mmcs_stack_va2pa(uint32_t va);
 

@@ -34,6 +34,8 @@
 #include "hw/char/serial.h"
 #include "qemu/datadir.h"
 #include "hw/misc/unimp.h"
+#include "migration/vmstate.h"
+#include "migration/register.h"
 
 #define MMCS_SDRAM_BASE 0x08000000
 #define MMCS_SDRAM_SIZE 0x8800000  /* 0x08000000..0x10800000: kernel RAM 0x88600000-0x90700000 (ROMHDR) + margin */
@@ -1480,10 +1482,12 @@ static MemoryRegion *mmcs_sdram_mr;  /* for MMCS_2DG console retarget */
  * splash's DU scanout base — 2DG+0x50 plane surface or, for the
  * single-surface design, the DL's Poly4AA texture). Direct SDRAM
  * pointer into the RAM MR backing (phys < MMCS_SDRAM_BASE+size). */
+static hwaddr mmcs_2dg_last;   /* savestate lane: file-scope */
 static void mmcs_2dg_present_console(hwaddr pa)
 {
-    static hwaddr last;
-    if (!mmcs_con || pa == last) {
+    /* mmcs_2dg_last: hoisted to file scope (savestate lane — the
+     * post_load console re-target must reset it) */
+    if (!mmcs_con || pa == mmcs_2dg_last) {
         return;
     }
     if (pa < MMCS_SDRAM_BASE
@@ -1500,7 +1504,7 @@ static void mmcs_2dg_present_console(hwaddr pa)
     DisplaySurface *s = qemu_create_displaysurface_from(
         800, 480, PIXMAN_r5g6b5, 800 * 2, fb);
     dpy_gfx_replace_surface(mmcs_con, s);
-    last = pa;
+    mmcs_2dg_last = pa;
     fprintf(stderr, "MMCS-2DG: console retargeted to presented surface "
             "phys %08x\n", (unsigned)pa);
 }
@@ -1533,7 +1537,7 @@ static int mmcs_fb_only_rearm = 0;  /* set by self-rearm: skip RAM sweep */
  * SINGLE-surface design (work surface == plane surface, §3.4) this is
  * pixel-complete; MMCS_FB capture retargets to the latched 2DG+0x50
  * surface A when armed. */
-static struct {
+struct Mmcs2dgState {
     int armed;
     uint32_t dl_base, surf_a, surf_b, mode, ctl;
     uint32_t du00, du04, du_done, du0c, du18;
@@ -1541,7 +1545,8 @@ static struct {
     /* DL walk (kick-time): the Polygon4AA that carries the splash */
     uint32_t tex, tex_w, tex_h;
     int nlog;
-} mmcs_2dg;
+};
+static struct Mmcs2dgState mmcs_2dg;
 
 /* Walk the display list at dl_base (RAM DL model — corpus 2DG research
  * lane §2.3): Wpr (0x18xxxxxx, skip pattern words), Lcofs (0x40xxxxxx),
@@ -2441,14 +2446,20 @@ static int mmcs_l32_armed;
 static uint32_t mmcs_l32_cadence_ms = 2000;
 static uint32_t mmcs_l32_max_deliv = 64;
 
+/* savestate lane: the tick-chain cadence counters were function-local
+ * statics — hoisted so the snapshot can stream them (losing them
+ * shifts every daemon scan phase by up to one cadence period after a
+ * restore, which breaks identical-continuation verify). */
+static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32;
+static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
+                               * re-arms the chain only when set) */
+
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
-    static uint64_t l19_ticks;
-    static uint64_t l26_ticks;
-    static uint64_t l32_ticks;
     bool hdevt = mmcs_hdevt_pending > 0;
     bool l16 = false;
+    mmcs_tick_live = 1;
     if (hdevt) {
         mmcs_inject_evt(0x200);
         if (--mmcs_hdevt_pending == 0) {
@@ -2465,18 +2476,18 @@ static void mmcs_tick_deliver(void *opaque)
         /* L19: the daemon scan runs on the tick chain — one scan per
          * cadence period (default every 1000th tick), each delivery
          * replaces this tick's 0x440 exactly like the L16/L18 chains */
-        if (mmcs_l19_armed && ++l19_ticks >= mmcs_l19_cadence_ms) {
-            l19_ticks = 0;
+        if (mmcs_l19_armed && ++mmcs_tick_l19 >= mmcs_l19_cadence_ms) {
+            mmcs_tick_l19 = 0;
             mmcs_l19_scan();
         }
         /* L26: the DoWait-orphan wake daemon (same cadence class) */
-        if (mmcs_l26_armed && ++l26_ticks >= mmcs_l26_cadence_ms) {
-            l26_ticks = 0;
+        if (mmcs_l26_armed && ++mmcs_tick_l26 >= mmcs_l26_cadence_ms) {
+            mmcs_tick_l26 = 0;
             mmcs_l26_scan();
         }
         /* L32: the create-completion event daemon (same class) */
-        if (mmcs_l32_armed && ++l32_ticks >= mmcs_l32_cadence_ms) {
-            l32_ticks = 0;
+        if (mmcs_l32_armed && ++mmcs_tick_l32 >= mmcs_l32_cadence_ms) {
+            mmcs_tick_l32 = 0;
             mmcs_l32_scan();
         }
         /* L16: service one pending event-wake per tick (after the
@@ -2926,6 +2937,21 @@ static const struct { uint32_t pa; } mmcs_l19_sig_cells[] = {
 };
 #define MMCS_L19_NSIG (ARRAY_SIZE(mmcs_l19_sig_cells) * 4)
 
+/* savestate lane: per-daemon movement-signature state, hoisted from
+ * the scan functions' function-local statics so the snapshot can
+ * stream them (a restored daemon that re-arms from have_prev=0 can
+ * deliver a wake the no-snapshot run would not — the quiet-park
+ * discipline must survive the snapshot). */
+static uint8_t mmcs_l19_sig[MMCS_L19_NSIG];
+static int mmcs_l19_sig_have;
+static uint32_t mmcs_l19_quiet, mmcs_l19_nopick;
+static uint8_t mmcs_l26_sig[MMCS_L19_NSIG];
+static int mmcs_l26_sig_have;
+static uint32_t mmcs_l26_quiet;
+static uint8_t mmcs_l32_sig[MMCS_L19_NSIG];
+static int mmcs_l32_sig_have;
+static uint32_t mmcs_l32_quiet;
+
 static void mmcs_l19_signature(uint8_t *out)
 {
     unsigned o = 0;
@@ -2994,9 +3020,6 @@ static uint32_t mmcs_l26_total;
 
 static void mmcs_l26_scan(void)
 {
-    static uint8_t prev_sig[MMCS_L19_NSIG];
-    static int have_prev;
-    static uint32_t quiet_scans;
     uint8_t sig[MMCS_L19_NSIG];
 
     if (mmcs_l26_total >= mmcs_l26_max_deliv) {
@@ -3008,24 +3031,25 @@ static void mmcs_l26_scan(void)
         return;
     }
     mmcs_l19_signature(sig);
-    bool moved = have_prev && memcmp(sig, prev_sig, MMCS_L19_NSIG) != 0;
-    memcpy(prev_sig, sig, MMCS_L19_NSIG);
-    have_prev = 1;
+    bool moved = mmcs_l26_sig_have
+                 && memcmp(sig, mmcs_l26_sig, MMCS_L19_NSIG) != 0;
+    memcpy(mmcs_l26_sig, sig, MMCS_L19_NSIG);
+    mmcs_l26_sig_have = 1;
     if (moved) {
-        quiet_scans = 0;
+        mmcs_l26_quiet = 0;
         if (!mmcs_l26_armed) {
             mmcs_l26_armed = 1;
             fprintf(stderr, "MMCS-L26: t=%" PRId64 "ms movement while "
                     "parked - re-armed (%u deliveries used)\n",
                     qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l26_total);
         }
-    } else if (mmcs_l26_armed && ++quiet_scans >= MMCS_L26_QUIET_PARK) {
+    } else if (mmcs_l26_armed && ++mmcs_l26_quiet >= MMCS_L26_QUIET_PARK) {
         fprintf(stderr, "MMCS-L26: t=%" PRId64 "ms %u quiet scans - "
                 "daemon parked at %u deliveries\n",
-                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), quiet_scans,
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l26_quiet,
                 mmcs_l26_total);
         mmcs_l26_armed = 0;
-        quiet_scans = 0;
+        mmcs_l26_quiet = 0;
     }
     if (!mmcs_l26_armed) {
         return;
@@ -3165,9 +3189,7 @@ static uint32_t mmcs_l32_stack_pa(uint32_t va)
 
 static void mmcs_l32_scan(void)
 {
-    static uint8_t prev_sig[MMCS_L19_NSIG];
-    static int have_prev;
-    static uint32_t quiet_scans;
+    uint8_t sig[MMCS_L19_NSIG];
 
     if (mmcs_l32_total >= mmcs_l32_max_deliv) {
         if (mmcs_l32_armed) {
@@ -3177,26 +3199,26 @@ static void mmcs_l32_scan(void)
         }
         return;
     }
-    uint8_t sig[MMCS_L19_NSIG];
     mmcs_l19_signature(sig);
-    bool moved = have_prev && memcmp(sig, prev_sig, MMCS_L19_NSIG) != 0;
-    memcpy(prev_sig, sig, MMCS_L19_NSIG);
-    have_prev = 1;
+    bool moved = mmcs_l32_sig_have
+                 && memcmp(sig, mmcs_l32_sig, MMCS_L19_NSIG) != 0;
+    memcpy(mmcs_l32_sig, sig, MMCS_L19_NSIG);
+    mmcs_l32_sig_have = 1;
     if (moved) {
-        quiet_scans = 0;
+        mmcs_l32_quiet = 0;
         if (!mmcs_l32_armed) {
             mmcs_l32_armed = 1;
             fprintf(stderr, "MMCS-L32: t=%" PRId64 "ms movement while "
                     "parked - re-armed (%u deliveries used)\n",
                     qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l32_total);
         }
-    } else if (mmcs_l32_armed && ++quiet_scans >= MMCS_L32_QUIET_PARK) {
+    } else if (mmcs_l32_armed && ++mmcs_l32_quiet >= MMCS_L32_QUIET_PARK) {
         fprintf(stderr, "MMCS-L32: t=%" PRId64 "ms %u quiet scans - "
                 "daemon parked at %u deliveries\n",
-                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), quiet_scans,
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l32_quiet,
                 mmcs_l32_total);
         mmcs_l32_armed = 0;
-        quiet_scans = 0;
+        mmcs_l32_quiet = 0;
     }
     if (!mmcs_l32_armed) {
         return;
@@ -3460,9 +3482,6 @@ static void mmcs_l19ev_fire(void *opaque)
 #define MMCS_L19_QUIET_PARK 60
 static void mmcs_l19_scan(void)
 {
-    static uint8_t prev_sig[MMCS_L19_NSIG];
-    static int have_prev;
-    static uint32_t quiet_scans, no_pick_scans;
     uint8_t sig[MMCS_L19_NSIG];
     if (mmcs_l19_total >= mmcs_l19_max_deliv) {
         if (mmcs_l19_armed) {
@@ -3473,24 +3492,25 @@ static void mmcs_l19_scan(void)
         return;
     }
     mmcs_l19_signature(sig);
-    bool moved = have_prev && memcmp(sig, prev_sig, MMCS_L19_NSIG) != 0;
-    memcpy(prev_sig, sig, MMCS_L19_NSIG);
-    have_prev = 1;
+    bool moved = mmcs_l19_sig_have
+                 && memcmp(sig, mmcs_l19_sig, MMCS_L19_NSIG) != 0;
+    memcpy(mmcs_l19_sig, sig, MMCS_L19_NSIG);
+    mmcs_l19_sig_have = 1;
     if (moved) {
-        quiet_scans = 0;
+        mmcs_l19_quiet = 0;
         if (!mmcs_l19_armed) {
             mmcs_l19_armed = 1;
             fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms movement while "
                     "parked - re-armed (%u deliveries used)\n",
                     qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l19_total);
         }
-    } else if (mmcs_l19_armed && ++quiet_scans >= MMCS_L19_QUIET_PARK) {
+    } else if (mmcs_l19_armed && ++mmcs_l19_quiet >= MMCS_L19_QUIET_PARK) {
         fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms %u quiet scans - "
                 "daemon parked at %u deliveries\n",
-                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), quiet_scans,
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l19_quiet,
                 mmcs_l19_total);
         mmcs_l19_armed = 0;
-        quiet_scans = 0;
+        mmcs_l19_quiet = 0;
     }
     if (!mmcs_l19_armed) {
         return;
@@ -3542,14 +3562,14 @@ static void mmcs_l19_scan(void)
     if (!pick_obj) {
         /* census: bounded no-pick sample so a silent pump lane is
          * diagnosable from the log alone */
-        if (++no_pick_scans % 60 == 1) {
+        if (++mmcs_l19_nopick % 60 == 1) {
             fprintf(stderr, "MMCS-L19: t=%" PRId64 "ms no lost wake in "
                     "the arena (scan %u)\n",
-                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), no_pick_scans);
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l19_nopick);
         }
         return;               /* nothing wake-pending: stay silent */
     }
-    no_pick_scans = 0;
+    mmcs_l19_nopick = 0;
     /* patch the generic delivery stub's event literal (.Le at +140)
      * and arm the delivery */
     for (int i = 0; i < MMCS_L16_MAX; i++) {
@@ -3959,6 +3979,7 @@ static void mmcs_usb_setup(void)
     qdev_realize_and_unref(udev, usb_bus, &error_fatal);
     fprintf(stderr, "MMCS: USB device '%s' attached to port 1\n", usb_dev);
 }
+
 /* MMCS fork (S159, MLD-HANDOFF): the loader no-update path -> the OS launch,
  * one continuous boot. DECODE (this lane; mld-mem pseudo-c + disasm + the
  * live park serial): the v2.21 M-Loader's post-splash decision tree is
@@ -4112,6 +4133,508 @@ static void mmcs_handoff_poll(void *opaque)
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
 }
 
+/* ===================== savestate (snapshot lane) =====================
+ * MMCS fork (savestate lane): vmstate for the machine's host-side
+ * state so `migrate exec:` + `-incoming exec:` snapshots work (the
+ * iteration-speed multiplier: boot-to-frontier once, then restore).
+ *
+ * DESIGN (the inventory — what must be saved vs. what is derived):
+ *  - GUEST RAM is auto-migrated: every region here is a
+ *    memory_region_init_ram block (mmcs.sdram/ram2/ram3/fileview/
+ *    killstk/srvpg/fsvt/flash/bootrom/lowslot, mld.*) — the RAM
+ *    migration streams them by name; the ROM-backed flash MR is
+ *    streamed too (it carries the env-gated BOOTFS/BOOTLD/REGFIX
+ *    patches + FILESHADOW overlay, which the re-run machine init
+ *    would re-apply, but streamed content is authoritative anyway).
+ *  - env-knob latches (mmcs_iatfix_on, c0arm, uwarm, fsvt_armed,
+ *    pgown_armed, the CPU env mmcs_*_active bits) are REBUILT from
+ *    the identical env at restore (documented requirement: the
+ *    restore process must launch with the same env + sidecar files;
+ *    the harness records them alongside the snapshot).
+ *  - static host tables that map VAs to backing pages MUST stream —
+ *    losing them would allocate FRESH scratch pages on the first
+ *    post-restore fault and re-seed stale init content over the
+ *    live guest state: the SRVPG map (VA->mmcs.srvpg page), the
+ *    PGOWN write-sticky table, the FILEVIEW/COWFIX maps (helper.c,
+ *    its own "mmcs/helper" vmsd).
+ *  - the REGVT hive tree is mutated at runtime (RegSetValueExW
+ *    applies, handle allocation) — flattened/rebuilt by the
+ *    "mmcs/regvt" vmsd below.
+ *  - the sh7777.c CMT/INTC/CPG model is NOT wired into this machine
+ *    (mmcs.c implements its own polled syscon at the same bases);
+ *    only the chanflash blocks are live (vmstate in sh7777.c).
+ *  - the L16/L18/L19 one-shot fire timers and the TICK/HDEVT/RINGNOP
+ *    delayed arms all live below the park point; the tick CHAIN
+ *    itself is free-floating (not a device timer) and is re-armed in
+ *    post_load. Diagnostics-only timers (census/schedtrace/dump/
+ *    jitfix sweeps) are not re-armed (log-only state).
+ */
+struct MmcsSnap {
+    uint32_t syscon[64];
+    uint32_t pfc[4];
+    uint32_t vintc[64];
+    uint32_t vintc_evt;
+    struct Mmcs2dgState dg;
+    uint32_t srvpg_map[1024][2];
+    uint32_t nsrvpg, srvpg_nxt;
+    struct mmcs_pgown_ent pgown[MMCS_PGOWN_SLOTS];
+    uint32_t pgown_nins, pgown_npin, pgown_novr;
+    struct mmcs_l16_ent l16[MMCS_L16_MAX];
+    int32_t l19_armed, l26_armed, l32_armed;
+    uint32_t l19_cadence, l26_cadence, l32_cadence;
+    uint32_t l19_max, l26_max, l32_max;
+    uint32_t l19_total, l26_total, l32_total;
+    uint8_t l19_sig[MMCS_L19_NSIG];
+    uint8_t l26_sig[MMCS_L19_NSIG];
+    uint8_t l32_sig[MMCS_L19_NSIG];
+    int32_t l19_have, l26_have, l32_have;
+    uint32_t l19_quiet, l19_nopick, l26_quiet, l32_quiet;
+    uint64_t tick_l19, tick_l26, tick_l32;
+    int32_t tick_live, hdevt_pending;
+};
+static struct MmcsSnap mmcs_snap;
+
+static int mmcs_machine_pre_save(void *opaque)
+{
+    struct MmcsSnap *s = opaque;
+    memcpy(s->syscon, syscon_c080, sizeof s->syscon);
+    memcpy(s->pfc, pfc_usb_st, sizeof s->pfc);
+    memcpy(s->vintc, mmcs_vintc_regs, sizeof s->vintc);
+    s->vintc_evt = mmcs_vintc_evt_code;
+    s->dg = mmcs_2dg;
+    memcpy(s->srvpg_map, mmcs_srvpg_map, sizeof s->srvpg_map);
+    s->nsrvpg = mmcs_nsrvpg;
+    s->srvpg_nxt = mmcs_srvpg_nxt;
+    memcpy(s->pgown, mmcs_pgown, sizeof s->pgown);
+    s->pgown_nins = mmcs_pgown_nins;
+    s->pgown_npin = mmcs_pgown_npin;
+    s->pgown_novr = mmcs_pgown_novr;
+    memcpy(s->l16, mmcs_l16_ents, sizeof s->l16);
+    s->l19_armed = mmcs_l19_armed;
+    s->l26_armed = mmcs_l26_armed;
+    s->l32_armed = mmcs_l32_armed;
+    s->l19_cadence = mmcs_l19_cadence_ms;
+    s->l26_cadence = mmcs_l26_cadence_ms;
+    s->l32_cadence = mmcs_l32_cadence_ms;
+    s->l19_max = mmcs_l19_max_deliv;
+    s->l26_max = mmcs_l26_max_deliv;
+    s->l32_max = mmcs_l32_max_deliv;
+    s->l19_total = mmcs_l19_total;
+    s->l26_total = mmcs_l26_total;
+    s->l32_total = mmcs_l32_total;
+    memcpy(s->l19_sig, mmcs_l19_sig, MMCS_L19_NSIG);
+    memcpy(s->l26_sig, mmcs_l26_sig, MMCS_L19_NSIG);
+    memcpy(s->l32_sig, mmcs_l32_sig, MMCS_L19_NSIG);
+    s->l19_have = mmcs_l19_sig_have;
+    s->l26_have = mmcs_l26_sig_have;
+    s->l32_have = mmcs_l32_sig_have;
+    s->l19_quiet = mmcs_l19_quiet;
+    s->l19_nopick = mmcs_l19_nopick;
+    s->l26_quiet = mmcs_l26_quiet;
+    s->l32_quiet = mmcs_l32_quiet;
+    s->tick_l19 = mmcs_tick_l19;
+    s->tick_l26 = mmcs_tick_l26;
+    s->tick_l32 = mmcs_tick_l32;
+    s->tick_live = mmcs_tick_live;
+    s->hdevt_pending = mmcs_hdevt_pending;
+    return 0;
+}
+
+static int mmcs_machine_post_load(void *opaque, int version_id)
+{
+    struct MmcsSnap *s = opaque;
+    memcpy(syscon_c080, s->syscon, sizeof s->syscon);
+    memcpy(pfc_usb_st, s->pfc, sizeof s->pfc);
+    memcpy(mmcs_vintc_regs, s->vintc, sizeof s->vintc);
+    mmcs_vintc_evt_code = s->vintc_evt;
+    mmcs_2dg = s->dg;
+    memcpy(mmcs_srvpg_map, s->srvpg_map, sizeof s->srvpg_map);
+    mmcs_nsrvpg = s->nsrvpg;
+    mmcs_srvpg_nxt = s->srvpg_nxt;
+    memcpy(mmcs_pgown, s->pgown, sizeof s->pgown);
+    mmcs_pgown_nins = s->pgown_nins;
+    mmcs_pgown_npin = s->pgown_npin;
+    mmcs_pgown_novr = s->pgown_novr;
+    memcpy(mmcs_l16_ents, s->l16, sizeof s->l16);
+    mmcs_l19_armed = s->l19_armed;
+    mmcs_l26_armed = s->l26_armed;
+    mmcs_l32_armed = s->l32_armed;
+    mmcs_l19_cadence_ms = s->l19_cadence;
+    mmcs_l26_cadence_ms = s->l26_cadence;
+    mmcs_l32_cadence_ms = s->l32_cadence;
+    mmcs_l19_max_deliv = s->l19_max;
+    mmcs_l26_max_deliv = s->l26_max;
+    mmcs_l32_max_deliv = s->l32_max;
+    mmcs_l19_total = s->l19_total;
+    mmcs_l26_total = s->l26_total;
+    mmcs_l32_total = s->l32_total;
+    memcpy(mmcs_l19_sig, s->l19_sig, MMCS_L19_NSIG);
+    memcpy(mmcs_l26_sig, s->l26_sig, MMCS_L19_NSIG);
+    memcpy(mmcs_l32_sig, s->l32_sig, MMCS_L19_NSIG);
+    mmcs_l19_sig_have = s->l19_have;
+    mmcs_l26_sig_have = s->l26_have;
+    mmcs_l32_sig_have = s->l32_have;
+    mmcs_l19_quiet = s->l19_quiet;
+    mmcs_l19_nopick = s->l19_nopick;
+    mmcs_l26_quiet = s->l26_quiet;
+    mmcs_l32_quiet = s->l32_quiet;
+    mmcs_tick_l19 = s->tick_l19;
+    mmcs_tick_l26 = s->tick_l26;
+    mmcs_tick_l32 = s->tick_l32;
+    mmcs_tick_live = s->tick_live;
+    mmcs_hdevt_pending = s->hdevt_pending;
+
+    /* Re-arm the free-floating tick chain (the scheduler tick + every
+     * daemon scan rides it; anonymous QEMUTimers are not migrated).
+     * The one-shot arms (VINTC/HDEVT/RINGNOP/L16/L18 lists) live
+     * below the park point and are intentionally NOT re-armed. */
+    if (mmcs_tick_live) {
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mmcs_tick_deliver,
+                                    NULL);
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+        fprintf(stderr, "MMCS-SNAP: tick chain re-armed after restore\n");
+    }
+    /* Re-target the live console at the presented surface (a pure
+     * host-side display pointer — the guest-side surface registers
+     * were restored with the 2dg model above). */
+    if (mmcs_2dg.armed && (mmcs_2dg.surf_a || mmcs_2dg.tex)) {
+        mmcs_2dg_last = 0;
+        mmcs_2dg_present_console(mmcs_2dg.surf_a
+                                 ? (mmcs_2dg.surf_a & 0x1FFFFFFF)
+                                 : (mmcs_2dg.tex & 0x1FFFFFFF));
+    }
+    fprintf(stderr, "MMCS-SNAP: machine state restored (srvpg=%d "
+            "pgown ins/pin=%u/%u, l16[0] pending=%d daemon=%d, "
+            "l26/l32 armed=%d/%d totals=%u/%u)\n",
+            mmcs_nsrvpg, mmcs_pgown_nins, mmcs_pgown_npin,
+            mmcs_l16_ents[0].pending, mmcs_l16_ents[0].daemon,
+            mmcs_l26_armed, mmcs_l32_armed, mmcs_l26_total,
+            mmcs_l32_total);
+    return 0;
+}
+
+static const VMStateDescription vmstate_mmcs_l16_ent = {
+    .name = "mmcs/l16_ent",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(evt_va, struct mmcs_l16_ent),
+        VMSTATE_UINT32(stub_va, struct mmcs_l16_ent),
+        VMSTATE_UINT32(evt_code, struct mmcs_l16_ent),
+        VMSTATE_UINT32(slot_pa, struct mmcs_l16_ent),
+        VMSTATE_INT32(pending, struct mmcs_l16_ent),
+        VMSTATE_INT32(daemon, struct mmcs_l16_ent),
+        VMSTATE_INT32(strikes, struct mmcs_l16_ent),
+        VMSTATE_UINT32(ndeliv, struct mmcs_l16_ent),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_mmcs_pgown_ent = {
+    .name = "mmcs/pgown_ent",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(va, struct mmcs_pgown_ent),
+        VMSTATE_UINT32(asid, struct mmcs_pgown_ent),
+        VMSTATE_UINT32(pa, struct mmcs_pgown_ent),
+        VMSTATE_UINT32(pinned, struct mmcs_pgown_ent),
+        VMSTATE_UINT32(nremap, struct mmcs_pgown_ent),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_mmcs_snap = {
+    .name = "mmcs/machine",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = mmcs_machine_pre_save,
+    .post_load = mmcs_machine_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(syscon, struct MmcsSnap, 64),
+        VMSTATE_UINT32_ARRAY(pfc, struct MmcsSnap, 4),
+        VMSTATE_UINT32_ARRAY(vintc, struct MmcsSnap, 64),
+        VMSTATE_UINT32(vintc_evt, struct MmcsSnap),
+        VMSTATE_INT32(dg.armed, struct MmcsSnap),
+        VMSTATE_UINT32(dg.dl_base, struct MmcsSnap),
+        VMSTATE_UINT32(dg.surf_a, struct MmcsSnap),
+        VMSTATE_UINT32(dg.surf_b, struct MmcsSnap),
+        VMSTATE_UINT32(dg.mode, struct MmcsSnap),
+        VMSTATE_UINT32(dg.ctl, struct MmcsSnap),
+        VMSTATE_UINT32(dg.du00, struct MmcsSnap),
+        VMSTATE_UINT32(dg.du04, struct MmcsSnap),
+        VMSTATE_UINT32(dg.du_done, struct MmcsSnap),
+        VMSTATE_UINT32(dg.du0c, struct MmcsSnap),
+        VMSTATE_UINT32(dg.du18, struct MmcsSnap),
+        VMSTATE_UINT32_ARRAY(dg.ch, struct MmcsSnap, 0x400),
+        VMSTATE_UINT32(dg.tex, struct MmcsSnap),
+        VMSTATE_UINT32(dg.tex_w, struct MmcsSnap),
+        VMSTATE_UINT32(dg.tex_h, struct MmcsSnap),
+        VMSTATE_INT32(dg.nlog, struct MmcsSnap),
+        VMSTATE_UINT32(nsrvpg, struct MmcsSnap),
+        VMSTATE_UINT32(srvpg_nxt, struct MmcsSnap),
+        VMSTATE_UINT32_2DARRAY(srvpg_map, struct MmcsSnap, 1024, 2),
+        VMSTATE_STRUCT_ARRAY(pgown, struct MmcsSnap, MMCS_PGOWN_SLOTS, 1,
+                             vmstate_mmcs_pgown_ent, struct mmcs_pgown_ent),
+        VMSTATE_UINT32(pgown_nins, struct MmcsSnap),
+        VMSTATE_UINT32(pgown_npin, struct MmcsSnap),
+        VMSTATE_UINT32(pgown_novr, struct MmcsSnap),
+        VMSTATE_STRUCT_ARRAY(l16, struct MmcsSnap, MMCS_L16_MAX, 1,
+                             vmstate_mmcs_l16_ent, struct mmcs_l16_ent),
+        VMSTATE_INT32(l19_armed, struct MmcsSnap),
+        VMSTATE_INT32(l26_armed, struct MmcsSnap),
+        VMSTATE_INT32(l32_armed, struct MmcsSnap),
+        VMSTATE_UINT32(l19_cadence, struct MmcsSnap),
+        VMSTATE_UINT32(l26_cadence, struct MmcsSnap),
+        VMSTATE_UINT32(l32_cadence, struct MmcsSnap),
+        VMSTATE_UINT32(l19_max, struct MmcsSnap),
+        VMSTATE_UINT32(l26_max, struct MmcsSnap),
+        VMSTATE_UINT32(l32_max, struct MmcsSnap),
+        VMSTATE_UINT32(l19_total, struct MmcsSnap),
+        VMSTATE_UINT32(l26_total, struct MmcsSnap),
+        VMSTATE_UINT32(l32_total, struct MmcsSnap),
+        VMSTATE_UINT8_ARRAY(l19_sig, struct MmcsSnap, MMCS_L19_NSIG),
+        VMSTATE_UINT8_ARRAY(l26_sig, struct MmcsSnap, MMCS_L19_NSIG),
+        VMSTATE_UINT8_ARRAY(l32_sig, struct MmcsSnap, MMCS_L19_NSIG),
+        VMSTATE_INT32(l19_have, struct MmcsSnap),
+        VMSTATE_INT32(l26_have, struct MmcsSnap),
+        VMSTATE_INT32(l32_have, struct MmcsSnap),
+        VMSTATE_UINT32(l19_quiet, struct MmcsSnap),
+        VMSTATE_UINT32(l19_nopick, struct MmcsSnap),
+        VMSTATE_UINT32(l26_quiet, struct MmcsSnap),
+        VMSTATE_UINT32(l32_quiet, struct MmcsSnap),
+        VMSTATE_UINT64(tick_l19, struct MmcsSnap),
+        VMSTATE_UINT64(tick_l26, struct MmcsSnap),
+        VMSTATE_UINT64(tick_l32, struct MmcsSnap),
+        VMSTATE_INT32(tick_live, struct MmcsSnap),
+        VMSTATE_INT32(hdevt_pending, struct MmcsSnap),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* ---- "mmcs/regvt": the runtime-mutated registry hive tree ---- */
+#define MMCS_SNAP_RK 8192
+#define MMCS_SNAP_RV 16384
+#define MMCS_SNAP_RN (256 * 1024)
+#define MMCS_SNAP_RD (1024 * 1024)
+struct MmcsRegvtSnap {
+    int32_t armed;
+    int32_t nrk, nrv, nname, ndata;
+    int32_t rk_parent[MMCS_SNAP_RK];
+    int32_t rk_nameoff[MMCS_SNAP_RK];
+    int32_t rv_key[MMCS_SNAP_RV];
+    int32_t rv_nameoff[MMCS_SNAP_RV];
+    int32_t rv_type[MMCS_SNAP_RV];
+    int32_t rv_len[MMCS_SNAP_RV];
+    int32_t rv_dataoff[MMCS_SNAP_RV];
+    uint8_t names[MMCS_SNAP_RN];
+    uint8_t data[MMCS_SNAP_RD];
+    int32_t hkeys[64];
+};
+static struct MmcsRegvtSnap mmcs_regvt_snap;
+
+static int mmcs_regvt_snap_name(struct MmcsRegvtSnap *s, const char *n)
+{
+    size_t l = strlen(n) + 1;
+    if (s->nname + l > MMCS_SNAP_RN) {
+        return -1;
+    }
+    int off = s->nname;
+    memcpy(s->names + s->nname, n, l);
+    s->nname += l;
+    return off;
+}
+
+static int mmcs_regvt_flatten(struct MmcsRegvtSnap *s,
+                              struct mmcs_regkey *k, int32_t parent)
+{
+    if (s->nrk >= MMCS_SNAP_RK) {
+        return -1;
+    }
+    int32_t idx = s->nrk++;
+    int no = mmcs_regvt_snap_name(s, k->name);
+    if (no < 0) {
+        return -1;
+    }
+    s->rk_parent[idx] = parent;
+    s->rk_nameoff[idx] = no;
+    for (unsigned i = 0; i < k->nsub; i++) {
+        if (mmcs_regvt_flatten(s, k->sub[i], idx)) {
+            return -1;
+        }
+    }
+    for (unsigned i = 0; i < k->nvals; i++) {
+        struct mmcs_regval *v = &k->vals[i];
+        if (s->nrv >= MMCS_SNAP_RV || v->len > MMCS_SNAP_RD
+            || s->ndata + v->len > MMCS_SNAP_RD) {
+            return -1;
+        }
+        int vo = mmcs_regvt_snap_name(s, v->name ? v->name : "");
+        if (vo < 0) {
+            return -1;
+        }
+        s->rv_key[s->nrv] = idx;
+        s->rv_nameoff[s->nrv] = vo;
+        s->rv_type[s->nrv] = v->type;
+        s->rv_len[s->nrv] = v->len;
+        s->rv_dataoff[s->nrv] = s->ndata;
+        memcpy(s->data + s->ndata, v->data, v->len ? v->len : 0);
+        s->ndata += v->len;
+        s->nrv++;
+    }
+    return 0;
+}
+
+static void mmcs_regkey_free(struct mmcs_regkey *k)
+{
+    for (unsigned i = 0; i < k->nsub; i++) {
+        mmcs_regkey_free(k->sub[i]);
+    }
+    g_free(k->sub);
+    for (unsigned i = 0; i < k->nvals; i++) {
+        g_free(k->vals[i].name);
+        g_free(k->vals[i].data);
+    }
+    g_free(k->vals);
+    g_free(k->name);
+    g_free(k);
+}
+
+static int mmcs_regvt_pre_save(void *opaque)
+{
+    struct MmcsRegvtSnap *s = opaque;
+    memset(s, 0, sizeof *s);
+    for (unsigned i = 0; i < 64; i++) {
+        s->hkeys[i] = -1;
+    }
+    s->armed = mmcs_regvt_armed;
+    if (!mmcs_regvt_armed || !mmcs_regvt_root) {
+        return 0;
+    }
+    if (mmcs_regvt_flatten(s, mmcs_regvt_root, -1)) {
+        fprintf(stderr, "MMCS-SNAP: REGVT tree exceeds snapshot caps "
+                "(keys=%d vals=%d names=%d data=%d) - SAVE FAILED\n",
+                s->nrk, s->nrv, s->nname, s->ndata);
+        return -1;
+    }
+    /* second pass: map live key pointers to saved indices by
+     * re-walking the same DFS order (flatten order == visit order) */
+    {
+        struct mmcs_regkey *stack_order[MMCS_SNAP_RK];
+        int n = 0;
+        /* iterative DFS matching mmcs_regvt_flatten's order */
+        struct mmcs_regkey *root = mmcs_regvt_root;
+        struct { struct mmcs_regkey *k; unsigned next_sub; } st[512];
+        int sp = 0;
+        st[sp].k = root;
+        st[sp].next_sub = 0;
+        stack_order[n++] = root;
+        while (sp >= 0 && n < MMCS_SNAP_RK) {
+            struct mmcs_regkey *k = st[sp].k;
+            if (st[sp].next_sub < k->nsub) {
+                struct mmcs_regkey *c = k->sub[st[sp].next_sub++];
+                st[++sp].k = c;
+                st[sp].next_sub = 0;
+                stack_order[n++] = c;
+            } else {
+                sp--;
+            }
+        }
+        for (unsigned i = 0; i < mmcs_regvt_nhandles && i < 64; i++) {
+            if (!mmcs_regvt_handles[i]) {
+                continue;
+            }
+            for (int j = 0; j < n; j++) {
+                if (stack_order[j] == mmcs_regvt_handles[i]) {
+                    s->hkeys[i] = j;
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int mmcs_regvt_post_load(void *opaque, int version_id)
+{
+    struct MmcsRegvtSnap *s = opaque;
+    if (!s->armed || s->nrk <= 0) {
+        return 0;
+    }
+    /* rebuild the tree over the env-loaded one (same env re-parses the
+     * same .reg file; the saved tree carries the runtime mutations) */
+    struct mmcs_regkey **keys = g_new0(struct mmcs_regkey *, s->nrk);
+    for (int i = 0; i < s->nrk; i++) {
+        keys[i] = mmcs_regkey_new((const char *)s->names + s->rk_nameoff[i]);
+    }
+    for (int i = 0; i < s->nrv; i++) {
+        struct mmcs_regkey *k = keys[s->rv_key[i]];
+        mmcs_regkey_setval(k, (const char *)s->names + s->rv_nameoff[i],
+                           s->rv_type[i], s->data + s->rv_dataoff[i],
+                           s->rv_len[i]);
+    }
+    for (int i = 1; i < s->nrk; i++) {        /* key 0 == root */
+        struct mmcs_regkey *p = keys[s->rk_parent[i]];
+        if (p->nsub == p->subcap) {
+            p->subcap = p->subcap ? p->subcap * 2 : 8;
+            p->sub = g_renew(struct mmcs_regkey *, p->sub, p->subcap);
+        }
+        p->sub[p->nsub++] = keys[i];
+    }
+    if (mmcs_regvt_root) {
+        mmcs_regkey_free(mmcs_regvt_root);
+    }
+    mmcs_regvt_root = keys[0];
+    if (mmcs_regvt_handles) {
+        g_free(mmcs_regvt_handles);
+    }
+    mmcs_regvt_handles = g_new0(struct mmcs_regkey *, 64);
+    mmcs_regvt_nhandles = 64;
+    for (unsigned i = 0; i < 64; i++) {
+        if (s->hkeys[i] >= 0 && s->hkeys[i] < s->nrk) {
+            mmcs_regvt_handles[i] = keys[s->hkeys[i]];
+        }
+    }
+    mmcs_regvt_armed = 1;
+    g_free(keys);
+    fprintf(stderr, "MMCS-SNAP: REGVT hive restored (%d keys, %d values)\n",
+            s->nrk, s->nrv);
+    return 0;
+}
+
+static const VMStateDescription vmstate_mmcs_regvt = {
+    .name = "mmcs/regvt",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = mmcs_regvt_pre_save,
+    .post_load = mmcs_regvt_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(armed, struct MmcsRegvtSnap),
+        VMSTATE_INT32(nrk, struct MmcsRegvtSnap),
+        VMSTATE_INT32(nrv, struct MmcsRegvtSnap),
+        VMSTATE_INT32(nname, struct MmcsRegvtSnap),
+        VMSTATE_INT32(ndata, struct MmcsRegvtSnap),
+        VMSTATE_INT32_ARRAY(rk_parent, struct MmcsRegvtSnap, MMCS_SNAP_RK),
+        VMSTATE_INT32_ARRAY(rk_nameoff, struct MmcsRegvtSnap, MMCS_SNAP_RK),
+        VMSTATE_INT32_ARRAY(rv_key, struct MmcsRegvtSnap, MMCS_SNAP_RV),
+        VMSTATE_INT32_ARRAY(rv_nameoff, struct MmcsRegvtSnap, MMCS_SNAP_RV),
+        VMSTATE_INT32_ARRAY(rv_type, struct MmcsRegvtSnap, MMCS_SNAP_RV),
+        VMSTATE_INT32_ARRAY(rv_len, struct MmcsRegvtSnap, MMCS_SNAP_RV),
+        VMSTATE_INT32_ARRAY(rv_dataoff, struct MmcsRegvtSnap, MMCS_SNAP_RV),
+        VMSTATE_UINT8_ARRAY(names, struct MmcsRegvtSnap, MMCS_SNAP_RN),
+        VMSTATE_UINT8_ARRAY(data, struct MmcsRegvtSnap, MMCS_SNAP_RD),
+        VMSTATE_INT32_ARRAY(hkeys, struct MmcsRegvtSnap, 64),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void mmcs_vmstate_register(void)
+{
+    vmstate_register(NULL, 0, &vmstate_mmcs_snap, &mmcs_snap);
+    vmstate_register(NULL, 0, &vmstate_mmcs_regvt, &mmcs_regvt_snap);
+    mmcs_helper_vmstate_register();
+}
+
 static void mmcs_init(MachineState *machine)
 {
     SuperHCPU *cpu;
@@ -4119,6 +4642,13 @@ static void mmcs_init(MachineState *machine)
     uint8_t *boot_stub;
 
     cpu = SUPERH_CPU(cpu_create(machine->cpu_type));
+
+    /* savestate lane: register the machine/host-side vmstate (must
+     * precede both boot paths so snapshots work for the OS boot and
+     * the MLD acceptance mode alike). The restore process re-runs
+     * this init under the SAME env (see scripts/emul/snapshot.sh —
+     * the env is recorded with the snapshot). */
+    mmcs_vmstate_register();
 
     /* MMCS_SH4A (MLD-splash lane, 2026-11-18): the SoC is an SH-4A core
      * (SH7777 per dmac_sh7777.dll); the resident M-Loader's startup

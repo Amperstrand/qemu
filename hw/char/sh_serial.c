@@ -36,6 +36,7 @@
 #include "qapi/error.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
 #include "trace.h"
 
 #define SH_SERIAL_FLAG_TEND (1 << 0)
@@ -398,6 +399,35 @@ static const MemoryRegionOps sh_serial_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/* MMCS fork (savestate lane): the SH SCI/SCIF had no VMState, so a
+ * savevm/migrate of any sh4 machine silently dropped the serial
+ * register file (the MMCS OAL debug SCIF is polled by the kernel;
+ * losing smr/brr/scr/sr/fcr/fifo state garbles post-restore serial).
+ * qemu_irq/CharBackend are runtime wiring (rebuilt at machine init);
+ * feat/etu are qdev properties. */
+static const VMStateDescription vmstate_sh_serial = {
+    .name = "sh-serial",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT8(smr, SHSerialState),
+        VMSTATE_UINT8(brr, SHSerialState),
+        VMSTATE_UINT8(scr, SHSerialState),
+        VMSTATE_UINT8(dr, SHSerialState),
+        VMSTATE_UINT8(sr, SHSerialState),
+        VMSTATE_UINT16(fcr, SHSerialState),
+        VMSTATE_UINT8(sptr, SHSerialState),
+        VMSTATE_UINT8_ARRAY(rx_fifo, SHSerialState, SH_RX_FIFO_LENGTH),
+        VMSTATE_UINT8(rx_cnt, SHSerialState),
+        VMSTATE_UINT8(rx_tail, SHSerialState),
+        VMSTATE_UINT8(rx_head, SHSerialState),
+        VMSTATE_INT32(flags, SHSerialState),
+        VMSTATE_INT32(rtrg, SHSerialState),
+        VMSTATE_TIMER(fifo_timeout_timer, SHSerialState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void sh_serial_reset(DeviceState *dev)
 {
     SHSerialState *s = SH_SERIAL(dev);
@@ -468,6 +498,7 @@ static void sh_serial_class_init(ObjectClass *oc, void *data)
     device_class_set_props(dc, sh_serial_properties);
     dc->realize = sh_serial_realize;
     dc->reset = sh_serial_reset;
+    dc->vmsd = &vmstate_sh_serial;
     /* Reason: part of SuperH CPU/SoC, needs to be wired up */
     dc->user_creatable = false;
 }
