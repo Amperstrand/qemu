@@ -1032,9 +1032,18 @@ static bool mmcs_srvpg_seed_page(uint32_t page, uint8_t *out)
         if (s->off != 0xffffffffu) {
             uint32_t o = page - s->va;
             uint32_t n = MIN(0x1000u, s->size - o);
-            if (s->off + n <= mmcs_srvt_blob_len) {
+            if (s->off + o + n <= mmcs_srvt_blob_len) {
                 memset(out, 0, 0x1000);
-                memcpy(out, mmcs_srvt_blob + s->off, n);
+                /* L31: the page offset o must reach the copy source —
+                 * the L17 code copied from s->off alone, so EVERY page
+                 * past a section's first served the first page's bytes
+                 * (filesys .data page c00d1000 served the pre-bound
+                 * desc0-IAT head: the launch walker's count cell at
+                 * c00d1020 read IAT slot 8 = StringCchCopyW
+                 * 0x4003ed18, the insert-search walked 0x4003ed18
+                 * entries off the table end and the kill walk retired
+                 * the servant before the first CreateProcessW). */
+                memcpy(out, mmcs_srvt_blob + s->off + o, n);
                 return true;
             }
         } else if (page >= s->va && page < s->va + ((s->size + 0xFFF) & ~0xFFFu)) {
