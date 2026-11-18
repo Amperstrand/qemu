@@ -22,6 +22,7 @@
 
 #include "cpu.h"
 #include "exec/exec-all.h"
+#include "hw/core/tcg-cpu-ops.h"
 #include "exec/log.h"
 
 #if !defined(CONFIG_USER_ONLY)
@@ -126,6 +127,20 @@ int mmcs_pgown_fill(CPUSH4State *env, uint32_t address, uint32_t *pa,
 static struct { uint32_t va, pa; } mmcs_fvmap[16384];
 static int mmcs_nfvmap;
 static uint32_t mmcs_fvmap_nxt = 0x20000000;
+
+/* MMCS fork (L32): va->pa lookup over the FILEVIEW dedup table, for
+ * the hw-side wake daemons that must read a parked thread's stack
+ * wait-struct (the D0 stacks are P3/UTLB — no P1 identity). Returns
+ * 0 when unknown. */
+uint32_t mmcs_fv_va2pa(uint32_t va)
+{
+    for (int i = 0; i < mmcs_nfvmap; i++) {
+        if (mmcs_fvmap[i].va == (va & ~0xFFFu)) {
+            return mmcs_fvmap[i].pa + (va & 0xFFF);
+        }
+    }
+    return 0;
+}
 
 /* MMCS fork (L8): shared ILKFIX progress latch — set when the first
  * USER-mode KData-page fault maps VA 0x5000 (coredll PSL bind = the

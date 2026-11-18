@@ -209,6 +209,9 @@ typedef struct CPUArchState {
     memory_content **movcal_backup_tail;
 } CPUSH4State;
 
+/* MMCS fork (L32): FILEVIEW va->pa lookup for the hw-side daemons */
+uint32_t mmcs_fv_va2pa(uint32_t va);
+
 /**
  * SuperHCPU:
  * @env: #CPUSH4State

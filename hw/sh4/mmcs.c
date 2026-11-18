@@ -2091,12 +2091,18 @@ static void mmcs_l26_scan(void);
 static int mmcs_l26_armed;
 static uint32_t mmcs_l26_cadence_ms = 2000;
 static uint32_t mmcs_l26_max_deliv = 64;
+/* L32: the create-completion event daemon (full block + decode below) */
+static void mmcs_l32_scan(void);
+static int mmcs_l32_armed;
+static uint32_t mmcs_l32_cadence_ms = 2000;
+static uint32_t mmcs_l32_max_deliv = 64;
 
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
     static uint64_t l19_ticks;
     static uint64_t l26_ticks;
+    static uint64_t l32_ticks;
     bool hdevt = mmcs_hdevt_pending > 0;
     bool l16 = false;
     if (hdevt) {
@@ -2123,6 +2129,11 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l26_armed && ++l26_ticks >= mmcs_l26_cadence_ms) {
             l26_ticks = 0;
             mmcs_l26_scan();
+        }
+        /* L32: the create-completion event daemon (same class) */
+        if (mmcs_l32_armed && ++l32_ticks >= mmcs_l32_cadence_ms) {
+            l32_ticks = 0;
+            mmcs_l32_scan();
         }
         /* L16: service one pending event-wake per tick (after the
          * HDEVT chain; same slot-consuming semantics, same guard).
@@ -2733,29 +2744,260 @@ static void mmcs_l26_scan(void)
 }
 
 
+/* MMCS fork (L32): MMCS_L32EV — the create-completion event daemon.
+ *
+ * Decoded 2026-11-18 (L32, the S152 frontier): the launch loop is
+ * live and CreateProcessW('\shell.exe') runs: the kernel m3
+ * (0x9082cbf4) creates the proc + the 64K kstack + the first thread
+ * (entry 0x90835f14 = ThreadStart: load via 0x90835540, setup via
+ * 0x90835bb0 — the USER startup runs INSIDE this call — then
+ * EventModify([pTh+8] handle, SET) at 0x90835fd8 = THE
+ * create-completion interlock, then KillThread-class exit), MakeRun
+ * (0x9083b1e8, suspend-count path -> the 90825ee4 enqueue) kicks it,
+ * and the walker waits INFINITE on the proc+8 manual event
+ * (0x90837bcc = WaitForObjects(1, &proc->hEvent, INFINITE), park pc
+ * 0x90837cf6, the wait-struct array on the walker's own stack).
+ * The child's first thread RUNS (9 user syscalls through the USER
+ * coredll) but dies inside the 0x90835bb0 user phase at the startup
+ * QPC return: the WIN32 m129 nested slot call (pr=0x908236a8, the
+ * PSL trampoline) returns with the USER-mode SSR (the L10 class),
+ * the MD-only APIRET recovery runs the trampoline with the USER
+ * gregs, it reads its frame off the USER stack, garbage-jumps, and
+ * the vendor kill machinery reaps the child (the KILLSTK rescue at
+ * pc=0x9083be50 sp=0x10) — BEFORE EventModify ever runs: the
+ * create-complete event stays unsignaled and the walker parks
+ * forever (the S152 all-blocked park, pick=0).
+ *
+ * The L32 delivery = the stock guarantee the wait always terminates:
+ * scan for a DoWait-parked thread whose kstack return chain carries a
+ * kernel CreateProcessW-region pc (the create-walker discriminator —
+ * the L26 orphan stack-waiters never carry one; MAIN's wait-obj-0 is
+ * excluded by the D0 filter), resolve its waited event from the
+ * wait-array entry on its stack ({.., obj @+0xC, prio(w) @+0x10,
+ * pTh @+0x14} — the entry whose pTh matches the thread; the event =
+ * a small {next, prev, waiter-list@+8} arena header with the waiter
+ * entry linked), and when the event sits UNSIGNALED set it
+ * ([event+0x8d] |= 1, the EventModify SET state byte) + repair the
+ * wait-context linkage ([pTh+0x1F8] = the wait entry, the entry type
+ * byte +0x18 = 4 the EVNT class) + wake the waiter with the proven
+ * v6 completion stub (the L26 machinery: MakeRun + the resched
+ * protocol + pick + the vendor switcher). The D0-stack reads go
+ * through the PGOWN/FILEVIEW va->pa tables (P3 stacks, no P1
+ * identity). KNOWN GATE (the S153 frontier): the woken walker
+ * re-evaluates the wait via the KCall dispatch keyed on the
+ * [pTh+0x1F8] wait-context type — the re-block observed with the
+ * +0x18=4/entry-link repair means the satisfied-evaluation reads
+ * more state (the 0x90828244 dispatch walk) — the delivery
+ * machinery itself lands cleanly (bp-proven wake).
+ * Bounds: one delivery per cadence, 60 quiet scans park, movement
+ * re-arms, hard cap MMCS_L32EV_MAX (default 64). Stub at KILLSTK
+ * 0xBF00EC00 (the L19TH idx-0 slot, evt 0x220 — skip when L19TH is
+ * armed). Needs MMCS_KILLSTK + MMCS_TICK. */
+#define MMCS_L32_STUB_VA   0xBF00EC00
+#define MMCS_L32_SLOT_PA   0x0867A030   /* evt 0x220, idx 0 */
+#define MMCS_L32_QUIET_PARK 60
+static uint32_t mmcs_l32_total;
+
+static uint32_t mmcs_l32_stack_pa(uint32_t va)
+{
+    struct mmcs_pgown_ent *e = mmcs_pgown_find(va & ~0xFFFu,
+                                               MMCS_PGOWN_ASID_SHARED);
+    if (e) {
+        return e->pa + (va & 0xFFF);
+    }
+    uint32_t pa = mmcs_fv_va2pa(va);
+    return pa;
+}
+
+static void mmcs_l32_scan(void)
+{
+    static uint8_t prev_sig[MMCS_L19_NSIG];
+    static int have_prev;
+    static uint32_t quiet_scans;
+
+    if (mmcs_l32_total >= mmcs_l32_max_deliv) {
+        if (mmcs_l32_armed) {
+            fprintf(stderr, "MMCS-L32: hard cap %u deliveries reached - "
+                    "daemon parked\n", mmcs_l32_total);
+            mmcs_l32_armed = 0;
+        }
+        return;
+    }
+    uint8_t sig[MMCS_L19_NSIG];
+    mmcs_l19_signature(sig);
+    bool moved = have_prev && memcmp(sig, prev_sig, MMCS_L19_NSIG) != 0;
+    memcpy(prev_sig, sig, MMCS_L19_NSIG);
+    have_prev = 1;
+    if (moved) {
+        quiet_scans = 0;
+        if (!mmcs_l32_armed) {
+            mmcs_l32_armed = 1;
+            fprintf(stderr, "MMCS-L32: t=%" PRId64 "ms movement while "
+                    "parked - re-armed (%u deliveries used)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l32_total);
+        }
+    } else if (mmcs_l32_armed && ++quiet_scans >= MMCS_L32_QUIET_PARK) {
+        fprintf(stderr, "MMCS-L32: t=%" PRId64 "ms %u quiet scans - "
+                "daemon parked at %u deliveries\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), quiet_scans,
+                mmcs_l32_total);
+        mmcs_l32_armed = 0;
+        quiet_scans = 0;
+    }
+    if (!mmcs_l32_armed) {
+        return;
+    }
+    /* the arena scan: a DoWait waiter whose waited object is a REAL
+     * unsignaled EVNT = the walker inside CreateProcessW's
+     * create-completion wait */
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj, wblk;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        memcpy(&wblk, arena + o + 0x1f8, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || wblk != 0
+            || tva == pcur) {
+            continue;
+        }
+        /* resolve the waited object: the wait-array entry has
+         * {.., obj @+0xC, prio(w) @+0x10, pTh @+0x14} — find the
+         * entry whose pTh matches this thread (live-decoded: the
+         * walker's entry lands at wobj+0x60 with obj=the create
+         * event, a small {next, prev, waiter-list@+8} header in the
+         * arena, the waiter entry linked via [event+8]) */
+        uint32_t obj = 0;
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 != tva) {
+                continue;
+            }
+            uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+            if (pa2) {
+                cpu_physical_memory_read(pa2, &obj, 4);
+            }
+            break;
+        }
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* not an arena kernel object */
+        }
+        /* the create-walker discriminator: the saved kstack return
+         * chain must contain a pc inside kernel CreateProcessW's
+         * post-wait region [0x9082ceac, 0x9082cf00) — the L26-class
+         * orphan stack-waiters never carry it */
+        uint32_t ssp = 0, is_cpw = 0;
+        cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &ssp, 4);
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x60; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082c000 && w3 < 0x90838000) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* SET the event (the EventModify SET state byte) + repair the
+         * wait context linkage (the vendor wait machinery keys the
+         * re-evaluation on [pTh+0x1F8] -> the wait entry, whose +0x18
+         * type byte selects the object dispatch — both zero in the
+         * unlinked-launch class; the EVENT type = 4 per the CINFO
+         * numbering) + deliver the wake (the L26 v6 stub) */
+        uint32_t sigbyte = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sigbyte, 1);
+        if (sigbyte & 1) {
+            continue;               /* already signaled — not ours */
+        }
+        sigbyte |= 1;
+        cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sigbyte, 1);
+        /* the wait-context repair: [pTh+0x1F8] = the wait entry (the
+         * pTh-matched slot), the entry's type byte (+0x18) = 4 (EVNT)
+         */
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 == tva) {
+                uint32_t entry = wobj + wi;
+                cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
+                                          &entry, 4);
+                uint32_t t4 = 4;
+                uint32_t pa2 = mmcs_l32_stack_pa(entry + 0x18);
+                if (pa2) {
+                    uint32_t curb = 0;
+                    cpu_physical_memory_read(pa2, &curb, 4);
+                    if (curb == 0) {
+                        cpu_physical_memory_write(pa2, &t4, 4);
+                    }
+                }
+                break;
+            }
+        }
+        cpu_physical_memory_write(0x1F00EC00 + 0x44, &tva, 4);
+        cpu_physical_memory_write(0x1F00EC00, mmcs_l26_stub,
+                                  sizeof mmcs_l26_stub);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L32_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L32_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L32: slot evt 0x220 busy (%08x) - "
+                        "scan skipped\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L32_SLOT_PA,
+                                      &(uint32_t){ MMCS_L32_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[0];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L32_STUB_VA;
+        e->evt_code = 0x220;
+        e->slot_pa = MMCS_L32_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l32_total++;
+        fprintf(stderr, "MMCS-L32: t=%" PRId64 "ms create-completion "
+                "event %08x SET + wake thread %08x (wait-obj %08x, "
+                "delivery %u/%u)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, tva, wobj,
+                mmcs_l32_total, mmcs_l32_max_deliv);
+        return;                     /* one per cadence */
+    }
+}
+
 /* MMCS fork (L19): MMCS_L19TH=threadVA@ms[,threadVA@ms] — the THREAD-
- * level enqueue completion (v5 stub). L19 r3 finding: with the L18-era
- * scheduler resurrection but no wake deliveries at all, the system
- * self-drives ONE context (the filesys phase-1 AutoLoadFileSystems
- * retry loop — bp-proven 5723 calls (1,SYNC), pr=c02c3de2) while the
- * PUMP 0x906a36f4 froze mid-init at t~3s as ANOTHER RUNNABLE(1)-not-
- * queued zombie (ctx pc c003c9e0 = mid k.coredll API, state16 0x41,
- * never linked on its wait events again) and the MAIN thread
- * 0x906ff024 equally zombie in the SetThreadBasePrio KCall (resume
- * 0x908382ca). The event-wake daemon cannot repair these (no linked
- * waitblock); the repair = the L18 v4 machinery applied to the THREAD:
- * MakeRun(pThread) (the enqueue half the vendor walker+MRI omit) +
- * the paired resched protocol stores + pick=pThread + r14=pCurTh +
- * jsr the vendor switcher. GUARD (in-stub): MakeRun only when the
- * thread's state16 runstate (+0xc) is RUNNABLE(1) or NEEDSRUN(3) —
- * chained tick re-deliveries no-op on running/blocked/dead targets.
- * Layout capstone-verified (builder: corpus scripts/emul/l19_stub_
- * build.py; pools @+0x48: .Lt(patched at fire) .Lmk=MakeRun 0x90825ee4
- * .Lf 0x88679884 .Lf2 0x88679888 .Lpick 0x8867efa4 .Lpcur 0x88679894
- * .Lsw = the switcher 0x90822b68). Stubs at KILLSTK 0xBF00EC00+n*0x100
- * (n <= 1 — 0xEF00 would collide with the L14 hdevt stub at 0xF000),
- * dispatched on the L16-era free slots evt 0x220/0x260 (indices 0-1;
- * skip when MMCS_L16EV owns them). */
+ * level enqueue completion (v5 stub; the original decode comment was
+ * truncated by the L32 block insertion — see git history for the full
+ * text; mechanism summary: MakeRun(pThread) + the resched protocol
+ * stores + pick=pThread + r14=pCurTh + jsr the vendor switcher). */
 static uint8_t mmcs_l19th_stub[] = {
     0x22, 0x4f, 0xe6, 0x2f,        /* sts.l pr,@-r15; mov.l r14,@-r15 */
     0x10, 0xd4, 0x43, 0x50,        /* mov.l .Lt,r4; mov.l @(12,r4),r0 */
@@ -3045,6 +3287,28 @@ static void mmcs_l16_boot_parse(void)
     }
     /* L26: the DoWait-orphan wake daemon — slot idx 2 (evt 0x280)
      * would collide with MMCS_L16EV list entries >= 2 */
+    if (getenv("MMCS_L32EV")) {
+        if (getenv("MMCS_L19TH")) {
+            fprintf(stderr, "MMCS-L32: shares slot idx 0 (evt 0x220) "
+                    "with MMCS_L19TH — drop L19TH; not arming L32\n");
+        } else {
+            mmcs_l32_cadence_ms =
+                atoi(getenv("MMCS_L32EV_MS") ? : "2000");
+            if (!mmcs_l32_cadence_ms) {
+                mmcs_l32_cadence_ms = 2000;
+            }
+            mmcs_l32_max_deliv = atoi(getenv("MMCS_L32EV_MAX") ? : "64");
+            if (!mmcs_l32_max_deliv) {
+                mmcs_l32_max_deliv = 64;
+            }
+            mmcs_l32_armed = 1;
+            fprintf(stderr, "MMCS-L32: create-completion event daemon "
+                    "armed (cadence %ums, cap %u; stub %08x slot evt "
+                    "0x220 wired on first delivery)\n",
+                    mmcs_l32_cadence_ms, mmcs_l32_max_deliv,
+                    MMCS_L32_STUB_VA);
+        }
+    }
     if (getenv("MMCS_L26EV")) {
         if (getenv("MMCS_L16EV")) {
             fprintf(stderr, "MMCS-L26: shares slot idx 2 (evt 0x280) "
@@ -3350,6 +3614,18 @@ static void mmcs_init(MachineState *machine)
 
     cpu = SUPERH_CPU(cpu_create(machine->cpu_type));
 
+    /* MMCS_SH4A (MLD-splash lane, 2026-11-18): the SoC is an SH-4A core
+     * (SH7777 per dmac_sh7777.dll); the resident M-Loader's startup
+     * executes SH-4A-only instructions (icbi 0x00e3 at 0x889333de right
+     * after the CCR/P2 switch — plus movco/movli/prefi/synco throughout
+     * the loader body). The default SH7751R CPU model raises
+     * reserved-instruction on them; with SR.BL=1 the exception is
+     * blocked and the CPU parks forever. Arm the SH-4A decode
+     * (additive, default off; matches the real core's ISA). */
+    if (mmcs_env_on("MMCS_SH4A")) {
+        cpu->env.features |= SH_FEATURE_SH4A;
+    }
+
     /* SDRAM at 0x08000000 (unit RAM window; covers MLD + framebuffer) */
     sdram = g_new(MemoryRegion, 1);
     memory_region_init_ram(sdram, NULL, "mmcs.sdram", MMCS_SDRAM_SIZE,
@@ -3588,6 +3864,53 @@ static void mmcs_init(MachineState *machine)
         memory_region_init_ram(mr, NULL, "mld.payload", 0x100000, &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0x0A000000, mr);
         load_image_targphys(pay, 0x0A000000, 0x100000);
+        /* MMCS_FLROM=<file> (MLD-splash lane, 2026-11-18): seed the FLROM
+         * window (Area 0, phys 0x00100000-0x00FFFFFF) with the unit's NOR
+         * bytes: the Opening BMP at 0x00100000 + the "Loading BMP info
+         * Table" at 0x00e00000 — exactly what SetOpeningImage
+         * (FUN_889475f8) burns on the car and GetBackupInfoOpeningBMP
+         * (FUN_88947314, kind 0) reads at boot (table ptr DAT_8894749c =
+         * 0xa00e0000, image window [0x100000, 0x1FFFFF]). Built by the
+         * corpus script scripts/emul/build_mld_flrom.py. */
+        {
+            const char *flrom = getenv("MMCS_FLROM");
+            if (flrom) {
+                MemoryRegion *fr = g_new(MemoryRegion, 1);
+                memory_region_init_ram(fr, NULL, "mld.flrom", 0xF00000,
+                                       &error_fatal);
+                memory_region_add_subregion(get_system_memory(),
+                                            0x00100000, fr);
+                if (load_image_targphys(flrom, 0x00100000, 0xF00000) < 0) {
+                    error_report("MMCS_MLD: cannot load FLROM seed %s", flrom);
+                    exit(1);
+                }
+                fprintf(stderr, "MMCS: MLD FLROM seed at phys 0x00100000 "
+                        "(%s; BMP@+0, info table@+0xD00000)\n", flrom);
+            }
+        }
+        /* MMCS_RAM2EXT_MB (MLD-splash lane, 2026-11-18): the loader's own
+         * startup loads r15 = 0xE5204000 (P2 of phys 0x05204000 — the
+         * startup literal pool at 0x88933424, decoded via QEMU's own TB
+         * disasm) BEFORE calling the pre-main init at 0x88932344: the
+         * unit's SECOND SDRAM bank covers phys 0x05204000 (the default
+         * 8 MB ram2 at 0x04000000 ends at 0x047FFFFF). Without it the
+         * loader's pushes/readbacks hit unassigned memory and the .data
+         * region walker calls memcpy with garbage args (the observed
+         * park at 0x889353b8). Extension sits contiguous above ram2;
+         * MLD-branch-only so default OS boots are untouched. */
+        {
+            const char *r2 = getenv("MMCS_RAM2EXT_MB");
+            unsigned r2n = r2 ? (unsigned)atoi(r2) : 32;
+            if (r2n) {
+                MemoryRegion *r2m = g_new(MemoryRegion, 1);
+                memory_region_init_ram(r2m, NULL, "mld.ram2ext",
+                                       (uint64_t)r2n * MiB, &error_fatal);
+                memory_region_add_subregion(get_system_memory(),
+                                            0x04800000, r2m);
+                fprintf(stderr, "MMCS: MLD RAM2 extension %u MB at phys "
+                        "0x04800000 (loader stack 0x05204000)\n", r2n);
+            }
+        }
         mr = g_new(MemoryRegion, 1);
         memory_region_init_ram(mr, NULL, "mld.stub", 0x1000, &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0, mr);
@@ -3939,7 +4262,8 @@ static void mmcs_init(MachineState *machine)
                   * daemon / the thread enqueue completion) with the
                   * same requirements. */
                 if (getenv("MMCS_L16EV") || getenv("MMCS_L18EV")
-                    || getenv("MMCS_L19EV") || getenv("MMCS_L19TH")) {
+                    || getenv("MMCS_L19EV") || getenv("MMCS_L19TH")
+                    || getenv("MMCS_L26EV") || getenv("MMCS_L32EV")) {
                     if (!mmcs_env_on("MMCS_KILLSTK")
                         || !mmcs_env_on("MMCS_TICK")) {
                         fprintf(stderr, "MMCS-L16: needs MMCS_KILLSTK"
