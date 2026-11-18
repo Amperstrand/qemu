@@ -132,6 +132,12 @@ static uint32_t mmcs_fvmap_nxt = 0x20000000;
  * the hw-side wake daemons that must read a parked thread's stack
  * wait-struct (the D0 stacks are P3/UTLB — no P1 identity). Returns
  * 0 when unknown. */
+
+/* MMCS fork (S159): hw/sh4/mmcs.c clears this while the MLD FLROM owns
+ * phys [0,16MB) (the L26 P1 servant-alias claim would hijack the
+ * loader's own P1 NOR reads); restored at the handoff FLROM retirement */
+extern int mmcs_p1_alias_enabled;
+
 uint32_t mmcs_fv_va2pa(uint32_t va)
 {
     for (int i = 0; i < mmcs_nfvmap; i++) {
@@ -2525,6 +2531,12 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     if (mmu_idx != MMU_USER_IDX
         && (mmcs_ilkfix_user_seen || mmcs_c0arm)
         && mmcs_iatfix_on
+        && mmcs_p1_alias_enabled      /* S159: off while the MLD FLROM
+                                       * owns phys [0,16MB) — the loader's
+                                       * P1 NOR reads (the Opening BMP at
+                                       * 0x80100000) must not be claimed
+                                       * as servant aliases; restored at
+                                       * the handoff FLROM retirement */
         && (uint32_t)address >= 0x80000000
         && (uint32_t)address < 0x81000000
         && (access_type == MMU_INST_FETCH
