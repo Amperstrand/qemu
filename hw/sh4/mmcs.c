@@ -3142,7 +3142,12 @@ static void mmcs_l26_scan(void)
 #define MMCS_L32_QUIET_PARK 60
 static uint32_t mmcs_l32_total;
 
-static uint32_t mmcs_l32_stack_pa(uint32_t va)
+/* MMCS fork (L33): exported for the CBRET callback-return completion
+ * (target/sh4/helper.c) — the D0 kstacks are P3/UTLB (no P1 identity),
+ * so kernel-stack frame writes must resolve through the PGOWN
+ * write-sticky table first, the FILEVIEW dedup table second (the L32
+ * daemon discipline). Returns 0 when unknown. */
+uint32_t mmcs_stack_va2pa(uint32_t va)
 {
     struct mmcs_pgown_ent *e = mmcs_pgown_find(va & ~0xFFFu,
                                                MMCS_PGOWN_ASID_SHARED);
@@ -3151,6 +3156,11 @@ static uint32_t mmcs_l32_stack_pa(uint32_t va)
     }
     uint32_t pa = mmcs_fv_va2pa(va);
     return pa;
+}
+
+static uint32_t mmcs_l32_stack_pa(uint32_t va)
+{
+    return mmcs_stack_va2pa(va);
 }
 
 static void mmcs_l32_scan(void)
@@ -4561,6 +4571,16 @@ static void mmcs_init(MachineState *machine)
              * unwind the call properly; see the L10 decode there).
              * Needs the launch lane (KILK-class combo) to matter. */
             cpu->env.mmcs_apiret_active = 1;
+        }
+        if (getenv("MMCS_CBRET")) {
+            /* Arm the L33 callback-return completion (helper.c: the -1
+             * marker slot 0xfffffdff = the vendor's PerformCallBack
+             * return; with the launch-side continuation lost
+             * ([pTh+0x1C]==0) the plain-API face cycles into the
+             * user-mode P1 fetch death — synthesize the pending
+             * ThreadStart setup continuation so the vendor's own
+             * 0x908236f8 resume face runs; see the L33 decode there). */
+            cpu->env.mmcs_cbret_active = 1;
         }
         if (getenv("MMCS_COWFIX")) {
             /* Arm the COWFIX fork-side COW for user .data write

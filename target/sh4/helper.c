@@ -142,6 +142,27 @@ uint32_t mmcs_fv_va2pa(uint32_t va)
     return 0;
 }
 
+/* MMCS fork (L33): resolve a guest VA through the LIVE UTLB (get_mmu_
+ * address's own hit formula; ASID-agnostic — kernel stack mappings are
+ * SH or kernel-ASID). A freshly ldtlb'd kstack page may not yet be in
+ * any host-side table (PGOWN/FILEVIEW), but the guest UTLB always
+ * holds it. Returns 0 when no valid entry covers the VA. */
+static uint32_t mmcs_utlb_va2pa(CPUSH4State *env, uint32_t va)
+{
+    for (int i = 0; i < UTLB_SIZE; i++) {
+        const tlb_t *e = &env->utlb[i];
+        if (!e->v) {
+            continue;
+        }
+        uint32_t start = (e->vpn << 10) & ~(e->size - 1);
+        if (va >= start && va < start + e->size) {
+            return ((e->ppn << 10) & ~(e->size - 1))
+                   | (va & (e->size - 1));
+        }
+    }
+    return 0;
+}
+
 /* MMCS fork (L8): shared ILKFIX progress latch — set when the first
  * USER-mode KData-page fault maps VA 0x5000 (coredll PSL bind = the
  * launches are live, the early IRQ-init walk is past). Gates (a) the
@@ -196,6 +217,126 @@ void superh_cpu_do_interrupt(CPUState *cs)
         }
     }
     env->in_sleep = 0;
+
+    /* MMCS fork: MMCS_CBRET (L33) — the first-user-process callback-return
+     * completion. DECODE (L33, step-trails l33_probeB/C + the SLOTTRACE
+     * census + the ROM disasm): the vendor services EVERY user API slot
+     * through the PSL trampoline at 0x908235fa (exception entry
+     * 0x90822a80 computes r0 = (SPC-0xfffffe01)>>1 = the method index and
+     * jumps there with SSR in r2). The head special-cases index -1 (the
+     * slot 0xfffffdff): with [pTh+0x1C] != 0 it takes the RESUME face
+     * 0x908236f8 (r15 := [pTh+0x1C] = a kernel restart frame, then the
+     * post-API 0x9082a6c0 chain-pop and the epilogue at 0x908236a8 which
+     * jmps @[[frame+0x3C]] with r15=[frame+0x40] = the KERNEL
+     * continuation); with [pTh+0x1C] == 0 it takes the plain-API face
+     * (the marker method 0x908325b8 = "[pCurTh+0x38]=50", then the
+     * user-return rte to SPC=[F+0x3C]=pr). The stock mirror = the
+     * PerformCallBack protocol: the kernel launches a user callback with
+     * pr pre-loaded 0xfffffdff (the vendor's 0x908238a4 driver does
+     * exactly this: lds 0xfffffdff,pr; rte to user), the callback stub
+     * ends with `rts` to the popped marker, and the -1 trap means "the
+     * callback returned" — the kernel resumes its saved continuation.
+     * The ThreadStart setup (0x90835bb0) launches the child's user phase
+     * this way (jsr 0x90823778 @0x90835e74, pr=0x90835e78); its frame
+     * ({r8..r13,pr} pushed at [kstack_top-0xE0..-0xC4]) sits untouched
+     * below the trampoline's user-call frame slot (kstack_top-0x70-0x80:
+     * the cells the trampoline writes at [F+0x3C..F+0x78] do not overlap
+     * [launch_sp .. launch_sp+0x18] — bp-verified in the probeC trail).
+     * BUG (the S153/S154 child death): in our emulation [pTh+0x1C] is 0
+     * at the -1 trap, so the plain-API face runs: its rte goes to
+     * SPC=[F+0x3C]=pr=0xfffffdff (the slot again — the cascade's second
+     * -1 trap now carries pr=0x908236a8, the epilogue's own leftover),
+     * whose frame {pc=0x908236a8, sp=user, flag=1} rtes to the kernel P1
+     * trampoline IN USER MODE -> 0x0e0 -> the L10 APIRET MD-only fix
+     * resumes the epilogue with the USER r15 -> it reads its frame off
+     * the USER stack -> garbage-jump -> the kill machinery reaps the
+     * child BEFORE EventModify SET (0x90835fd8) — the S152 park. (The two
+     * reverted S154 APIRET2 attempts failed exactly here: the restart
+     * record on the kstack {908236a8, user-sp, 1} re-executes the loop —
+     * its pc cell IS the direct-return, so a frame re-drive cycles; only
+     * the missing [pTh+0x1C] continuation breaks it; a synthesized
+     * resume-record delivery was also tried and REJECTED: the natural
+     * frame's chain cells ([+0x38]/[+0x48]/[+0x50]) are unknowable at
+     * trap time, and the zeroed record drove the post-API validator
+     * (0x9082a4f8) into an unbounded KCall-poll recursion, -0x2AC of
+     * kstack per level). FIX (the direct completion): at the -1 marker
+     * trap (pc=pr=0xfffffdff, USER mode) with [pTh+0x1C]==0, guarded by
+     * the ThreadStart fingerprint (the setup's saved pr at
+     * [kstack_top-0xE0+0x20] in [0x90835f14,0x90836000)), consume the
+     * trap and jump STRAIGHT to the setup's post-launch continuation:
+     * SR.MD on, r15 = kstack_top-0xE0 (the setup's launch sp), pc =
+     * 0x90835e78 (ROM constant). The vendor's own exit sequence does the
+     * rest — 0x90835e78 -> add#32 -> the pops restore r8-r13+pr from the
+     * intact kstack frame -> rts into ThreadStart at 0x90835fb2 ->
+     * EventModify SET 0x90835fd8 -> the create event satisfies and the
+     * create-walker wakes NATURALLY (no daemon, no repair) -> the launch
+     * cascade continues (the observed post-fix attractor: the kernel's
+     * -30/0xE2 nested-slot class firing + a SECOND user thread running
+     * its own startup through the USER coredll). Bounds:
+     * MMCS_CBRET_MAX deliveries (default 64). The kstack is P3 (no P1
+     * identity) — the fingerprint read resolves through the live guest
+     * UTLB first (a fresh kstack page may be in no host-side table),
+     * the PGOWN/FILEVIEW exports second (the L32 discipline). */
+    if (env->mmcs_cbret_active && do_exp
+        && cs->exception_index == 0x0e0
+        && !(env->sr & (1u << SR_MD))
+        && env->pc == 0xfffffdffu
+        && env->pr == 0xfffffdffu) {
+        static uint32_t ncbret, maxcb;
+        if (!maxcb) {
+            maxcb = 64;
+            const char *m = getenv("MMCS_CBRET_MAX");
+            if (m) {
+                maxcb = (uint32_t)atoi(m) ? : 1;
+            }
+        }
+        uint32_t pth = 0, ktop = 0;
+        cpu_physical_memory_read(0x08679894, &pth, 4);
+        if (pth >= 0x90600000u && pth < 0x90800000u) {
+            cpu_physical_memory_read((pth & 0x1fffffffu) + 0x2c, &ktop, 4);
+        }
+        uint32_t ktop_pa = (ktop >= 0xD0000000u && ktop < 0xE0000000u)
+                           ? (mmcs_utlb_va2pa(env, ktop)
+                              ? : mmcs_stack_va2pa(ktop)) : 0;
+        uint32_t kpage_pa = ktop_pa & ~0xFFFu;
+        if (ktop_pa && ncbret < maxcb) {
+            uint32_t launch_sp = ktop - 0xE0;
+            uint32_t saved_pr = 0;
+            /* the setup prologue pushed {r8..r13,pr} then add#-32:
+             * [launch_sp+0x20]=pr, [launch_sp+0x24]=r13 .. [+0x38]=r8
+             * (the continuation's add#32 + pops expect exactly this) */
+            cpu_physical_memory_read(kpage_pa + (launch_sp & 0xFFF) + 0x20,
+                                     &saved_pr, 4);
+            uint32_t pend = 1;
+            cpu_physical_memory_read((pth & 0x1fffffffu) + 0x1c, &pend, 4);
+            if (!pend
+                && saved_pr >= 0x90835f14u && saved_pr < 0x90836000u) {
+                /* DIRECT completion: jump straight to the setup's
+                 * post-launch continuation in kernel mode with the
+                 * setup's launch sp — the vendor's own epilogue
+                 * (0x90835e78 -> add#32 -> pops -> rts) restores
+                 * r8-r13+pr from the intact kstack frame and returns
+                 * into ThreadStart, which proceeds to EventModify SET.
+                 * No frame synthesis, no post-API chain walk (the
+                 * synthesized-record drive recursed the KCall poll:
+                 * the natural frame's chain cells are unknowable at
+                 * trap time). */
+                env->sr |= (1u << SR_MD);
+                env->gregs[15] = launch_sp;
+                env->pc = 0x90835e78;
+                cs->exception_index = -1;
+                ncbret++;
+                fprintf(stderr, "MMCS: CBRET callback-return completed, "
+                        "th=%08x kstack=%08x -> setup continuation "
+                        "90835e78 (delivery %u/%u)\n", pth, ktop,
+                        ncbret, maxcb);
+                return;
+            }
+        }
+        /* fall through: the guards failed (a pending continuation
+         * exists, or the kstack frame is not a ThreadStart launch) —
+         * the vendor dispatch proceeds untouched */
+    }
 
     /* MMCS fork: MMCS_APIRET (L10) — recover the kernel PSL direct-return
      * that lands in a USER thread. Decode (L10): WIN32 implicit-set
@@ -301,6 +442,24 @@ void superh_cpu_do_interrupt(CPUState *cs)
                 env->sr, env->ssr, env->spc, env->gregs[15],
                 env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7],
                 env->pr);
+        /* MMCS_SLOTTRACE (L33): for slot-class traps, decode the vendor
+         * method index (idx = (pc - 0xfffffe01) >> 1; the exception entry
+         * 0x90822a98 computes exactly this) and the trampoline head's
+         * branch selector [pCurTh+0x1C] (nonzero at a -1-slot trap = the
+         * kernel-continuation resume path 0x908236f8; zero = the plain
+         * API face — the L33 death-class discriminator). */
+        if (getenv("MMCS_SLOTTRACE") && env->pc >= 0xfffefe03u) {
+            uint32_t pth = 0, c1c = 0, c38 = 0;
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            if (pth >= 0x90600000u && pth < 0x90800000u) {
+                cpu_physical_memory_read((pth & 0x1fffffffu) + 0x1c,
+                                         &c1c, 4);
+                cpu_physical_memory_read((pth & 0x1fffffffu) + 0x38,
+                                         &c38, 4);
+            }
+            fprintf(stderr, "SLOT idx=%d pth=%08x [1C]=%08x [38]=%08x\n",
+                    (int32_t)(env->pc - 0xfffffe01u) >> 1, pth, c1c, c38);
+        }
         /* MMCS_SYSTRACE_PR=<hex>[,<hex>...]: when pr matches, dump the
          * caller stack frame — decodes who calls through the coredll
          * wrapper identified by pr. MMCS_SYSTRACE_MEM=a,b,c: also dump

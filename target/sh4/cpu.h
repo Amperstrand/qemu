@@ -180,6 +180,8 @@ typedef struct CPUArchState {
     uint32_t mmcs_ringfix_active; /* MMCS fork: RINGFIX uHAL ring ret */
     uint32_t mmcs_kapifix_active; /* MMCS fork: KAPIFIX kapi thunk bind */
     uint32_t mmcs_apiret_active; /* MMCS fork: APIRET direct-return MD fix */
+    uint32_t mmcs_cbret_active; /* MMCS fork: CBRET callback-return
+                                   * continuation completion (L33) */
     uint32_t mmcs_killstk_active; /* MMCS fork: KILLSTK kill-dispatch stack */
     uint32_t mmcs_srvpg_active; /* MMCS fork: SRVPG servant .text page-in
                                    * synthesis (L12) */
@@ -211,6 +213,9 @@ typedef struct CPUArchState {
 
 /* MMCS fork (L32): FILEVIEW va->pa lookup for the hw-side daemons */
 uint32_t mmcs_fv_va2pa(uint32_t va);
+
+/* MMCS fork (L33): PGOWN/FILEVIEW stack va->pa for the CBRET completion */
+uint32_t mmcs_stack_va2pa(uint32_t va);
 
 /**
  * SuperHCPU:
