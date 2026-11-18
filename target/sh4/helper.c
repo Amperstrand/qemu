@@ -291,9 +291,14 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * calibration: TRA 0x71 = RegQueryValueExW per the REGFIX hook). */
     if (getenv("MMCS_SYSTRACE") && do_exp
         && (env->pc & 1 || env->pc >= 0xffff0000)) {
-        /* flycast wince.h pattern: CE syscalls = odd/hi fetch exceptions */
-        fprintf(stderr, "SYSCALL exp=%03x pc=%08x r4=%08x r5=%08x "
+        /* flycast wince.h pattern: CE syscalls = odd/hi fetch exceptions.
+         * L33: sr/ssr/spc/r15 added — the nested-slot decode needs the
+         * MODE at the trap boundary (user P4 fetch = 0x0e0 native;
+         * kernel slot calls arrive 0x180->KSLOT or via rte re-entry). */
+        fprintf(stderr, "SYSCALL exp=%03x pc=%08x sr=%08x ssr=%08x "
+                "spc=%08x r15=%08x r4=%08x r5=%08x "
                 "r6=%08x r7=%08x pr=%08x\n", cs->exception_index, env->pc,
+                env->sr, env->ssr, env->spc, env->gregs[15],
                 env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7],
                 env->pr);
         /* MMCS_SYSTRACE_PR=<hex>[,<hex>...]: when pr matches, dump the
@@ -1927,8 +1932,17 @@ hwaddr superh_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
     target_ulong physical;
     int prot;
 
-    if (get_physical_address(&cpu->env, &physical, &prot, addr, MMU_DATA_LOAD)
-            == MMU_OK) {
+    int rdbg = get_physical_address(&cpu->env, &physical, &prot, addr,
+                                    MMU_DATA_LOAD);
+    if (getenv("MMCS_DBGVA")) {
+        static int ndbg;
+        if (ndbg++ < 32) {
+            fprintf(stderr, "GETPHYSDBG va=%08" VADDR_PRIx " ret=%d pa=%08x "
+                    "sr=%08x mmucr=%08x pc=%08x\n", addr, rdbg, physical,
+                    cpu->env.sr, cpu->env.mmucr, cpu->env.pc);
+        }
+    }
+    if (rdbg == MMU_OK) {
         return physical;
     }
 

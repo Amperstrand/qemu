@@ -1474,7 +1474,330 @@ static void mmcs_fbcon_init(MemoryRegion *sdram_mr)
     fprintf(stderr, "MMCS: framebuffer console live (800x480 RGB565)\n");
 }
 
+static MemoryRegion *mmcs_sdram_mr;  /* for MMCS_2DG console retarget */
+
+/* MMCS_2DG: re-point the live console at the presented surface (the
+ * splash's DU scanout base — 2DG+0x50 plane surface or, for the
+ * single-surface design, the DL's Poly4AA texture). Direct SDRAM
+ * pointer into the RAM MR backing (phys < MMCS_SDRAM_BASE+size). */
+static void mmcs_2dg_present_console(hwaddr pa)
+{
+    static hwaddr last;
+    if (!mmcs_con || pa == last) {
+        return;
+    }
+    if (pa < MMCS_SDRAM_BASE
+        || pa + 800 * 480 * 2 > MMCS_SDRAM_BASE + MMCS_SDRAM_SIZE) {
+        fprintf(stderr, "MMCS-2DG: presented surface %08x outside SDRAM "
+                "- console not retargeted\n", (unsigned)pa);
+        return;
+    }
+    if (!mmcs_sdram_mr) {
+        return;
+    }
+    uint8_t *fb = memory_region_get_ram_ptr(mmcs_sdram_mr)
+                  + (pa - MMCS_SDRAM_BASE);
+    DisplaySurface *s = qemu_create_displaysurface_from(
+        800, 480, PIXMAN_r5g6b5, 800 * 2, fb);
+    dpy_gfx_replace_surface(mmcs_con, s);
+    last = pa;
+    fprintf(stderr, "MMCS-2DG: console retargeted to presented surface "
+            "phys %08x\n", (unsigned)pa);
+}
+
 static int mmcs_fb_only_rearm = 0;  /* set by self-rearm: skip RAM sweep */
+
+/* ---- MMCS_2DG (MLD-splash lane, 2026-11-18): the SH7777 2D Graphic
+ * Accelerator register window at 0xFFE80000 (0x1000) + the DU-system
+ * register file at 0xFFF80000 (0x1000) + the DU channel regs at
+ * 0xFE540000 (0x1000, logging/latch only) — the minimal splash model
+ * per the 2DG research lane (corpus docs/lane-reports/
+ * 2026-11-18-2dg-research.md §4), all semantics Verified from the MLD
+ * disasm:
+ *
+ *   - every splash PIXEL is CPU-produced (DispLoadBitmap BMP->RGB565 +
+ *     centering copy into the work surface) before the first 2DG write;
+ *   - the 2DG window owns the DU plane-surface registers (+0x50/+0x5C
+ *     = DuRendrStart's plane surface publish) and the display-list base
+ *     (+0x48, RAM DL model, no FIFO);
+ *   - the kick is 2DG+0x08=1 then 2DG+0x00=1 (after DU+0x0C =
+ *     (1<<(plane-1))|0x800); completion is DU+0x08 bits 0-5 vs the
+ *     armed mask 1<<(plane-1) (FUN_88937b0c, 500-unit timeout
+ *     NON-FATAL); the G2dLibInit gate reads DU+0x00 with
+ *     (v & 0x001103F0) == 0x00090280 and DU+0x04 with
+ *     (v & 0x1F0FF1C0) == 0;
+ *   - no IRQ in the loader path (the loader polls).
+ *
+ * The model: read-seeds + latches + kick fast-complete (done bits set
+ * from the last DU+0x0C plane mask). No blit engine is modeled: for the
+ * SINGLE-surface design (work surface == plane surface, §3.4) this is
+ * pixel-complete; MMCS_FB capture retargets to the latched 2DG+0x50
+ * surface A when armed. */
+static struct {
+    int armed;
+    uint32_t dl_base, surf_a, surf_b, mode, ctl;
+    uint32_t du00, du04, du_done, du0c, du18;
+    uint32_t ch[0x400];
+    /* DL walk (kick-time): the Polygon4AA that carries the splash */
+    uint32_t tex, tex_w, tex_h;
+    int nlog;
+} mmcs_2dg;
+
+/* Walk the display list at dl_base (RAM DL model — corpus 2DG research
+ * lane §2.3): Wpr (0x18xxxxxx, skip pattern words), Lcofs (0x40xxxxxx),
+ * Polygon4C (0x80xxxxxx: color + 3-4 coord words), the textured
+ * Polygon4AA (0x82xxxxxx: word1 = texture source ptr, word2 = {w,h}
+ * u16 pair, word3 = 0, 4 vertex words), Jump (0x28xxxxxx, word1 target
+ * & 0x1ffffffc — stop when the target walks off the list tail). Live
+ * decoded from the loader's own splash DL at 0x09832800. */
+static void mmcs_2dg_walk_dl(uint32_t dl_base)
+{
+    uint32_t words[64];
+    if (!dl_base) {
+        return;
+    }
+    uint32_t pa = dl_base & 0x1FFFFFFF;
+    cpu_physical_memory_read(pa, words, sizeof words);
+    unsigned i = 0;
+    while (i < 64) {
+        uint32_t w0 = words[i];
+        if ((w0 & 0xFE000000) == 0x82000000 && i + 8 < 64) {
+            mmcs_2dg.tex = words[i + 1];
+            mmcs_2dg.tex_w = words[i + 2] >> 16;   /* {x=w, y=h} u16 pair */
+            mmcs_2dg.tex_h = words[i + 2] & 0xFFFF;
+            fprintf(stderr, "MMCS-2DG: Poly4AA texture %08x %ux%u\n",
+                    mmcs_2dg.tex, mmcs_2dg.tex_w, mmcs_2dg.tex_h);
+            i += 9;
+            continue;
+        }
+        if ((w0 & 0xFE000000) == 0x80000000) {
+            i += 6;            /* Polygon4C: color + coords */
+            continue;
+        }
+        if ((w0 & 0xFF000000) == 0x81000000) {
+            i += 7;            /* Polygon4B */
+            continue;
+        }
+        if ((w0 & 0xFF000000) == 0x18000000) {
+            /* Wpr: word1 = patternNo<<16|first; pattern words follow
+             * (count not in the DL — the builder appends; the observed
+             * splash lists are 2 words each, next word not 0x18xx = a
+             * new command boundary; scan forward to the next known
+             * word0 class). */
+            i += 2;
+            while (i < 64) {
+                uint32_t w = words[i];
+                if ((w & 0xFE000000) == 0x80000000
+                    || (w & 0xFE000000) == 0x82000000
+                    || (w & 0xFF000000) == 0x81000000
+                    || (w & 0xFF000000) == 0x40000000
+                    || (w & 0xFF000000) == 0x18000000
+                    || (w & 0xFF000000) == 0x28000000) {
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if ((w0 & 0xFF000000) == 0x40000000) {
+            i += 2;            /* Lcofs */
+            continue;
+        }
+        if ((w0 & 0xFF000000) == 0x28000000) {
+            /* Jump: follow once (the splash tail jumps to the zero
+             * terminator); stop on out-of-list/zero targets. */
+            uint32_t t = words[i + 1] & 0x1FFFFFFC;
+            if (t == (pa & ~3) || t >= (pa & ~3) + sizeof words || !t) {
+                break;
+            }
+            uint32_t npa = t & 0x1FFFFFFF;
+            if (npa == pa) {
+                break;
+            }
+            cpu_physical_memory_read(npa, words, sizeof words);
+            pa = npa;
+            i = 0;
+            continue;
+        }
+        break;                  /* unknown/zero = end of list */
+    }
+}
+
+static uint64_t mmcs_2dg_read(void *opaque, hwaddr off, unsigned sz)
+{
+    switch (off) {
+    case 0x00: return 0;            /* idle (never busy) */
+    case 0x04: return 0;            /* no error (bit 2 clear) */
+    case 0x08: return 0;            /* idle */
+    case 0x48: return mmcs_2dg.dl_base;
+    case 0x50: return mmcs_2dg.surf_a;
+    case 0x5C: return mmcs_2dg.surf_b;
+    case 0xC0: return mmcs_2dg.mode;
+    }
+    return 0;
+}
+
+static void mmcs_2dg_write(void *opaque, hwaddr off, uint64_t v, unsigned sz)
+{
+    switch (off) {
+    case 0x48:
+        mmcs_2dg.dl_base = v;
+        break;
+    case 0x50:
+        mmcs_2dg.surf_a = v;
+        if (mmcs_2dg.nlog++ < 64) {
+            fprintf(stderr, "MMCS-2DG: plane surface A = %08llx\n",
+                    (unsigned long long)v);
+        }
+        break;
+    case 0x5C:
+        mmcs_2dg.surf_b = v;
+        if (mmcs_2dg.nlog++ < 64) {
+            fprintf(stderr, "MMCS-2DG: plane surface B = %08llx\n",
+                    (unsigned long long)v);
+        }
+        break;
+    case 0xC0:
+        mmcs_2dg.mode = v;
+        break;
+    case 0x08:
+        if (v == 1) {
+            /* KICK: fast-complete — done bits from the last DU+0x0C
+             * plane mask (bits 0-4); the wait reads DU+0x08 & 0x3F.
+             * Then the presentation: walk the DL for the textured
+             * blit; single-surface design (plane surface 0) presents
+             * the texture itself, two-surface copies it into the
+             * latched plane surface A (1:1 — the splash dest rect is
+             * full-screen). */
+            mmcs_2dg.du_done |= (mmcs_2dg.du0c & 0x3F);
+            mmcs_2dg_walk_dl(mmcs_2dg.dl_base);
+            mmcs_2dg_present_console(mmcs_2dg.surf_a
+                                     ? (mmcs_2dg.surf_a & 0x1FFFFFFF)
+                                     : (mmcs_2dg.tex & 0x1FFFFFFF));
+            if (mmcs_2dg.tex && mmcs_2dg.surf_a
+                && mmcs_2dg.tex_w && mmcs_2dg.tex_w <= 2048
+                && mmcs_2dg.tex_h <= 2048) {
+                hwaddr sp = mmcs_2dg.surf_a & 0x1FFFFFFF;
+                hwaddr tp = mmcs_2dg.tex & 0x1FFFFFFF;
+                uint32_t row = mmcs_2dg.tex_w * 2;
+                for (uint32_t y = 0; y < mmcs_2dg.tex_h; y++) {
+                    uint8_t lbuf[4096];
+                    uint32_t n = MIN(row, sizeof lbuf);
+                    cpu_physical_memory_read(tp + (hwaddr)y * row,
+                                             lbuf, n);
+                    cpu_physical_memory_write(sp + (hwaddr)y * row,
+                                              lbuf, n);
+                }
+                fprintf(stderr, "MMCS-2DG: blit %ux%u texture -> "
+                        "surface A phys %08x\n", mmcs_2dg.tex_w,
+                        mmcs_2dg.tex_h, (unsigned)sp);
+            }
+            if (mmcs_2dg.nlog++ < 64) {
+                fprintf(stderr, "MMCS-2DG: KICK dl_base=%08x surf_a=%08x "
+                        "surf_b=%08x mode=%08x du0c=%08x -> done=%08x "
+                        "tex=%08x\n",
+                        mmcs_2dg.dl_base, mmcs_2dg.surf_a, mmcs_2dg.surf_b,
+                        mmcs_2dg.mode, mmcs_2dg.du0c, mmcs_2dg.du_done,
+                        mmcs_2dg.tex);
+            }
+        }
+        break;
+    case 0x00:
+        mmcs_2dg.ctl = v;
+        break;
+    default:
+        if (mmcs_2dg.nlog++ < 32) {
+            fprintf(stderr, "MMCS-2DG: write +%03llx = %08llx\n",
+                    (unsigned long long)off, (unsigned long long)v);
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps mmcs_2dg_ops = {
+    .read = mmcs_2dg_read,
+    .write = mmcs_2dg_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+static uint64_t mmcs_dusys_read(void *opaque, hwaddr off, unsigned sz)
+{
+    switch (off) {
+    case 0x00: return mmcs_2dg.du00;    /* seed 0x00090280 (G2dLibInit) */
+    case 0x04: return mmcs_2dg.du04;
+    case 0x08: return mmcs_2dg.du_done;
+    case 0x0C: return mmcs_2dg.du0c;
+    case 0x18: return mmcs_2dg.du18;
+    }
+    return 0;
+}
+
+static void mmcs_dusys_write(void *opaque, hwaddr off, uint64_t v, unsigned sz)
+{
+    switch (off) {
+    case 0x00:
+        /* G2dLibInit seed stays (accept the setup writes 0/0x100) */
+        if (mmcs_2dg.nlog++ < 64) {
+            fprintf(stderr, "MMCS-2DG: DU+00 write %08llx (seed kept "
+                    "%08x)\n", (unsigned long long)v, mmcs_2dg.du00);
+        }
+        return;
+    case 0x0C:
+        mmcs_2dg.du0c = v;
+        break;
+    case 0x18:
+        mmcs_2dg.du18 = v;
+        if (mmcs_2dg.nlog++ < 64) {
+            fprintf(stderr, "MMCS-2DG: DU+18 plane-enable %08llx\n",
+                    (unsigned long long)v);
+        }
+        break;
+    case 0x40:
+    case 0x48:
+        if (mmcs_2dg.nlog++ < 64) {
+            fprintf(stderr, "MMCS-2DG: DU+%02llx clip advance %08llx\n",
+                    (unsigned long long)off, (unsigned long long)v);
+        }
+        return;
+    }
+}
+
+static const MemoryRegionOps mmcs_dusys_ops = {
+    .read = mmcs_dusys_read,
+    .write = mmcs_dusys_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+static uint64_t mmcs_duch_read(void *opaque, hwaddr off, unsigned sz)
+{
+    return off < sizeof(mmcs_2dg.ch) ? mmcs_2dg.ch[off / 4] : 0;
+}
+
+static void mmcs_duch_write(void *opaque, hwaddr off, uint64_t v, unsigned sz)
+{
+    if (off < sizeof(mmcs_2dg.ch)) {
+        mmcs_2dg.ch[off / 4] = v;
+    }
+    if ((off == 0x26 || off == 0x1C || off == 0x1E) && mmcs_2dg.nlog++ < 64) {
+        fprintf(stderr, "MMCS-2DG: DU-channel +%02llx = %08llx "
+                "(%s = %08x)\n", (unsigned long long)off,
+                (unsigned long long)v,
+                off == 0x26 ? "bpp" : "SA0R",
+                mmcs_2dg.ch[off / 4]);
+    }
+}
+
+static const MemoryRegionOps mmcs_duch_ops = {
+    .read = mmcs_duch_read,
+    .write = mmcs_duch_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
 
 /* ---- MMCS_JITFIX: break the WinCE JIT-debugger name in kernel RAM ----
  * L9 decode: the last remaining per-boot fault (a servant's second-chance
@@ -1635,14 +1958,35 @@ static void mmcs_dump_ram(void *opaque)
             const int FW = 800, FH = 480;
             static uint8_t rgb565[800 * 480 * 2];
             static uint8_t ppm[800 * 480 * 3 + 64];
-            cpu_physical_memory_read(0x08B00000, rgb565, sizeof rgb565);
+            /* MMCS_2DG capture retarget: the latched 2DG+0x50 plane
+             * surface A is the DU scanout source; when the plane
+             * descriptor shipped 0 (single-surface design — the
+             * splash's live case), the DL walk's Poly4AA texture IS
+             * the presented image. P1/P2 alias -> phys. Fallback: the
+             * fixed 0x08B00000 assumption. */
+            hwaddr fbp = 0x08B00000;
+            if (mmcs_2dg.armed) {
+                if (mmcs_2dg.surf_a) {
+                    fbp = mmcs_2dg.surf_a & 0x1FFFFFFF;
+                } else if (mmcs_2dg.tex) {
+                    fbp = mmcs_2dg.tex & 0x1FFFFFFF;
+                }
+                fprintf(stderr, "MMCS: FB capture from 2DG presented "
+                        "surface: phys %08x\n", (unsigned)fbp);
+            }
+            cpu_physical_memory_read(fbp, rgb565, sizeof rgb565);
             int n = snprintf((char *)ppm, sizeof ppm,
                              "P6\n%d %d\n255\n", FW, FH);
             for (int i = 0; i < FW * FH; i++) {
                 uint16_t p = rgb565[2 * i] | rgb565[2 * i + 1] << 8;
-                ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13);
-                ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9);
-                ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2);
+                /* 565->888 with proper low-bit replication (the old
+                 * (p>>9)/(p>>2) terms were unmasked and leaked the
+                 * neighboring channels' bits into every captured
+                 * frame's colors — e.g. the splash's exact 0xf804 red
+                 * captured as orange (255,124,33)) */
+                ppm[n + 3 * i + 0] = (p >> 8 & 0xf8) | (p >> 13 & 7);
+                ppm[n + 3 * i + 1] = (p >> 3 & 0xfc) | (p >> 9 & 3);
+                ppm[n + 3 * i + 2] = (p << 3 & 0xf8) | (p >> 2 & 7);
             }
             char fn[512];
             if (total > 1)
@@ -3631,6 +3975,7 @@ static void mmcs_init(MachineState *machine)
     memory_region_init_ram(sdram, NULL, "mmcs.sdram", MMCS_SDRAM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), MMCS_SDRAM_BASE, sdram);
+    mmcs_sdram_mr = sdram;
     if (getenv("MMCS_FBCON")) {
         mmcs_fbcon_init(sdram);
     }
@@ -3864,41 +4209,65 @@ static void mmcs_init(MachineState *machine)
         memory_region_init_ram(mr, NULL, "mld.payload", 0x100000, &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0x0A000000, mr);
         load_image_targphys(pay, 0x0A000000, 0x100000);
-        /* MMCS_FLROM=<file> (MLD-splash lane, 2026-11-18): seed the FLROM
-         * window (Area 0, phys 0x00100000-0x00FFFFFF) with the unit's NOR
-         * bytes: the Opening BMP at 0x00100000 + the "Loading BMP info
-         * Table" at 0x00e00000 — exactly what SetOpeningImage
-         * (FUN_889475f8) burns on the car and GetBackupInfoOpeningBMP
-         * (FUN_88947314, kind 0) reads at boot (table ptr DAT_8894749c =
-         * 0xa00e0000, image window [0x100000, 0x1FFFFF]). Built by the
-         * corpus script scripts/emul/build_mld_flrom.py. */
-        {
-            const char *flrom = getenv("MMCS_FLROM");
-            if (flrom) {
-                MemoryRegion *fr = g_new(MemoryRegion, 1);
-                memory_region_init_ram(fr, NULL, "mld.flrom", 0xF00000,
-                                       &error_fatal);
-                memory_region_add_subregion(get_system_memory(),
-                                            0x00100000, fr);
-                if (load_image_targphys(flrom, 0x00100000, 0xF00000) < 0) {
-                    error_report("MMCS_MLD: cannot load FLROM seed %s", flrom);
-                    exit(1);
-                }
-                fprintf(stderr, "MMCS: MLD FLROM seed at phys 0x00100000 "
-                        "(%s; BMP@+0, info table@+0xD00000)\n", flrom);
+        /* MMCS_FLROM=<file> (MLD-splash lane, 2026-11-18): seed the NOR
+         * FLROM window (Area 0, phys 0x00000000-0x00FFFFFF, P2 alias
+         * 0xA0000000) with the unit's NOR bytes. Geometry live-proven this
+         * lane (the resume lane's killer): GetBackupInfoOpeningBMP's table
+         * ptr DAT_8894749c = 0xa00e0000 -> phys 0x000e0000 = NOR +0xE0000
+         * (QEMU's GETPHYSDBG print caught the loader reading 0xa00e0000
+         * and the P2 mask resolving 0x000e0000 — the earlier 0x00e00000
+         * placement was a factor-of-16 misread), and SetOpeningImage's
+         * image start DAT_889477a4 = 0xa0100000 -> phys 0x00100000, the
+         * validated NOR [1 MB, 2 MB) burn window. Seed layout (corpus
+         * scripts/emul/build_mld_flrom.py): BMP @+0x100000, info table
+         * @+0xE0000. The MR covers the whole 16 MB window INCLUDING phys 0,
+         * so the separate stub MR below is skipped and the boot stub is
+         * written into the NOR MR at +0 (the real NOR boots from here). */
+        const char *flrom = getenv("MMCS_FLROM");
+        if (flrom) {
+            MemoryRegion *fr = g_new(MemoryRegion, 1);
+            memory_region_init_ram(fr, NULL, "mld.flrom", 0x1000000,
+                                   &error_fatal);
+            memory_region_add_subregion(get_system_memory(),
+                                        0x00000000, fr);
+            /* write through the RAM pointer (the L27/L14 lesson: ROM
+             * blobs apply at reset AFTER machine init and would stomp
+             * the stub written at NOR +0 below) */
+            gsize flen = 0;
+            uint8_t *fbuf = NULL;
+            if (!g_file_get_contents(flrom, (gchar **)&fbuf, &flen, NULL)
+                || !fbuf || flen == 0 || flen > 0x1000000) {
+                error_report("MMCS_MLD: cannot load FLROM seed %s", flrom);
+                exit(1);
             }
+            cpu_physical_memory_write(0, fbuf, flen);
+            g_free(fbuf);
+            fprintf(stderr, "MMCS: MLD FLROM seed at phys 0x00000000 "
+                    "(%s; BMP@+0x100000, info table@+0xE0000)\n", flrom);
         }
-        /* MMCS_RAM2EXT_MB (MLD-splash lane, 2026-11-18): the loader's own
-         * startup loads r15 = 0xE5204000 (P2 of phys 0x05204000 — the
-         * startup literal pool at 0x88933424, decoded via QEMU's own TB
-         * disasm) BEFORE calling the pre-main init at 0x88932344: the
-         * unit's SECOND SDRAM bank covers phys 0x05204000 (the default
-         * 8 MB ram2 at 0x04000000 ends at 0x047FFFFF). Without it the
-         * loader's pushes/readbacks hit unassigned memory and the .data
-         * region walker calls memcpy with garbage args (the observed
-         * park at 0x889353b8). Extension sits contiguous above ram2;
-         * MLD-branch-only so default OS boots are untouched. */
+        /* MMCS_OCIRAM (MLD-splash lane, 2026-11-18): the loader's own
+         * startup loads r15 = 0xE5204000 (the literal at 0x88933424,
+         * decoded via QEMU's own TB disasm) BEFORE calling the pre-main
+         * init at 0x88932344. 0xE5204000 is P4 space — the SH7777's
+         * on-chip RAM, the classic boot-loader stack before SDRAM init.
+         * Without it the loader's pushes/readbacks hit unassigned memory
+         * (stores dropped) and the .data region walker reads an empty
+         * frame -> memcpy with garbage args (the observed park at
+         * 0x889353b8). 64 KB at P4 0xE5200000; MLD-branch-only.
+         * MMCS_RAM2EXT_MB (default 32): second-SDRAM-bank window above
+         * the stock ram2 (the loader scans/uses the 0x04800000+ span). */
         {
+            const char *oir = getenv("MMCS_OCIRAM");
+            unsigned oir_kb = oir ? (unsigned)atoi(oir) : 64;
+            if (oir_kb) {
+                MemoryRegion *oc = g_new(MemoryRegion, 1);
+                memory_region_init_ram(oc, NULL, "mld.ociram",
+                                       (uint64_t)oir_kb * KiB, &error_fatal);
+                memory_region_add_subregion(get_system_memory(),
+                                            0xE5200000, oc);
+                fprintf(stderr, "MMCS: MLD on-chip RAM %u KB at P4 "
+                        "0xE5200000 (loader stack 0xE5204000)\n", oir_kb);
+            }
             const char *r2 = getenv("MMCS_RAM2EXT_MB");
             unsigned r2n = r2 ? (unsigned)atoi(r2) : 32;
             if (r2n) {
@@ -3908,17 +4277,33 @@ static void mmcs_init(MachineState *machine)
                 memory_region_add_subregion(get_system_memory(),
                                             0x04800000, r2m);
                 fprintf(stderr, "MMCS: MLD RAM2 extension %u MB at phys "
-                        "0x04800000 (loader stack 0x05204000)\n", r2n);
+                        "0x04800000\n", r2n);
             }
         }
-        mr = g_new(MemoryRegion, 1);
-        memory_region_init_ram(mr, NULL, "mld.stub", 0x1000, &error_fatal);
-        memory_region_add_subregion(get_system_memory(), 0, mr);
-        if (load_image_targphys(stub, 0, 0x1000) < 0) {
-            error_report("MMCS_MLD: cannot load stub %s", stub);
-            exit(1);
+        if (!flrom) {
+            mr = g_new(MemoryRegion, 1);
+            memory_region_init_ram(mr, NULL, "mld.stub", 0x1000, &error_fatal);
+            memory_region_add_subregion(get_system_memory(), 0, mr);
+            if (load_image_targphys(stub, 0, 0x1000) < 0) {
+                error_report("MMCS_MLD: cannot load stub %s", stub);
+                exit(1);
+            }
+            memory_region_set_readonly(mr, true);
+        } else {
+            /* FLROM owns phys 0: the boot stub lives at NOR +0, written
+             * through the FLROM MR's RAM backing directly (NOT a ROM
+             * blob — rom_check_and_register_reset hard-fails on the
+             * overlapping FLROM+stub ranges). */
+            gsize slen = 0;
+            uint8_t *sbuf = NULL;
+            if (!g_file_get_contents(stub, (gchar **)&sbuf, &slen, NULL)
+                || !sbuf || slen == 0 || slen > 0x1000) {
+                error_report("MMCS_MLD: cannot load stub %s", stub);
+                exit(1);
+            }
+            cpu_physical_memory_write(0, sbuf, slen);
+            g_free(sbuf);
         }
-        memory_region_set_readonly(mr, true);
         /* debug SCIF below still wires; skip kernel flash/bootrom path */
         sh7750_init(cpu, get_system_memory());
         {
@@ -3929,6 +4314,37 @@ static void mmcs_init(MachineState *machine)
             qdev_prop_set_uint8(dev, "features", SH_SERIAL_FEAT_SCIF);
             sysbus_realize_and_unref(sb, &error_fatal);
             sysbus_mmio_map(sb, 0, 0xffe40000);
+        }
+        /* MMCS_2DG (MLD-splash lane): the 2DG/DU-system/DU-channel carves
+         * — overlap priority 1 shadows the sh7750 SCIF claim at
+         * 0xFFE80000 (P4) and its A7 alias at 0x1FE80000 (the known
+         * serial collision; the sh_serial device itself stays alive,
+         * only its MMIO window is claimed by the real engine). */
+        if (mmcs_env_on("MMCS_2DG")) {
+            mmcs_2dg.armed = 1;
+            mmcs_2dg.du00 = 0x00090280;   /* G2dLibInit ID gate */
+            MemoryRegion *dg = g_new(MemoryRegion, 1);
+            memory_region_init_io(dg, NULL, &mmcs_2dg_ops, NULL,
+                                  "mld.2dg", 0x1000);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                0xFFE80000, dg, 1);
+            MemoryRegion *dga = g_new(MemoryRegion, 1);
+            memory_region_init_alias(dga, NULL, "mld.2dg-a7", dg, 0, 0x1000);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                0x1FE80000, dga, 1);
+            MemoryRegion *du = g_new(MemoryRegion, 1);
+            memory_region_init_io(du, NULL, &mmcs_dusys_ops, NULL,
+                                  "mld.dusys", 0x1000);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                0xFFF80000, du, 1);
+            MemoryRegion *ch = g_new(MemoryRegion, 1);
+            memory_region_init_io(ch, NULL, &mmcs_duch_ops, NULL,
+                                  "mld.duch", 0x1000);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                0xFE540000, ch, 1);
+            fprintf(stderr, "MMCS: 2DG window 0xFFE80000 + DU-system "
+                    "0xFFF80000 + DU-channel 0xFE540000 carved "
+                    "(fast-complete model)\n");
         }
         {
             const char *ds = getenv("MMCS_DUMP");
