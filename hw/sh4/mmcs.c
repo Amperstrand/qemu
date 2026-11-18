@@ -406,6 +406,9 @@ static struct mmcs_regkey *mmcs_regvt_root;   /* HKLM */
 static struct mmcs_regkey **mmcs_regvt_handles;
 static unsigned mmcs_regvt_nhandles;
 static int mmcs_regvt_armed;
+static unsigned mmcs_regvt_real_methods;
+static uint32_t mmcs_regvt_real[149];
+static unsigned mmcs_regvt_real_n;
 
 static struct mmcs_regkey *mmcs_regkey_new(const char *name)
 {
@@ -820,7 +823,7 @@ int mmcs_regvt_is_armed(void)
 #define MMCS_REGVT_TABLE_P1   (MMCS_FSVT_P1 + 0x400)
 #define MMCS_REGVT_STUBS_PA   (MMCS_FSVT_PAGE + 0x800)
 #define MMCS_REGVT_STUBS_P1   (MMCS_FSVT_P1 + 0x800)
-#define MMCS_REGVT_NMETHODS   128
+#define MMCS_REGVT_NMETHODS   152   /* 149 real entries + margin */
 /* the registry method slots (stock kmisc.c numbering) */
 static const struct {
     uint16_t off;       /* byte offset in the methods table */
@@ -859,6 +862,12 @@ uint32_t mmcs_regvt_method(uint32_t off)
             return MMCS_REGVT_STUBS_P1 + 8 * i;
         }
     }
+    /* L30: the REAL vendor methods routed into the table at bind time
+     * (immune to the cell flip — the register-level re-drive uses the
+     * same target the table holds). */
+    if ((off & 3) == 0 && off < 4 * mmcs_regvt_real_n) {
+        return mmcs_regvt_real[off / 4];
+    }
     return 0;
 }
 
@@ -893,6 +902,57 @@ int mmcs_regvt_bind(CPUState *cs)
         cpu_physical_memory_write(MMCS_REGVT_STUBS_PA + 8 * i, code,
                                   sizeof code);
     }
+    /* MMCS fork (L30): route every remaining method to the REAL
+     * implementation from the vendor's own CreateAPISet("FileSys")
+     * methods array — the 149-entry literal block in filesys .text at
+     * c00b1358 (XIP): GetFileAttributesW +0x1c -> c00cb8c4, Signal-
+     * Started +0x108 -> c00badf0 (the internal-event SET that wakes
+     * the signaler's post-FSReady wait — the kernel's pSignalStarted
+     * = coredll ordinal 639 = this method), etc. NULL entries keep
+     * the all-stub (-1) = the unregistered-optional-method semantics
+     * (the real table ships NULLs too, e.g. method 84). The registry
+     * stubs above and the FSINT_* overrides stay (both proven). */
+    {
+        const uint32_t tbl_va = 0xc00b1358;
+        const struct {
+            uint32_t va, size, rom, flags, off;
+        } *row = mmcs_srvt_find(tbl_va);
+        if (row) {
+            uint32_t real[149];
+            if (address_space_read(&address_space_memory,
+                                   mmcs_rom_pa(row->rom)
+                                   + (tbl_va - row->va),
+                                   MEMTXATTRS_UNSPECIFIED,
+                                   real, sizeof real) == MEMTX_OK) {
+                unsigned nreal = 0;
+                memcpy(mmcs_regvt_real, real, sizeof real);
+                mmcs_regvt_real_n = ARRAY_SIZE(real);
+                for (unsigned i = 0; i < ARRAY_SIZE(real)
+                                && 4 * i < 4 * MMCS_REGVT_NMETHODS; i++) {
+                    uint32_t off = 4 * i, v = real[i];
+                    unsigned k;
+                    bool synth = false;
+                    for (k = 0; k < ARRAY_SIZE(mmcs_regvt_methods); k++) {
+                        if (mmcs_regvt_methods[k].off == off) {
+                            synth = true;
+                        }
+                    }
+                    for (k = 0; k < ARRAY_SIZE(mmcs_regvt_fs); k++) {
+                        if (mmcs_regvt_fs[k].off == off) {
+                            synth = true;
+                        }
+                    }
+                    if (synth || !v) {
+                        continue;
+                    }
+                    cpu_physical_memory_write(MMCS_REGVT_TABLE_PA + off,
+                                              &v, 4);
+                    nreal++;
+                }
+                mmcs_regvt_real_methods = nreal;
+            }
+        }
+    }
     uint32_t tbl = MMCS_REGVT_TABLE_P1;
     cpu_memory_rw_debug(cs, 0xc00835c0, (uint8_t *)&tbl, 4, 1);
     {
@@ -901,9 +961,11 @@ int mmcs_regvt_bind(CPUState *cs)
         uint32_t cell = 0;
         cpu_memory_rw_debug(cs, 0xc00835c0, (uint8_t *)&cell, 4, 0);
         fprintf(stderr, "MMCS: REGVT FileSys api-set cell [c00835c0] bound "
-                "-> methods table P1 %08x (8 registry stubs + %u FSINT + "
-                "all-stub); stub[0] chk=%04x cell=%08x\n",
-                tbl, (unsigned)ARRAY_SIZE(mmcs_regvt_fs), chk[0], cell);
+                        "-> methods table P1 %08x (8 registry stubs + %u "
+                        "FSINT + %u real vendor methods + all-stub); "
+                        "stub[0] chk=%04x cell=%08x\n",
+                tbl, (unsigned)ARRAY_SIZE(mmcs_regvt_fs),
+                mmcs_regvt_real_methods, chk[0], cell);
     }
     return 1;
 }

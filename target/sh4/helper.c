@@ -448,8 +448,29 @@ void superh_cpu_do_interrupt(CPUState *cs)
                     break;
                 }
             }
+            if (!tgt && mmcs_regvt_is_armed()) {
+                /* L30: the REGVT table (registry stubs + the REAL
+                 * vendor methods routed from filesys .text c00b1358)
+                 * owns every offset it knows — e.g. SignalStarted
+                 * +0x108 = c00badf0 (the kernel's pSignalStarted =
+                 * coredll ord 639 -> this cluster's c00309a0 thunk)
+                 * must reach the REAL implementation, not the -1
+                 * stub (the stub answer killed the signaler's
+                 * internal wait and parked the boot). */
+                tgt = mmcs_regvt_method(env->tea);
+                if (tgt) {
+                    mmcs_regvt_bind(cs);
+                }
+            }
             if (!tgt) {
-                tgt = mmcs_fsvt_p1() + env->tea;   /* stub table */
+                /* L30: unknown offsets land on the all-stub CODE slot
+                 * (mov #-1,r0; rts at +0xF00). The v1 target
+                 * `table_base + tea` only worked for tea < 0xE0 (the
+                 * pointer-filled slots); larger offsets (e.g. the
+                 * launcher's post-FSReady FS method 66 at +0x108)
+                 * landed in the empty tail of the 4K page and raised
+                 * illegal 0x180. */
+                tgt = mmcs_fsvt_p1() + 0xF00;
             }
             env->gregs[3] = tgt;
             hit = true;
@@ -517,19 +538,33 @@ void superh_cpu_do_interrupt(CPUState *cs)
         && (env->sr & (1u << SR_MD))
         && env->tea < 0x1000
         && !(env->tea & 3)
-        && env->pc >= 0xc0020000 && env->pc < 0xc0082b00
-        && mmcs_regvt_method(env->tea)) {
+        && env->pc >= 0xc0020000 && env->pc < 0xc0082b00) {
         uint32_t tgt = mmcs_regvt_method(env->tea);
-        mmcs_regvt_bind(cs);
-        env->gregs[3] = tgt;
-        static int nrb;
-        if (nrb++ < 12) {
-            fprintf(stderr, "MMCS: REGVT cell bind + dispatch pc=%08x "
-                    "tea=%08x -> %08x\n", env->pc, env->tea, tgt);
+        if (tgt || mmcs_fsvt_p1()) {
+            mmcs_regvt_bind(cs);
+            if (!tgt) {
+                /* MMCS fork (L30): unknown method offset -> the
+                 * all-stub -1 (the guarded failure of an unregistered
+                 * optional method). The L29 design promised this but
+                 * only wired the KNOWN offsets, so the method-7 site
+                 * (c0032750, GetFileAttributesW at +0x1c) fell to the
+                 * vendor exception handler and killed the servant
+                 * thread on prgInit's post-boot-phase
+                 * \Windows\Restore.fdf probe (NULL-cell deref at
+                 * 0x1c — the cell bind does not survive the page
+                 * flip-flop, the register-level re-drive does). */
+                tgt = mmcs_fsvt_p1() + 0xF00;
+            }
+            env->gregs[3] = tgt;
+            static int nrb;
+            if (nrb++ < 12) {
+                fprintf(stderr, "MMCS: REGVT cell bind + dispatch pc=%08x "
+                        "tea=%08x -> %08x\n", env->pc, env->tea, tgt);
+            }
+            env->pc += 2;      /* skip the deref; execute the jsr/jmp @r3 */
+            cs->exception_index = -1;
+            return;
         }
-        env->pc += 2;      /* skip the deref; execute the jsr/jmp @r3 */
-        cs->exception_index = -1;
-        return;
     }
     /* MMCS fork (L29): the REGVT registry-method stubs (trapa #0x73,
      * TRA=0x1CC). The stub is the api-set METHOD: it receives the full
@@ -588,14 +623,28 @@ void superh_cpu_do_interrupt(CPUState *cs)
             break;
         }
         case 6: {   /* RegQueryValueExW(hk, name, resv, lpType=r7,
-                     * lpData=a[0], lpcbData=a[1]) */
+                     * lpData=a[0], lpcbData: the RegQueryValueExW thunk
+                     * (c0032c0c: `sts pr; add #-28,r15`) re-stages the
+                     * method's stack args as 5th=[r15+16] (lpData) and
+                     * 6th=[r15+24] (the lpcbData POINTER), with its own
+                     * deref *lpcbData at [r15+20] — the v1 code read
+                     * [r15+20] as the pointer and got the raw cb VALUE,
+                     * so every data-read call answered ERROR_MORE_DATA,
+                     * FsdGetRegistryValue failed, LoadFlags defaulted
+                     * to ASYNC and the ObjectStore never entered the
+                     * SYNC load list (no file system ever mounted). */
             uint32_t type = 0, len = 0;
             const uint8_t *data = NULL;
+            uint32_t a1 = 0;
+            cpu_memory_rw_debug(cs, env->gregs[15] + 24,
+                                (uint8_t *)&a1, 4, 0);
             rc = mmcs_regvt_query(r4, name, &type, &len, &data);
             if (rc == 0) {
                 uint32_t cb = 0;
-                if (a[1]) {
-                    cpu_memory_rw_debug(cs, a[1], (uint8_t *)&cb, 4, 0);
+                int cb_rd = -1, cb_wr = 0, d_wr = 0;
+                if (a1) {
+                    cb_rd = cpu_memory_rw_debug(cs, a1,
+                                                (uint8_t *)&cb, 4, 0);
                 }
                 if (r7) {
                     cpu_memory_rw_debug(cs, r7, (uint8_t *)&type, 4, 1);
@@ -603,11 +652,23 @@ void superh_cpu_do_interrupt(CPUState *cs)
                 if (!a[0] || cb < len) {
                     rc = a[0] ? 234 : 0;   /* size query vs short buf */
                 } else {
-                    cpu_memory_rw_debug(cs, a[0], (void *)data, len, 1);
+                    d_wr = cpu_memory_rw_debug(cs, a[0], (void *)data,
+                                               len, 1);
+                    if (d_wr) {
+                        rc = 234;
+                    }
                 }
-                if (a[1]) {
-                    cpu_memory_rw_debug(cs, a[1], (uint8_t *)&len, 4, 1);
+                if (a1) {
+                    cb_wr = cpu_memory_rw_debug(cs, a1,
+                                                (uint8_t *)&len, 4, 1);
                 }
+                if (getenv("MMCS_REGVT_QDBG")) {
+                    fprintf(stderr, "MMCS: REGVT q6 '%s' a0=%08x a1=%08x "
+                            "cb=%d(len=%d type=%u) rd=%d d_wr=%d cb_wr=%d "
+                            "rc=%d\n", name, a[0], a1, cb, len, type,
+                            cb_rd, d_wr, cb_wr, rc);
+                }
+                break;
             }
             break;
         }
