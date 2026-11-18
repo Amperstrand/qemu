@@ -1271,6 +1271,17 @@ struct mmcs_pgown_ent {
 static struct mmcs_pgown_ent mmcs_pgown[MMCS_PGOWN_SLOTS];
 static int mmcs_pgown_armed;
 static uint32_t mmcs_pgown_nins, mmcs_pgown_npin, mmcs_pgown_novr;
+static uint32_t mmcs_pgown_nretire;
+
+/* L34: is this phys page a GUEST-authored page (the vendor pager's own
+ * RAM, [0x08600000,0x10700000) = ulRAMStart..ulRAMEnd)? The host-side
+ * seed pools live elsewhere: COWFIX [0x10710000,0x10800000) (past
+ * ulRAMEnd, under the flash window), FILEVIEW [0x20000000,0x24000000),
+ * SRVPG [0x26000000,0x26400000). */
+static bool mmcs_pgown_guest_page(uint32_t pa)
+{
+    return pa >= 0x08600000u && pa < 0x10700000u;
+}
 
 /* helper.c's launch-phase latch (the first USER-mode KData fault = the
  * PSL launches are live) — sub-floor stack registration gate */
@@ -1402,6 +1413,36 @@ int mmcs_pgown_fill(CPUSH4State *env, uint32_t address, uint32_t *pa,
     }
     if (e->pinned) {
         if (*pa != e->pa) {
+            if (cls == 1 && mmcs_pgown_guest_page(*pa)) {
+                /* L34: PER-PROCESS RETIREMENT. The per-process user
+                 * windows got a GUEST-authored remap to a fresh
+                 * guest-RAM page — the vendor pager's fresh per-process
+                 * copy (process death + relaunch: the pager decompresses
+                 * the section into a new physical page; ROMHDR
+                 * ulRAMStart..ulRAMEnd bounds the guest pool). The
+                 * pinned copy belongs to the DEAD process — its critsec
+                 * {OwnerThread=dead hTh, hCrit=old handle} and its
+                 * CRT-init cells (g_hProcessHeap) must NOT leak into
+                 * the newcomer: on HW the new process reads a fresh
+                 * image-init copy. Retire the pin and adopt the guest's
+                 * page as the new clean base (the first store re-pins).
+                 * Host-seed re-serves (COWFIX/FILEVIEW/SRVPG pools,
+                 * outside the guest range) keep the L21 flip-flop
+                 * override — one shared backing for the same live
+                 * mapping. */
+                uint32_t old_pa = e->pa;
+                e->pinned = 0;
+                e->pa = *pa;
+                e->nremap = 0;
+                mmcs_pgown_nretire++;
+                if (haslog && mmcs_pgown_nretire <= 32) {
+                    fprintf(stderr, "MMCS-PGOWN: RETIRE va=%08x asid=%02x "
+                            "pinned pa=%08x -> fresh guest pa=%08x "
+                            "(per-process relaunch)\n",
+                            page, key, old_pa, *pa);
+                }
+                return prot & ~PAGE_WRITE;
+            }
             e->nremap++;
             mmcs_pgown_novr++;
             if (haslog && mmcs_pgown_novr <= 32) {
@@ -1436,9 +1477,9 @@ static void mmcs_pgown_census(void)
         return;
     }
     fprintf(stderr, "MMCS-PGOWN: registered=%u pinned=%u remap-overrides=%u "
-            "launch-latch=%d\n",
+            "retirements=%u launch-latch=%d\n",
             mmcs_pgown_nins, mmcs_pgown_npin, mmcs_pgown_novr,
-            (int)mmcs_ilkfix_user_seen);
+            mmcs_pgown_nretire, (int)mmcs_ilkfix_user_seen);
     int shown = 0;
     for (unsigned i = 0; i < MMCS_PGOWN_SLOTS && shown < 24; i++) {
         struct mmcs_pgown_ent *e = &mmcs_pgown[i];

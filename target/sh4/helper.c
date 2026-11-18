@@ -296,6 +296,37 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * identity) — the fingerprint read resolves through the live guest
      * UTLB first (a fresh kstack page may be in no host-side table),
      * the PGOWN/FILEVIEW exports second (the L32 discipline). */
+    /* MMCS fork (L34): the -1-trap census — every marker arrival with the
+     * exact CBRET guard values (why a delivery did NOT fire: pend!=0 /
+     * fingerprint miss / ktop resolution failure / pr shape). Env
+     * MMCS_CBRET_DBG, default off. */
+    if (env->mmcs_cbret_active && do_exp
+        && cs->exception_index == 0x0e0
+        && !(env->sr & (1u << SR_MD))
+        && env->pc == 0xfffffdffu
+        && getenv("MMCS_CBRET_DBG")) {
+        static int ndbg;
+        uint32_t pth = 0, ktop = 0, pendd = 0, sprd = 0, ktop_pa = 0;
+        cpu_physical_memory_read(0x08679894, &pth, 4);
+        if (pth >= 0x90600000u && pth < 0x90800000u) {
+            cpu_physical_memory_read((pth & 0x1fffffffu) + 0x2c, &ktop, 4);
+            cpu_physical_memory_read((pth & 0x1fffffffu) + 0x1c, &pendd, 4);
+        }
+        if (ktop >= 0xD0000000u && ktop < 0xE0000000u) {
+            ktop_pa = mmcs_utlb_va2pa(env, ktop) ? : mmcs_stack_va2pa(ktop);
+        }
+        if (ktop_pa) {
+            cpu_physical_memory_read(
+                (ktop_pa & ~0xFFFu) + ((ktop - 0xE0) & 0xFFF) + 0x20,
+                &sprd, 4);
+        }
+        if (ndbg++ < 96) {
+            fprintf(stderr, "MMCS-CBRET-DBG -1trap th=%08x ktop=%08x "
+                    "ktop_pa=%08x [1C]=%08x saved_pr=%08x pr=%08x "
+                    "sp=%08x\n", pth, ktop, ktop_pa, pendd, sprd,
+                    env->pr, env->gregs[15]);
+        }
+    }
     if (env->mmcs_cbret_active && do_exp
         && cs->exception_index == 0x0e0
         && !(env->sr & (1u << SR_MD))
