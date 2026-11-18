@@ -109,6 +109,26 @@ int sh_intc_get_pending_vector(struct intc_desc *desc, int imask)
     return -1;
 }
 
+/* MMCS fork (L35/Linux lane, 2026-11-18): any pending source? The CPU
+ * side needs this in the masked-IRQ window: sh_intc raises the CPU HARD
+ * line only on the desc->pending 0->1 transition, while the CPU can
+ * DROP the line again on a masked query (get_pending_vector == -1 with
+ * imask 0xF). A request asserted after that (pending 1->2) re-raises
+ * nothing, so a guest that then executes SLEEP halts with live pending
+ * sources and never wakes — observed live with the Linux oracle: the
+ * TMU0 underflow (vect 0x400) asserted while the kernel still ran with
+ * IMASK 0xF (line dropped on the masked query), then the SCIF TXI
+ * (0x760) asserted at pending==1->2 (no cpu_interrupt), then
+ * default_idle slept forever with 2 pending sources. Keeping the line
+ * armed while anything is pending matches the hardware request line
+ * (and the SLEEP wake depends on it). No effect on boots that never
+ * arm an INTC source (the vendor WinCE path: prio regs never
+ * programmed, pending stays 0). */
+bool sh_intc_has_pending(struct intc_desc *desc)
+{
+    return desc->pending > 0;
+}
+
 typedef enum {
     INTC_MODE_NONE,
     INTC_MODE_DUAL_SET,

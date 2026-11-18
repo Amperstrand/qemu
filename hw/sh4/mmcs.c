@@ -2112,8 +2112,14 @@ static void mmcs_dump_ram(void *opaque)
  * filled the slot. A jsr whose register was JUST loaded via mov.w from
  * a word >= 0x8000 can never be a valid SH4 address -> NOP the jsr at
  * load time. Executed-on-real-HW paths with valid pools are untouched. */
-static void mmcs_nop_marker_jsrs(uint8_t *img, size_t len, hwaddr img_va)
+static void mmcs_nop_marker_jsrs(uint8_t *img, size_t len, hwaddr img_va,
+                                 bool nop_user_coredll)
 {
+    /* L35: the user coredll fixed-slot .text XIP window (ROM 0x90853000,
+     * size 0x625ba — the SRP2 manifest row 0) carries LIVE direct
+     * `jsr @slot` syscall sites; exempt it unless MMCS_NOPALL. */
+    const hwaddr user_text_lo = 0x90853000;
+    const hwaddr user_text_hi = 0x90853000 + 0x625ba;
     int nops = 0;
     for (size_t pc = 0; pc + 40 < len; pc += 2) {
         uint16_t w = img[pc] | (img[pc + 1] << 8);
@@ -2145,6 +2151,11 @@ static void mmcs_nop_marker_jsrs(uint8_t *img, size_t len, hwaddr img_va)
                 j2 = j4;
                 pc += 2;   /* report the jsr address, not the mid */
             }
+        }
+        if (hit && !nop_user_coredll
+            && (hwaddr)(img_va + pc + 2) >= user_text_lo
+            && (hwaddr)(img_va + pc + 2) < user_text_hi) {
+            continue;      /* L35: leave the live user syscall jsrs alone */
         }
         if (hit) {
             img[pc + 2] = 0x09; img[pc + 3] = 0x00;   /* nop the jsr */
@@ -4676,6 +4687,17 @@ static void mmcs_vmstate_register(void)
     mmcs_helper_vmstate_register();
 }
 
+/* MMCS fork (L35/Linux lane): sh vmlinux ELF program headers carry
+ * p_paddr == p_vaddr (P1-linked; the linker script places sections with
+ * AT(ADDR(.)) so the load address IS the P1 virtual address). The SH
+ * P1/P2 windows translate to phys by masking the top bits — translate
+ * the segment addresses for load_elf so the kernel lands in the SDRAM
+ * MR at 0x08000000+. */
+static uint64_t mmcs_linux_elf_translate(void *opaque, uint64_t addr)
+{
+    return addr & 0x1fffffff;
+}
+
 static void mmcs_init(MachineState *machine)
 {
     SuperHCPU *cpu;
@@ -5144,6 +5166,180 @@ static void mmcs_init(MachineState *machine)
         }
     }
 
+    /* MMCS fork (L35/Linux lane, 2026-11-18): MMCS_LINUX=1 — second-OS
+     * oracle mode. Boots a plain Linux/sh kernel (v6.1 LTS, sh4 LE, built
+     * with CPU_SUBTYPE_SH7751R + MEMORY_START=0x08000000/128M, busybox
+     * initramfs embedded) into the SDRAM MR above, instead of the WinCE
+     * image — an independent OS exercising the sh7750 INTC/TMU/SCI models
+     * the WinCE boot path also rides (every divergence = a machine-model
+     * bug; see the lane report). The world: SDRAM (mapped above) + the
+     * full sh7750 SoC model (INTC w/ IPRA@0xffd00004, TMU012@0x1fd80000
+     * + its P4 alias, TMU34@0x1e100000, SCI@0xffe00000 serial0, SCIF@
+     * 0xffe80000 serial1 = the kernel's console=ttySC1, FRQCR/BCS) + the
+     * proven debug SCIF at 0xFFE40000 (serial 2). NO XIP flash, NO vintc/
+     * chanflash services beyond what ran above, NO evt/tick daemons —
+     * the WinCE tail below is skipped entirely (additive, default off;
+     * the default boot is unchanged).
+     * Env:
+     *   MMCS_LINUX_KERNEL   vmlinux ELF (EM_SH; entry from e_entry) or a
+     *                       flat binary (zImage/vmlinux.bin — loaded at
+     *                       MMCS_LINUX_BASE, entered at MMCS_LINUX_ENTRY)
+     *                       default /tmp/mmcs-linux-vmlinux
+     *   MMCS_LINUX_BASE     hex phys base for flat images (default
+     *                       0x08001000 = MEMORY_START+ZERO_PAGE_OFFSET)
+     *   MMCS_LINUX_ENTRY    hex entry override (default: ELF e_entry or
+     *                       the flat base)
+     *   MMCS_LINUX_CMDLINE  written at PARAM+0x100 (phys 0x08001100, the
+     *                       empty_zero_page COMMAND_LINE slot the SH
+     *                       kernel reads with CONFIG_CMDLINE_EXTEND) */
+    if (mmcs_env_on("MMCS_LINUX")) {
+        uint64_t entry = 0, low = 0, high = 0;
+        const char *kern = getenv("MMCS_LINUX_KERNEL")
+                           ? : "/tmp/mmcs-linux-vmlinux";
+        const char *cml = getenv("MMCS_LINUX_CMDLINE");
+        hwaddr flat_base = 0x08001000;
+        uint8_t hdr[4] = { 0, 0, 0, 0 };
+        FILE *kf;
+        int is_elf = 0;
+        ssize_t klen;
+        /* the SoC: INTC + TMU + RTC + SCI/SCIF + BSC/CPG (identical to
+         * the default-boot tail's sh7750_init — the Linux setup-sh7750.c
+         * device/intc tables are a register-for-register match). */
+        sh7750_init(cpu, get_system_memory());
+        /* the kernel's debug SCIF at 0xFFE40000 (serial 2; the proven
+         * port — kept available for earlycon-style polling) */
+        {
+            DeviceState *dev = qdev_new(TYPE_SH_SERIAL);
+            SysBusDevice *sb = SYS_BUS_DEVICE(dev);
+            dev->id = g_strdup("mmcs-dbg-scif");
+            qdev_prop_set_chr(dev, "chardev", serial_hd(2));
+            qdev_prop_set_uint8(dev, "features", SH_SERIAL_FEAT_SCIF);
+            sysbus_realize_and_unref(sb, &error_fatal);
+            sysbus_mmio_map(sb, 0, 0xffe40000);
+        }
+        /* P4 aliases: the sh7750 model maps TMU012 only at phys
+         * 0x1fd80000 and TMU34 at 0x1e100000, but the SH kernel
+         * addresses on-chip blocks P4-style (its platform resources are
+         * 0xffd80000 / 0xfe100000 / 0xffc80000) — same p4map pattern as
+         * the tail below, plus TMU34 which the tail never needed. */
+        {
+            struct { hwaddr p4, phys; const char *name; } l4map[] = {
+                { 0xFFD80000, 0x1FD80000, "mmcs.linux-tmu-p4" },
+                { 0xFFC80000, 0x1FC80000, "mmcs.linux-rtc-p4" },
+                { 0xFE100000, 0x1E100000, "mmcs.linux-tmu34-p4" },
+            };
+            for (unsigned i = 0; i < ARRAY_SIZE(l4map); i++) {
+                MemoryRegionSection sec = memory_region_find(
+                    get_system_memory(), l4map[i].phys, 4);
+                if (sec.mr && sec.mr != get_system_memory()) {
+                    MemoryRegion *al = g_new(MemoryRegion, 1);
+                    memory_region_init_alias(al, NULL, l4map[i].name,
+                                             sec.mr, 0, 0x100);
+                    memory_region_add_subregion_overlap(
+                        get_system_memory(), l4map[i].p4, al, 0);
+                }
+            }
+        }
+
+        /* MMCS_SDHI (L35/Linux lane): the drafted SDHI0/1 host model at
+         * 0xFFE4C000/0xFFE4D000 (car-research emul-drafts/mmcs-sdhi.c,
+         * spec 2026-11-17-sdhi-device-spec.md; empty-slot v1). The
+         * kernel side registers a sh_mobile_sdhi platform device at
+         * 0xffe4c000 + evt2irq(0xAE0) — the tmio/renesas_sdhi driver
+         * probing our empty-slot model is the designed-semantics
+         * oracle (clean enumeration, no card). */
+        if (mmcs_env_on("MMCS_SDHI")) {
+            mmcs_sdhi_init();
+        }
+
+        /* load the kernel: ELF (paddr from program headers) or flat bin */
+        kf = fopen(kern, "rb");
+        if (kf) {
+            size_t n = fread(hdr, 1, sizeof hdr, kf);
+            fclose(kf);
+            is_elf = (n == sizeof hdr && hdr[0] == 0x7f && hdr[1] == 'E'
+                      && hdr[2] == 'L' && hdr[3] == 'F');
+        }
+        if (is_elf) {
+            /* load_rom=false: a ROM blob would be re-applied at system
+             * reset and restore the image bytes over the boot-param
+             * cmdline written below (the L27 ROM-blob-vs-RAM-pointer
+             * lesson, in ELF form). */
+            klen = load_elf_ram(kern, NULL, mmcs_linux_elf_translate, NULL,
+                                &entry, &low, &high,
+                                NULL, 0, 42 /* EM_SH */, 0, 0,
+                                NULL, false);
+            if (klen < 0) {
+                error_report("MMCS_LINUX: cannot load ELF kernel %s "
+                             "(%s)", kern, load_elf_strerror(klen));
+                exit(1);
+            }
+        } else {
+            const char *b = getenv("MMCS_LINUX_BASE");
+            if (b) {
+                flat_base = (hwaddr)strtoul(b, NULL, 16);
+            }
+            klen = load_image_targphys(kern, flat_base,
+                                       MMCS_SDRAM_SIZE - 0x1000);
+            if (klen < 0) {
+                error_report("MMCS_LINUX: cannot load flat kernel %s "
+                             "at %" HWADDR_PRId, kern, flat_base);
+                exit(1);
+            }
+            low = flat_base;
+            high = flat_base + klen;
+            entry = flat_base;
+        }
+        {
+            const char *e = getenv("MMCS_LINUX_ENTRY");
+            if (e) {
+                entry = (uint64_t)strtoul(e, NULL, 16);
+            }
+        }
+        fprintf(stderr, "MMCS: LINUX oracle mode — kernel %s (%s) "
+                "phys %08llx-%08llx entry %08llx\n",
+                kern, is_elf ? "ELF" : "flat",
+                (unsigned long long)low, (unsigned long long)high,
+                (unsigned long long)entry);
+        /* boot-param cmdline at PARAM+0x100 (the empty_zero_page starts
+         * at phys MEMORY_START+ZERO_PAGE_OFFSET = 0x08001000; the SH
+         * kernel reads COMMAND_LINE from +0x100 with CMDLINE_EXTEND) */
+        if (cml && *cml) {
+            size_t cl = strlen(cml);
+            if (cl >= 0x800) {
+                error_report("MMCS_LINUX_CMDLINE too long (%zu)", cl);
+                exit(1);
+            }
+            cpu_physical_memory_write(0x08001100, cml, cl + 1);
+            fprintf(stderr, "MMCS: LINUX cmdline at 0x08001100: %s\n",
+                    cml);
+        }
+
+        /* boot ROM stub at phys 0: reset PC is 0xA0000000 (P2 alias of
+         * phys 0); jump to the kernel entry. mov.l @(1,pc),r0 reads the
+         * pool at +8 (past the jmp delay slot + nop — the delay slot
+         * must NOT be the pool word: the stock stub's pool rides the
+         * delay slot and executes as an instruction; an arbitrary entry
+         * literal is not guaranteed harmless there). */
+        bootrom = g_new(MemoryRegion, 1);
+        memory_region_init_ram(bootrom, NULL, "mmcs.linuxrom", 0x1000,
+                               &error_fatal);
+        boot_stub = memory_region_get_ram_ptr(bootrom);
+        boot_stub[0] = 0x01; boot_stub[1] = 0xD0;   /* mov.l @(1,pc),r0 */
+        boot_stub[2] = 0x2B; boot_stub[3] = 0x40;   /* jmp @r0          */
+        boot_stub[4] = 0x09; boot_stub[5] = 0x00;   /* nop (delay slot) */
+        boot_stub[6] = 0x09; boot_stub[7] = 0x00;   /* nop (pool pad)   */
+        boot_stub[8] = entry & 0xff;                /* pool @+8: EA =   */
+        boot_stub[9] = (entry >> 8) & 0xff;         /* (pc+4)&~3 + 4    */
+        boot_stub[10] = (entry >> 16) & 0xff;
+        boot_stub[11] = (entry >> 24) & 0xff;
+        memory_region_set_readonly(bootrom, true);
+        memory_region_add_subregion(get_system_memory(), 0, bootrom);
+
+        mmcs_usb_setup();
+        return;
+    }
+
     /* XIP flash window at 0x10800000: -pflash/-device loader fills it, or a
      * raw file via firmware property; default: load machine->firmware if set */
     flash = g_new(MemoryRegion, 1);
@@ -5374,10 +5570,34 @@ static void mmcs_init(MachineState *machine)
         g_free(buf);
         g_free(fn);
         /* neutralize all shipped jsr-to-negative-pool sites in the image
-         * (MMCS_NONOP=1 disables for A/B comparison) */
+         * (MMCS_NONOP=1 disables for A/B comparison).
+         *
+         * L35 (S166) EXEMPTION — the USER-COREDLL XIP window. The patcher
+         * was built in the S2 epoch against the KERNEL-ROM sentinel sites
+         * (the 0x9080d8b0 error-printer jsr@0xfffffbeb class) where a
+         * live kernel-mode slot fetch reads P4-bus zeros in this SH4 model
+         * (the L12 recursion march). But the same sweep also NOP'd every
+         * DIRECT `mov.w <negative-slot>; jsr @r3` call site inside the
+         * fixed-slot USER coredll .text (XIP at ROM 0x90853000,
+         * 0x625ba bytes = 123 sites, e.g. ROM 0x9086eb04 = user VA
+         * 0x4002cb04 = coredll ExitThread's NKTerminateThread terminator).
+         * L33 proved those slot calls ARE the real CE5 syscall mechanism
+         * (the vendor exception entry decodes (SPC-0xfffffe01)>>1 and the
+         * PSL trampoline dispatches the method); NOP'ing them makes every
+         * direct-jsr API a silent no-op-return: ExitThread(0) "returns",
+         * the callback unwinds to the 0xfffffdff marker, the ThreadStart
+         * continuation re-launches it, the 0x90835fbe delay-slot store
+         * faults with r9=1, the raise machinery delivers
+         * ThreadExceptionExit(STATUS_STACK_OVERFLOW) which calls
+         * ExitThread again — the S164/S165 x276 exception-exit loop (the
+         * user-mode fetch at the odd slot VA raises the 0x0e0 address
+         * error exactly as on silicon, so these sites work natively once
+         * left alone; the fixed-slot jmp-stub forms were never touched
+         * and always worked). Exempt the window; MMCS_NOPALL=1 restores
+         * the blanket sweep for A/B. */
         if (!getenv("MMCS_NONOP")) {
             mmcs_nop_marker_jsrs(memory_region_get_ram_ptr(flash), len,
-                                 0x90800000);
+                                 0x90800000, getenv("MMCS_NOPALL") != NULL);
         }
     }
     /* InitLocale late-bound pools ship marker 0xffff54e9 (config loader

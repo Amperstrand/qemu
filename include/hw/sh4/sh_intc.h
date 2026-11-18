@@ -59,6 +59,11 @@ struct intc_desc {
 
 int sh_intc_get_pending_vector(struct intc_desc *desc, int imask);
 
+/* MMCS fork (L35/Linux lane, 2026-11-18): true while any INTC source
+ * is pending (asserted && enabled). The CPU-side masked-IRQ path needs
+ * this to keep the HARD line armed — see the do_interrupt -1 handler. */
+bool sh_intc_has_pending(struct intc_desc *desc);
+
 void sh_intc_toggle_source(struct intc_source *source,
                            int enable_adj, int assert_adj);
 

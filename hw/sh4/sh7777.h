@@ -6,4 +6,7 @@
 #include "hw/irq.h"
 void sh7777_init(qemu_irq cpu_irq);
 void mmcs_chanflash_init(void);
+/* MMCS fork (L35/Linux lane): drafted SDHI0/1 host-controller model
+ * (car-research emul-drafts/mmcs-sdhi.c; env MMCS_SDHI, default off) */
+void mmcs_sdhi_init(void);
 #endif

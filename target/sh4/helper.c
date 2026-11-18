@@ -370,7 +370,27 @@ void superh_cpu_do_interrupt(CPUState *cs)
                  * No frame synthesis, no post-API chain walk (the
                  * synthesized-record drive recursed the KCall poll:
                  * the natural frame's chain cells are unknowable at
-                 * trap time). */
+                 * trap time).
+                 *
+                 * L35 (S166): repair the frame's r9 slot before the
+                 * pops. The setup saved r9=pTh (ThreadStart's arg2,
+                 * stored at [launch_sp+0x34]); the user phase's own
+                 * PSL syscall frames reuse the same shallow kstack
+                 * (everything below ktop) and had clobbered it to 1 —
+                 * the continuation's jsr@0x90835fbe then ran its
+                 * delay slot `mov.l r12,@(12,r9)' with r9=1 -> the
+                 * store hit 0xd -> the access-violation raise ->
+                 * ThreadExceptionExit(STATUS_STACK_OVERFLOW) instead
+                 * of the clean EventModify-SET exit (the S164/S165
+                 * x276 exception-exit attractor; live-proven: the
+                 * step-trail through 0x90835fb2 shows r9=1 at the
+                 * jsr while every other popped reg was sane). On HW
+                 * the register set comes from the kernel RESTART
+                 * record ([pTh+0x1C], the resume face) which carries
+                 * pCurTh; restoring pth to the slot gives the pops
+                 * the same value. */
+                cpu_physical_memory_write(
+                    kpage_pa + (launch_sp & 0xFFF) + 0x34, &pth, 4);
                 env->sr |= (1u << SR_MD);
                 env->gregs[15] = launch_sp;
                 env->pc = 0x90835e78;
@@ -378,8 +398,8 @@ void superh_cpu_do_interrupt(CPUState *cs)
                 ncbret++;
                 fprintf(stderr, "MMCS: CBRET callback-return completed, "
                         "th=%08x kstack=%08x -> setup continuation "
-                        "90835e78 (delivery %u/%u)\n", pth, ktop,
-                        ncbret, maxcb);
+                        "90835e78 (r9 slot repaired) (delivery %u/%u)\n",
+                        pth, ktop, ncbret, maxcb);
                 return;
             }
         }
@@ -1721,6 +1741,18 @@ fileview_done:;
                 /* MMCS fork: HARD asserted by our injector with the flag
                  * already consumed = stale line; drop it instead of the
                  * upstream g_assert_not_reached crash path. */
+                /* MMCS fork (L35/Linux lane): a REAL pending request that
+                 * is masked right now (imask 0xF) must keep the HARD
+                 * line armed — sh_intc only re-asserts on the pending
+                 * 0->1 edge, so clearing here would lose the wake for a
+                 * later assert; a guest SLEEP with the line dropped
+                 * never wakes (observed: Linux parked in default_idle
+                 * with TMU0+SCIF TXI pending — see sh_intc_has_pending).
+                 * No effect on boots that never arm an INTC source. */
+                if (env->intc_handle &&
+                    sh_intc_has_pending(env->intc_handle)) {
+                    return; /* masked but armed — line stays high */
+                }
                 cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
                 return; /* masked */
             }
