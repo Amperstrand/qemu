@@ -5537,14 +5537,8 @@ static void mmcs_init(MachineState *machine)
              * (helper.c: fault at 0x908083fc). */
             cpu->env.mmcs_kapifix_active = 1;
         }
-        if (getenv("MMCS_APIRET")) {
-            /* Arm the APIRET user-mode direct-return recovery (helper.c:
-             * user-mode fetch fault at the PSL trampoline window
-             * 0x908236a8 -> set SR.MD, let the trampoline epilogue
-             * unwind the call properly; see the L10 decode there).
-             * Needs the launch lane (KILK-class combo) to matter. */
-            cpu->env.mmcs_apiret_active = 1;
-        }
+        /* (MMCS_APIRET arm deleted 2026-11-19, retirement lane S173 —
+         * inert in the successor world, fidelity scorecard §1.9/§B3.) */
         if (getenv("MMCS_CBRET")) {
             /* Arm the L33 callback-return completion (helper.c: the -1
              * marker slot 0xfffffdff = the vendor's PerformCallBack

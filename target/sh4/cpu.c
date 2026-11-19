@@ -415,7 +415,6 @@ static const VMStateDescription vmstate_sh_cpu = {
         VMSTATE_UINT32(env.mmcs_ilkfix_active, SuperHCPU),
         VMSTATE_UINT32(env.mmcs_ringfix_active, SuperHCPU),
         VMSTATE_UINT32(env.mmcs_kapifix_active, SuperHCPU),
-        VMSTATE_UINT32(env.mmcs_apiret_active, SuperHCPU),
         VMSTATE_UINT32(env.mmcs_cbret_active, SuperHCPU),
         VMSTATE_UINT32(env.mmcs_killstk_active, SuperHCPU),
         VMSTATE_UINT32(env.mmcs_srvpg_active, SuperHCPU),
