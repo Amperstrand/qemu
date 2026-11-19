@@ -3068,46 +3068,10 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     if (ret == MMU_OK) {
         address &= TARGET_PAGE_MASK;
         physical &= TARGET_PAGE_MASK;
-        /* MMCS fork: MMCS_PSLFIX — force-complete coredll's PSL bind.
-         *
-         * Decoded 2026-11-15 (driver-init lane): each process's coredll
-         * binds the running PSL servers' API sets via the bind fn at
-         * coreddll VA 0x400181f0 (queries A/B/C/E = kernel api0-m17
-         * lookups returning set handles 0x00400103..0x00430103, D = the
-         * set-66 ready check via api2-m26). The E step (FUN_40024fc4 ->
-         * FUN_40024cf4 -> coredll heap grow -> kernel api0-m29 call at
-         * slot 0xfffffdc7, PR=0x40021336, hProc=0xc0000005) returns NULL
-         * in our boot: the kernel services it in the target-process
-         * context and that path takes an exception (k.coredll PDATA
-         * cluster 0xc0035bd4+) every time. The bind therefore never
-         * reaches its success tail, the "PSL APIs bound" latch
-         * *(0x400746d8) stays 0, the server-launch loop retries ~3033x,
-         * the launch thread dies -> device.exe/BuiltIn/sdhi.dll never
-         * load -> IISR chain[23]/[24] stay NULL (the 0xAE0/0xB00
-         * no-wake root cause).
-         *
-         * coredll is a compressed XIP module: each process's slot copy is
-         * decompressed to RAM by the kernel pager, so the fix patches the
-         * E-failure branch `bt 0x4001821c` (word 0x89e5 at page offset
-         * 0x24e of the page mapped at VA 0x40018000, signature-verified)
-         * to a NOP at TLB-fill time — before the page is ever translated,
-         * per process instance. The bind tail then always runs and sets
-         * the latch; the PSL heap is simply absent (driver init is local
-         * and does not need it). */
-        if (getenv("MMCS_PSLFIX") && address == 0x40018000) {
-            static const uint8_t sig[6] = {
-                0x0b, 0x43, 0x09, 0x00, 0x08, 0x20   /* jsr r3;nop;tst;bt.. */
-            };
-            uint8_t buf[8];
-            cpu_physical_memory_read(physical + 0x248, buf, 8);
-            if (buf[6] == 0xe5 && buf[7] == 0x89
-                && memcmp(buf, sig, 6) == 0) {
-                static uint8_t nop[2] = { 0x09, 0x00 };
-                cpu_physical_memory_write(physical + 0x24e, nop, 2);
-                fprintf(stderr, "MMCS: PSLFIX patched coredll bind gate "
-                        "(phys %08x)\n", (unsigned)(physical + 0x24e));
-            }
-        }
+        /* (MMCS_PSLFIX deleted 2026-11-19, retirement lane S173: armed-
+         * but-inert requalification archived by the fidelity scorecard
+         * §1.14/§E — patch applied, serial+census identical; the parked
+         * guest-code patch never mattered to any working combo.) */
         /* L21: the ownership choke point — clean writable pages install
          * write-stripped (first store bounces back and pins); pinned
          * pages override the guest translation's pa with their sticky
