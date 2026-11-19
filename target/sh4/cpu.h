@@ -181,7 +181,6 @@ typedef struct CPUArchState {
     uint32_t mmcs_kapifix_active; /* MMCS fork: KAPIFIX kapi thunk bind */
     uint32_t mmcs_cbret_active; /* MMCS fork: CBRET callback-return
                                    * continuation completion (L33) */
-    uint32_t mmcs_killstk_active; /* MMCS fork: KILLSTK kill-dispatch stack */
     uint32_t mmcs_srvpg_active; /* MMCS fork: SRVPG servant .text page-in
                                    * synthesis (L12) */
     uint32_t mmcs_kslot_active; /* MMCS fork: KSLOT kernel-mode slot-call

@@ -4773,9 +4773,12 @@ static void mmcs_init(MachineState *machine)
                 "(64 MB)\n");
     }
 
-    /* MMCS_KILLSTK: 64KB RAM at phys 0x1F00000 backing the KillThread
-     * dispatch stack (P2 0xBF00FF00-class; see the KILLSTK hook in
-     * target/sh4/helper.c do_interrupt — the L11 kill-loop fix). Must
+    /* MMCS_KILLSTK: 64KB RAM at phys 0x1F00000 — the daemon stub page
+     * provider (HDEVT stub P2 0xBF00F000, L16EV, L26EV 0xBF00E200,
+     * L32EV 0xBF00EC00; the L11 kill-dispatch hook that also used the
+     * top page 0xBF00FF00 was deleted 2026-11-19 by the retirement
+     * lane S173 — inert in the successor world, fidelity scorecard
+     * §1.10/§B3; the knob now provides ONLY this page). Must
      * stay below phys 0x20000000: the SH4 P1/P2 windows only translate
      * the low 29 bits (P1/P2 0xA5000000-class aliases phys 0x05000000,
      * NOT 0x25000000 — first cut wrote to an unmapped hole and the
@@ -4794,7 +4797,6 @@ static void mmcs_init(MachineState *machine)
                                &error_fatal);
         memory_region_add_subregion_overlap(get_system_memory(), 0x1F000000,
                                             ks, 1);
-        cpu->env.mmcs_killstk_active = 1;
         fprintf(stderr, "MMCS: KILLSTK kill-stack RAM at phys 0x1F000000 "
                 "(P2 0xBF00FF00)\n");
     }
