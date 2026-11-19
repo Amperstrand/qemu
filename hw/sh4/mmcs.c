@@ -5593,11 +5593,18 @@ static void mmcs_init(MachineState *machine)
          * user-mode fetch at the odd slot VA raises the 0x0e0 address
          * error exactly as on silicon, so these sites work natively once
          * left alone; the fixed-slot jmp-stub forms were never touched
-         * and always worked). Exempt the window; MMCS_NOPALL=1 restores
-         * the blanket sweep for A/B. */
+         * and always worked). Exempt the window when MMCS_USERJSR=1
+         * (the L35 exit fix, armed by the standing combo); the default
+         * keeps the blanket sweep byte-identical (GOLDEN-proven: the
+         * un-gated exemption shifted the default boot's SRD ring +
+         * 422 framebuffer pixels — the default path reads the changed
+         * flash bytes). MMCS_NOPALL=1 + MMCS_USERJSR=1 restores the
+         * blanket sweep for A/B. */
+        bool exempt_user = getenv("MMCS_USERJSR") != NULL
+                           && getenv("MMCS_NOPALL") == NULL;
         if (!getenv("MMCS_NONOP")) {
             mmcs_nop_marker_jsrs(memory_region_get_ram_ptr(flash), len,
-                                 0x90800000, getenv("MMCS_NOPALL") != NULL);
+                                 0x90800000, !exempt_user);
         }
     }
     /* InitLocale late-bound pools ship marker 0xffff54e9 (config loader
