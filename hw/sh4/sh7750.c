@@ -428,35 +428,28 @@ static void sh7750_mem_writel(void *opaque, hwaddr addr,
         return;
     case SH7750_MMUCR_A7:
         if (mem_value & MMUCR_TI) {
-            /* MMCS fork (L34, env MMCS_TIFLUSH): TI invalidates the
-             * ENTIRE UTLB/ITLB on real silicon — every cached
-             * translation dies and the next access re-translates (the
-             * CE5 SH4 kernel's slot-0 process switch relies on this:
-             * the new process's page tables only become visible because
-             * the old entries are gone). QEMU's
-             * cpu_sh4_invalidate_tlb only clears env->{u,it}lb — the
-             * softmmu's already-installed VA->PA entries survived the
-             * guest's full invalidate, so the DEAD process's private
-             * pages (slot-0 .data with its critsec/CRT state) kept
-             * serving the newcomer after an ASID recycle — the L34
-             * critsec-park root cause. Flush the softmmu too. Env-gated
-             * (default off) to keep the default boots byte-identical. */
-            static int tiflush = -1;
-            if (tiflush < 0) {
-                tiflush = getenv("MMCS_TIFLUSH") != NULL;
-            }
+            /* MMCS fork note (2026-11-19, retirement lane S173): TI
+             * invalidates the ENTIRE UTLB/ITLB on real silicon — every
+             * cached translation dies and the next access re-translates.
+             * The L34 lane's env MMCS_TIFLUSH added a conditional
+             * tlb_flush(CPU(s->cpu)) here on the belief that
+             * cpu_sh4_invalidate_tlb only clears env->{u,it}lb —
+             * DISPROVEN AGAINST THE UPSTREAM BASE: our v8.2.2 upstream
+             * cpu_sh4_invalidate_tlb (target/sh4/helper.c) already ends
+             * with tlb_flush(env_cpu(s)), so the softmmu was flushed on
+             * every TI all along and the knob's extra flush was an
+             * idempotent duplicate (the fidelity scorecard §B4's
+             * ±TIFLUSH A/B freed the critsec park in BOTH arms —
+             * consistent with a no-op). Knob deleted; the diagnostic
+             * MMCS_TICENSUS (the vendor writes TI 21x/boot) stays. */
             if (getenv("MMCS_TICENSUS")) {
                 static int nti;
                 if (nti++ < 64) {
                     fprintf(stderr, "MMCS-TI full TLB invalidate #%d "
-                            "(pc below retranslates, flush=%d)\n",
-                            nti, tiflush);
+                            "(pc below retranslates)\n", nti);
                 }
             }
             cpu_sh4_invalidate_tlb(&s->cpu->env);
-            if (tiflush) {
-                tlb_flush(CPU(s->cpu));
-            }
         }
         s->cpu->env.mmucr = mem_value & ~MMUCR_TI;
         return;
