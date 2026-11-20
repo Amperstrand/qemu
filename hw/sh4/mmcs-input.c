@@ -366,6 +366,18 @@ static void mmcs_in_seq_start(int kind, int steps, int step_ms,
 
 /* ---- QEMU input-core wiring (VNC/SDL mouse = finger, keys = buttons) - */
 
+/* round-to-nearest inverse of the input core's ABS scaling: VNC sends
+ * console pixel p, the core floors value = p*32767/res (ui/input.c
+ * qemu_input_queue_abs), so pixel = round(value*res/32767) recovers p
+ * EXACTLY (double-flooring without this skews every coordinate by
+ * ~1px: live-caught 400->399, 300->299). */
+static int mmcs_in_abs_to_pixel(int value, int res)
+{
+    int p = (int)(((int64_t)value * res + 16383) / 32767);
+
+    return MAX(0, MIN(p, res - 1));
+}
+
 static QemuInputHandlerState *mmcs_in_ihs;
 static int mmcs_in_absx = -1, mmcs_in_absy = -1;
 static int mmcs_in_btn, mmcs_in_pen;
@@ -390,15 +402,11 @@ static void mmcs_in_input_event(DeviceState *dev, QemuConsole *src,
     switch (evt->type) {
     case INPUT_EVENT_KIND_ABS:
         if (evt->u.abs.data->axis == INPUT_AXIS_X) {
-            mmcs_in_absx = qemu_input_scale_axis(evt->u.abs.data->value,
-                                                 INPUT_EVENT_ABS_MIN,
-                                                 INPUT_EVENT_ABS_MAX,
-                                                 0, MMCS_IN_RES_X - 1);
+            mmcs_in_absx = mmcs_in_abs_to_pixel(evt->u.abs.data->value,
+                                                MMCS_IN_RES_X);
         } else if (evt->u.abs.data->axis == INPUT_AXIS_Y) {
-            mmcs_in_absy = qemu_input_scale_axis(evt->u.abs.data->value,
-                                                 INPUT_EVENT_ABS_MIN,
-                                                 INPUT_EVENT_ABS_MAX,
-                                                 0, MMCS_IN_RES_Y - 1);
+            mmcs_in_absy = mmcs_in_abs_to_pixel(evt->u.abs.data->value,
+                                                MMCS_IN_RES_Y);
         }
         break;
     case INPUT_EVENT_KIND_BTN:
