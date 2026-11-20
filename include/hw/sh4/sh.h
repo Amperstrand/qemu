@@ -28,6 +28,7 @@
 #define QEMU_HW_SH_H
 
 #include "hw/sh4/sh_intc.h"
+#include "hw/qdev-core.h"
 #include "target/sh4/cpu-qom.h"
 
 #define A7ADDR(x) ((x) & 0x1fffffff)
@@ -56,6 +57,10 @@ int sh7750_register_io_device(struct SH7750State *s,
 /* sh_serial.c */
 #define TYPE_SH_SERIAL "sh-serial"
 #define SH_SERIAL_FEAT_SCIF (1 << 0)
+
+/* MMCS fork (input lane): RX feeder for emulated sub-CPU frames (no
+ * chardev on the injected SCIF) — see hw/char/sh_serial.c. */
+int sh_serial_rx_inject(DeviceState *dev, const uint8_t *buf, int size);
 
 /* sh7750.c */
 qemu_irq sh7750_irl(struct SH7750State *s);

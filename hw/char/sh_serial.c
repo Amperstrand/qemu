@@ -150,7 +150,20 @@ static void sh_serial_write(void *opaque, hwaddr offs,
                 s->flags &= ~SH_SERIAL_FLAG_BRK;
             }
             if (!(val & (1 << 1))) {
-                s->flags &= ~SH_SERIAL_FLAG_RDF;
+                /* MMCS fork (input lane): RDF is a LIVE status on
+                 * silicon — it re-asserts while the receive FIFO count
+                 * stays >= the trigger, so a guest that clears RDF
+                 * after each SCFRDR pop (the Micon-loader protocol:
+                 * read one byte, write FSR=0, re-poll) still sees the
+                 * remaining bytes. The stock model latched RDF at push
+                 * time only, stranding FIFO data behind a cleared
+                 * flag (live-caught: injected 7-byte frame drained
+                 * exactly one byte, then the receive-error timeout). */
+                if (s->rx_cnt >= s->rtrg) {
+                    s->flags |= SH_SERIAL_FLAG_RDF;
+                } else {
+                    s->flags &= ~SH_SERIAL_FLAG_RDF;
+                }
             }
             if (!(val & (1 << 0))) {
                 s->flags &= ~SH_SERIAL_FLAG_DR;
@@ -391,6 +404,29 @@ static void sh_serial_event(void *opaque, QEMUChrEvent event)
     if (event == CHR_EVENT_BREAK) {
         sh_serial_receive_break(s);
     }
+}
+
+/* MMCS fork (input lane, 2026-11-19): RX feeder for emulated sub-CPU
+ * (Micon) frames — the SCIF at 0xFFE41000 has no host chardev: the
+ * sub-CPU peer does not exist, so the mmcs-input device injects whole
+ * wire frames byte-by-byte through this call instead of a CharBackend.
+ * Same acceptance path as the chardev handler (sh_serial_receive1) with
+ * the same flow control (sh_serial_can_receive: FIFO space, RE-gated).
+ * Returns the number of bytes accepted (0 = receiver not ready); the
+ * caller paces the remainder. */
+int sh_serial_rx_inject(DeviceState *dev, const uint8_t *buf, int size)
+{
+    SHSerialState *s = SH_SERIAL(dev);
+    int n = sh_serial_can_receive(s);
+
+    if (n <= 0) {
+        return 0;
+    }
+    if (n > size) {
+        n = size;
+    }
+    sh_serial_receive1(s, buf, n);
+    return n;
 }
 
 static const MemoryRegionOps sh_serial_ops = {

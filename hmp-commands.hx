@@ -778,6 +778,79 @@ SRST
 ERST
 
     {
+        .name       = "mmcs_touch",
+        .args_type  = "x:i,y:i,phase:s,ms:i?",
+        .params     = "x y down|up|tap [ms]",
+        .help       = "MMCS: inject a touch event at panel point x,y (tap hold default 80ms)",
+        .cmd        = hmp_mmcs_touch,
+    },
+
+SRST
+``mmcs_touch`` *x* *y* *down|up|tap* [*ms*]
+  Inject a sub-CPU Micon touch frame at panel point *x,y* (800x480,
+  identity-mapped). ``tap`` holds for *ms* milliseconds (default 80).
+ERST
+
+    {
+        .name       = "mmcs_swipe",
+        .args_type  = "x1:i,y1:i,x2:i,y2:i,ms:i?,steps:i?",
+        .params     = "x1 y1 x2 y2 [ms] [steps]",
+        .help       = "MMCS: inject a drag from x1,y1 to x2,y2 over ms (default 300)",
+        .cmd        = hmp_mmcs_swipe,
+    },
+
+SRST
+``mmcs_swipe`` *x1* *y1* *x2* *y2* [*ms* [*steps*]]
+  Inject a streamed drag (gesture) across the panel over *ms*
+  milliseconds (default 300) in *steps* interpolated samples
+  (default ms/25).
+ERST
+
+    {
+        .name       = "mmcs_key",
+        .args_type  = "code:s,phase:s,ms:i?",
+        .params     = "code down|up|press [ms]",
+        .help       = "MMCS: inject a hard-button key event (raw hex/dec code)",
+        .cmd        = hmp_mmcs_key,
+    },
+
+SRST
+``mmcs_key`` *code* *down|up|press* [*ms*]
+  Inject a hard-button key frame with raw *code* (hex ``0x..`` or
+  decimal; the named-key table is a standing decode). ``press`` holds
+  for *ms* milliseconds (default 80).
+ERST
+
+    {
+        .name       = "mmcs_reverse",
+        .args_type  = "state:s",
+        .params     = "on|off",
+        .help       = "MMCS: inject the reverse-gear frame (NSUB 0x120F transmission record)",
+        .cmd        = hmp_mmcs_reverse,
+    },
+
+SRST
+``mmcs_reverse`` *on|off*
+  Inject the reverse-gear record (private NSUB cmd 0x120F, the
+  NSensorDeviceSubCpuShiftPos carrier). Gear byte values are
+  env-tunable (MMCS_INPUT_GEAR_R / MMCS_INPUT_GEAR_OFF).
+ERST
+
+    {
+        .name       = "mmcs_input_info",
+        .args_type  = "",
+        .params     = "",
+        .help       = "MMCS: show the input injector state and counters",
+        .cmd        = hmp_mmcs_input_info,
+    },
+
+SRST
+``mmcs_input_info``
+  Show the Micon input injector state (carrier cmd, gear bytes,
+  frames/counters, pen state).
+ERST
+
+    {
         .name       = "wavcapture",
         .args_type  = "path:F,audiodev:s,freq:i?,bits:i?,nchannels:i?",
         .params     = "path audiodev [frequency [bits [channels]]]",

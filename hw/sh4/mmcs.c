@@ -4947,6 +4947,17 @@ static void mmcs_init(MachineState *machine)
                 "(user windows per-ASID, C0/stack/KData shared)\n");
     }
 
+    /* MMCS fork (input lane, 2026-11-19): MMCS_INPUT=1 — the SCIF1
+     * Micon injector (hw/sh4/mmcs-input.c): the sub-CPU link SCIF at
+     * 0xFFE41000 with an RX frame feeder, the VNC-pointer-as-touch-
+     * panel input handler, and the mmcs_touch/mmcs_swipe/mmcs_key/
+     * mmcs_reverse HMP verbs. Called before the world branches so it
+     * arms in every mode (the MLD loader world — the earliest live
+     * consumer of the link, its subcpu_recv_req loop is the injection
+     * oracle — the handoff dual-world, and the default WinCE boot).
+     * Default off; the default boot never creates the SCIF. */
+    mmcs_input_init();
+
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —
      * map the loader RAM image, our payload, and the test stub at phys 0.
      * MMCS_PAYLOAD = container file (mapped at phys 0x0A000000),

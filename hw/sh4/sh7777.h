@@ -9,4 +9,7 @@ void mmcs_chanflash_init(void);
 /* MMCS fork (L35/Linux lane): drafted SDHI0/1 host-controller model
  * (car-research emul-drafts/mmcs-sdhi.c; env MMCS_SDHI, default off) */
 void mmcs_sdhi_init(void);
+/* MMCS fork (input lane, 2026-11-19): the SCIF1 Micon injector
+ * (hw/sh4/mmcs-input.c; env MMCS_INPUT, default off) */
+void mmcs_input_init(void);
 #endif
