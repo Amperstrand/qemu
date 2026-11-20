@@ -1660,6 +1660,13 @@ fileview_done:;
         if (env->mmcs_evt_inject) {          /* MMCS fork: vendor-INTC event */
             irq_vector = env->intevt;
             env->mmcs_evt_inject = 0;
+            if (getenv("MMCS_EVTDBG")) {
+                uint32_t br7 = env->gregs[7 ^ 0x10];
+                uint32_t c7 = 0;
+                cpu_memory_rw_debug(cs, br7 + 40, (void *)&c7, 4, 0);
+                fprintf(stderr, "EVTDBG: inject vec=%03x br7=%08x [br7+28]=%08x\n",
+                        irq_vector, br7, c7);
+            }
         } else {
             irq_vector = sh_intc_get_pending_vector(env->intc_handle,
                                                     (env->sr >> 4) & 0xf);
