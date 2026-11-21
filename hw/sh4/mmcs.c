@@ -4014,18 +4014,28 @@ static void mmcs_l46_scan(void)
         if (wlh == 0) {
             continue;               /* unlinked = L32EV's class */
         }
-        /* the create-body kstack witness (is_cpw — same as L32EV) */
+        /* the create-body kstack witness (is_cpw — same as L32EV but
+         * a wider window: the walker's sp wobbles between the L26EV
+         * re-wake frames and the postwait return cell can sit past
+         * +0x60 in the re-entered frame — live-caught) */
         uint32_t ssp = 0, is_cpw = 0;
         cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &ssp, 4);
         if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
-            for (uint32_t sa = ssp; sa < ssp + 0x60; sa += 4) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
                 uint32_t pa3 = mmcs_l32_stack_pa(sa);
                 uint32_t w3 = 0;
                 if (!pa3) {
                     continue;
                 }
                 cpu_physical_memory_read(pa3, &w3, 4);
-                if (w3 >= 0x9082c000 && w3 < 0x90838000) {
+                /* the CREATE BODY proper [0x9082ce00,0x9082ed00):
+                 * the postwait 9082ceb6 + the wait-return 9082ec86
+                 * cells — NOT the wide wait-wrapper window (the face
+                 * 0x90837cf6 is the GENERIC WaitForObjects face;
+                 * live-caught: the wide window matched a MARKED DoWait
+                 * orphan (906dd000) and the one-shot fired on the
+                 * wrong thread) */
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
                     is_cpw = 1;
                     break;
                 }
@@ -4034,8 +4044,36 @@ static void mmcs_l46_scan(void)
         if (!is_cpw) {
             continue;
         }
-        /* stability: the same dead shape across >= 2 cadences */
-        uint32_t key = tva ^ ssp ^ obj;
+        /* the filesys post-create witness: [th+0x150] reads the
+         * filesys continuation (the walker's live value c00bb4e0 —
+         * the TRUE post-CreateProcessW site, the L36-era c00bb3ba
+         * label corrected); a generic kernel-side waiter carries a
+         * kernel-window return there */
+        uint32_t wret = 0;
+        cpu_physical_memory_read(tva - 0x80000000 + 0x150, &wret, 4);
+        if (wret < 0xC0000000 || wret >= 0xC1000000) {
+            continue;
+        }
+        /* stability: the same dead interlock across >= 2 cadences.
+         * The key is {thread, waited obj} ONLY — the walker's sp
+         * wobbles between the L26EV re-wake frames (live-caught: the
+         * sp-keyed counter never accumulated although every filter
+         * passed; the interlock identity is thread+object). */
+        uint32_t key = tva ^ obj;
+        {   /* one-shot diagnostic: the first full-shape candidate's
+             * cells + the delivery-gate state */
+            static int once;
+            if (!once) {
+                once = 1;
+                fprintf(stderr, "MMCS-L46: diag t=%" PRId64 "ms cand "
+                        "%08x st16=%08x wobj=%08x obj=%08x sig=%02x "
+                        "wlh=%08x ssp=%08x is_cpw=%u ents0pend=%u "
+                        "key=%08x\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, st16,
+                        wobj, obj, sig46, wlh, ssp, is_cpw,
+                        mmcs_l16_ents[0].pending, key);
+            }
+        }
         if (key != mmcs_l46_key) {
             mmcs_l46_key = key;
             mmcs_l46_stable = 1;
@@ -4110,9 +4148,13 @@ static void mmcs_l46_scan(void)
                 "ctx repair + v7 stub wake walker %08x (sp %08x, wait-obj "
                 "%08x)\n", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, wlh,
                 tva, ssp, wobj);
+        /* no post-loop reset: the counter is monotonic per-key (a
+         * mid-wake scan that misses the shape is noise, not
+         * evidence of interlock life — the key-change path alone
+         * resets; live-caught: the every-other-scan reset starved
+         * the delivery forever while every sampled cell matched) */
         return;                     /* one-shot total */
     }
-    mmcs_l46_stable = 0;            /* no candidate this scan */
 }
 
 /* MMCS fork (L36): MMCS_L36EV — the post-exit requeue daemon (the
