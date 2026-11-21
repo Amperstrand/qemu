@@ -2573,6 +2573,68 @@ static void mmcs_l38timer_seed(void)
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), fn1);
 }
 
+/* MMCS fork (L39/S181): MMCS_L39TBIND — the fn2a/fn1b timer-slot
+ * binding EXPERIMENT (mechanism-(b) lane). The decode this lane: the
+ * two remaining OAL dispatch slots are fn2a [table+0xB4] (called by
+ * timer-fn2 0x90808478 with r4 = &{fn1's resched-consider return, 0,
+ * old [0x8860200c]} — the counter-delta feed; expected to update the
+ * change-detect cells [0x8860200c]/[0x88602010]) and fn1b [table+0xBC]
+ * (fired by the fn2-tail 0x90807e54's change-detect via the thunk
+ * 0x908084c8). The SHIPPED table holds the no-op default 0x9082e598
+ * (fn2a) and 0x908419f0 (fn1b); the L37-dead-lane candidates
+ * 0x90841fd0/0x90842038 (the table+0xA8/+0xAC neighbors) are x10000
+ * 64-bit time converters whose (r4=in, r5=out64) protocol does NOT
+ * match fn2a's 3-dword-ctx shape — the live A/B here records the
+ * verdict either way. The resched-consider itself ([table+0xC8] >=
+ * [table+0xC4], fn1's return) is fed by the SCHEDULER's quantum arming
+ * site 0x9082760a ([table+0xC4] = r9 + a notify method through the
+ * [0x8867f03c] scheduler vtable), NOT by these slots.
+ * Env: MMCS_L39TBIND="b4=HEX,bc=HEX" (either optional), default off;
+ * binds once at the L38TIMER cadence, only while a slot still holds
+ * its shipped default. */
+static void mmcs_l39tbind_seed(void)
+{
+    static int done;
+    const char *spec = getenv("MMCS_L39TBIND");
+    if (done || !spec || !*spec) {
+        return;
+    }
+    uint32_t tab = 0;
+    cpu_physical_memory_read(0x08602BEC, &tab, 4);
+    if (tab != 0x8867AA08) {
+        return;
+    }
+    char want[16] = { 0 };
+    for (unsigned slot = 0; slot < 2; slot++) {
+        const char *key = slot ? "bc=" : "b4=";
+        const char *p = strstr(spec, key);
+        if (!p) {
+            continue;
+        }
+        p += 3;
+        unsigned n = 0;
+        while (n < 15 && p[n] && p[n] != ',' && p[n] != ' ') {
+            want[n] = p[n];
+            n++;
+        }
+        want[n] = 0;
+        uint32_t val = strtoul(want, NULL, 16);
+        uint32_t pa = slot ? 0x0867AAC4 : 0x0867AABC;
+        uint32_t cur = 0;
+        cpu_physical_memory_read(pa, &cur, 4);
+        uint32_t dflt = slot ? 0x908419F0 : 0x9082E598;
+        if (cur != dflt && cur != 0x1010101 && cur != 0) {
+            continue;                 /* someone bound it for real */
+        }
+        cpu_physical_memory_write(pa, &val, 4);
+        fprintf(stderr, "MMCS-L39TBIND: t=%" PRId64 "ms OAL %s slot "
+                "bound (0x%08x -> 0x%08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), slot ? "fn1b" : "fn2a",
+                cur, val);
+    }
+    done = 1;
+}
+
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
@@ -2580,6 +2642,7 @@ static void mmcs_tick_deliver(void *opaque)
     bool l16 = false;
     mmcs_tick_live = 1;
     mmcs_l38timer_seed();
+    mmcs_l39tbind_seed();
     if (hdevt) {
         mmcs_inject_evt(0x200);
         if (--mmcs_hdevt_pending == 0) {
@@ -5617,6 +5680,9 @@ static void mmcs_init(MachineState *machine)
     }
     if (getenv("MMCS_KSLOT")) {
         cpu->env.mmcs_kslot_active = 1;
+    }
+    if (getenv("MMCS_L39KILL")) {
+        cpu->env.mmcs_l39kill_active = 1;
     }
 
     /* MMCS fork (L21): MMCS_PGOWN=1 — arm the write-sticky page-ownership

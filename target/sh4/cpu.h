@@ -185,6 +185,8 @@ typedef struct CPUArchState {
                                    * synthesis (L12) */
     uint32_t mmcs_kslot_active; /* MMCS fork: KSLOT kernel-mode slot-call
                                    * illegal->0x0e0 re-tag (L12) */
+    uint32_t mmcs_l39kill_active; /* MMCS fork: L39 kstack-execution
+                                   * kill-continuation repair (S181) */
     uint32_t mmcs_cowfix_active; /* MMCS fork: COWFIX user .data COW */
 
     tlb_t itlb[ITLB_SIZE];      /* instruction translation table */

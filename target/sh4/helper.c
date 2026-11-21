@@ -1641,6 +1641,51 @@ fileview_done:;
      * the vendor syscall entry decodes (SPC/SSR already saved by the
      * illegal raise; TEA := pc) and let the normal dispatch deliver
      * the vendor kernel its syscall. Gated on the launch-phase latch. */
+    /* MMCS fork (L39/S181): the kstack-execution kill-continuation
+     * repair. DECODE (live, int+exec windows, this lane): the woken
+     * DoWait-orphan's exception-forward cascade (the per-wake
+     * c004dba2 entries) DEGRADES — the thread's saved kernel context
+     * acquires an SPC pointing INTO ITS OWN D0-window kstack (first
+     * stack-landing during the c0000005 forwards; then every wake
+     * rte-delivers it there via the KCall-exit restore 0x90823344-8c
+     * reading [frame+16]), the fetch executes stack words as code until
+     * an illegal 0x180 lands (e.g. pc=0xd01cf900 pr=0xd01cf8fc on the
+     * PNP waiter), the vendor forward machinery re-forwards it as
+     * 0xC000001D to the k.coredll stub ([0x8867f030]=0xc004dba2), the
+     * stub re-raises through the KSLOT slot call, and the thread
+     * re-parks at the DoWait face — one cycle per L26 wake, forever,
+     * at a FIXED frame (the vendor endgame — the told waiter's death —
+     * never completes). On HW the vendor NEVER executes a kernel
+     * stack: a KERNEL-mode illegal whose fault pc is inside the D0
+     * kstack window [0xD0000000,0xDC000000) is unreachable vendor
+     * state, and the vendor's own response to a dead corrupted thread
+     * is the kill continuation (the S131-decoded dispatch: the thread
+     * ctx pc=KillThread 0x9083be50 + a valid kill stack). Fix: at the
+     * exception boundary, route the thread into THAT vendor kill
+     * continuation — pc=0x9083be50, r15=P2 0xBF00FF00 (the dedicated
+     * kill-stack RAM page at phys 0x1F000000, mapped every boot; the
+     * L11-era discipline) — so the vendor's own KillThread shutdown
+     * (owner-wait, handle close, DeCommitStack) completes the death
+     * natively instead of cycling. The death is COMPLETED, not
+     * suppressed: the told waiter exits through the same vendor path
+     * L36/L37 watched run to KillThread when the cascade got enough
+     * slices. Env-gated MMCS_L39KILL, default off. */
+    if (env->mmcs_l39kill_active && do_exp
+        && (cs->exception_index == 0x180 || cs->exception_index == 0x1a0)
+        && (env->sr & (1u << SR_MD))
+        && env->pc >= 0xD0000000u && env->pc < 0xDC000000u) {
+        static int nl39;
+        if (nl39++ < 32) {
+            fprintf(stderr, "MMCS-L39KILL: t-kstack-exec pc=%08x pr=%08x "
+                    "spc=%08x -> vendor kill continuation 9083be50 "
+                    "(%d)\n", env->pc, env->pr, env->spc, nl39);
+        }
+        env->gregs[15] = 0xBF00FF00u;
+        env->pc = 0x9083BE50u;
+        cs->exception_index = -1;
+        return;
+    }
+
     if (env->mmcs_kslot_active && do_exp
         && (cs->exception_index == 0x180 || cs->exception_index == 0x1a0)
         && (env->sr & (1u << SR_MD))
