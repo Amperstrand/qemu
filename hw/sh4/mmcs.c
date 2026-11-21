@@ -2510,13 +2510,17 @@ static void mmcs_l32_scan(void);
 static int mmcs_l32_armed;
 static uint32_t mmcs_l32_cadence_ms = 2000;
 static uint32_t mmcs_l32_max_deliv = 64;
+/* L46: the create-interlock SPLIT repair (one-shot; full block below) */
+static void mmcs_l46_scan(void);
+static uint32_t mmcs_l46_armed;
+static uint32_t mmcs_l46_cadence_ms = 2000;
 
 /* savestate lane: the tick-chain cadence counters were function-local
  * statics — hoisted so the snapshot can stream them (losing them
  * shifts every daemon scan phase by up to one cadence period after a
  * restore, which breaks identical-continuation verify). */
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
-static uint64_t mmcs_tick_l37;
+static uint64_t mmcs_tick_l37, mmcs_tick_l46;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2863,6 +2867,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l32_armed && ++mmcs_tick_l32 >= mmcs_l32_cadence_ms) {
             mmcs_tick_l32 = 0;
             mmcs_l32_scan();
+        }
+        /* L46: the create-interlock SPLIT repair daemon (same class;
+         * one-shot — see mmcs_l46_scan) */
+        if (mmcs_l46_armed && ++mmcs_tick_l46 >= mmcs_l46_cadence_ms) {
+            mmcs_tick_l46 = 0;
+            mmcs_l46_scan();
         }
         /* L36: the post-exit requeue daemon (same class) */
         if (mmcs_l36_armed && ++mmcs_tick_l36 >= mmcs_l36_cadence_ms) {
@@ -3899,6 +3909,212 @@ static void mmcs_l32_scan(void)
     }
 }
 
+/* MMCS fork (L46): MMCS_L46FIX — the create-interlock SPLIT repair
+ * (S193, decoded 2026-11-21; the L45 S191 decode's named next rung).
+ *
+ * THE SPLIT (L45, live): the create-walker's interlock has TWO
+ * objects. The walker (ctx pc 0x90837cf6 = the SC_CreateProc
+ * WaitForObjects face, schedule.c:6901) binds the event resolved
+ * through its OWN wait-array entry — sig byte 0x00 forever, the
+ * walker's wait entry linked on that object's waiter list — while
+ * the loader-side shims' SETs (the 8Hz create-retry storm,
+ * t=3.3-9.5s, SET jsr 0x90835fda) land on the psi-side event; both
+ * 0x90835f14-class shims die into the kill grave by ~9.5s, so
+ * nothing will ever signal the walker's object: CreateProcessW
+ * never returns, the filesys launch loop cannot iterate past its
+ * FIRST create, Depend20/SignalStarted(10) never entered.
+ *
+ * THE FIX — the stock completion re-delivered through the proven
+ * L32EV family (same recipe verbatim): the EventModify-SET state
+ * byte on the walker's OWN waited object (the vendor SET semantics
+ * L45 taped landing on the wrong half), the wait-context linkage
+ * repair ([pTh+0x1F8] wait entry + type byte 4 EVNT, both
+ * repair-if-zero only), and the L26 v7 stub wake (MakeRun + resched
+ * + pick + switcher) — the SAME wake delivery the L26EV daemon
+ * already runs on this exact thread every cadence (L45: "walker
+ * re-evaluates, re-blocks"); with the sig byte SET, the same vendor
+ * re-evaluation completes the wait natively and CreateProcessW
+ * returns through 100% vendor code.
+ *
+ * Discriminators (all readback; run-variance safe):
+ *  - the create-walker face: ctx pc 0x90837cf6, (st16&3)==2 BLOCKED,
+ *    D0 64K kstack, waited object resolved through the walker's OWN
+ *    wait-array entry (pTh-matched, the L32EV resolver loop) = an
+ *    arena object with sig byte 0x00 whose waiter-list head [obj+8]
+ *    is NON-zero — the LINKED shape, the complement of L32EV's
+ *    unlinked launch class (wblk==0);
+ *  - the kstack return chain carries a 0x9082c000-0x90838000 kernel
+ *    create-window address (is_cpw — same as L32EV);
+ *  - STABILITY: the same {thread, sp, waited obj, sig 0} shape on
+ *    >= 2 consecutive cadences (the storm long dead, the interlock
+ *    provably abandoned — the delivery is one-shot total).
+ * Env MMCS_L46FIX (default OFF; cadence MMCS_L46FIX_MS default
+ * 2000). Shares the L32 slot (evt 0x220 / ents[0] / stub
+ * 0xBF00EC00) with L32EV — disjoint classes, pending/slot-guarded.
+ * Needs MMCS_KILLSTK + MMCS_TICK. */
+static uint32_t mmcs_l46_done, mmcs_l46_stable;
+static uint32_t mmcs_l46_key;
+
+static void mmcs_l46_scan(void)
+{
+    if (!mmcs_l46_armed || mmcs_l46_done) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || tva == pcur) {
+            continue;
+        }
+        /* resolve the waited object through the walker's own
+         * wait-array entry (the L32EV resolver) */
+        uint32_t obj = 0;
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 != tva) {
+                continue;
+            }
+            uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+            if (pa2) {
+                cpu_physical_memory_read(pa2, &obj, 4);
+            }
+            break;
+        }
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* not an arena kernel object */
+        }
+        uint8_t sig46 = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sig46, 1);
+        if (sig46 & 1) {
+            continue;               /* signaled — not the dead half */
+        }
+        uint32_t wlh = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 8, &wlh, 4);
+        if (wlh == 0) {
+            continue;               /* unlinked = L32EV's class */
+        }
+        /* the create-body kstack witness (is_cpw — same as L32EV) */
+        uint32_t ssp = 0, is_cpw = 0;
+        cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &ssp, 4);
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x60; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082c000 && w3 < 0x90838000) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* stability: the same dead shape across >= 2 cadences */
+        uint32_t key = tva ^ ssp ^ obj;
+        if (key != mmcs_l46_key) {
+            mmcs_l46_key = key;
+            mmcs_l46_stable = 1;
+            break;                  /* candidate seen — keep the count */
+        }
+        if (++mmcs_l46_stable < 2) {
+            break;                  /* candidate seen — keep the count */
+        }
+        /* DELIVER — the L32EV recipe verbatim: SET state byte, ctx
+         * repair (if-zero), v7 stub wake on the walker */
+        if (mmcs_l16_ents[0].pending) {
+            return;                 /* L32EV mid-delivery — retry */
+        }
+        sig46 |= 1;
+        cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig46, 1);
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 == tva) {
+                uint32_t entry = wobj + wi;
+                uint32_t f8 = 0;
+                cpu_physical_memory_read(tva - 0x80000000 + 0x1f8,
+                                          &f8, 4);
+                if (f8 == 0) {
+                    cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
+                                              &entry, 4);
+                }
+                uint32_t t4 = 4;
+                uint32_t pa2 = mmcs_l32_stack_pa(entry + 0x18);
+                if (pa2) {
+                    uint32_t curb = 0;
+                    cpu_physical_memory_read(pa2, &curb, 4);
+                    if (curb == 0) {
+                        cpu_physical_memory_write(pa2, &t4, 4);
+                    }
+                }
+                break;
+            }
+        }
+        cpu_physical_memory_write(0x1F00EC00, mmcs_l26_stub,
+                                  sizeof mmcs_l26_stub);
+        cpu_physical_memory_write(0x1F00EC00 + 0x6c, &tva, 4);
+        cpu_physical_memory_write(0x1F00EC00 + 0x68,
+                                  &(uint32_t){ MMCS_L32_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(0x1F00ECF0,
+                                  &(uint32_t){ MMCS_L32_STUB_VA + 0xf0 }, 4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L32_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L32_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L46: slot evt 0x220 busy (%08x) - "
+                        "retry next cadence\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L32_SLOT_PA,
+                                      &(uint32_t){ MMCS_L32_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[0];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L32_STUB_VA;
+        e->evt_code = 0x220;
+        e->slot_pa = MMCS_L32_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l46_done = 1;
+        fprintf(stderr, "MMCS-L46: t=%" PRId64 "ms create-interlock SPLIT "
+                "repair: obj %08x sig 00->01 (linked waiter-list %08x), "
+                "ctx repair + v7 stub wake walker %08x (sp %08x, wait-obj "
+                "%08x)\n", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, wlh,
+                tva, ssp, wobj);
+        return;                     /* one-shot total */
+    }
+    mmcs_l46_stable = 0;            /* no candidate this scan */
+}
+
 /* MMCS fork (L36): MMCS_L36EV — the post-exit requeue daemon (the
  * S173 frontier, decoded 2026-11-20).
  *
@@ -4743,6 +4959,25 @@ static void mmcs_l16_boot_parse(void)
                     "0x220 wired on first delivery)\n",
                     mmcs_l32_cadence_ms, mmcs_l32_max_deliv,
                     MMCS_L32_STUB_VA);
+        }
+    }
+    /* L46: the create-interlock SPLIT repair (one-shot; shares the
+     * L32 slot machinery, pending/slot-guarded — see mmcs_l46_scan) */
+    if (getenv("MMCS_L46FIX")) {
+        if (getenv("MMCS_L19TH")) {
+            fprintf(stderr, "MMCS-L46: shares slot idx 0 (evt 0x220) "
+                    "with MMCS_L19TH — drop L19TH; not arming L46\n");
+        } else {
+            mmcs_l46_cadence_ms =
+                atoi(getenv("MMCS_L46FIX_MS") ? : "2000");
+            if (!mmcs_l46_cadence_ms) {
+                mmcs_l46_cadence_ms = 2000;
+            }
+            mmcs_l46_armed = 1;
+            fprintf(stderr, "MMCS-L46: create-interlock SPLIT repair "
+                    "armed (one-shot, cadence %ums; stock completion "
+                    "SET + v7 wake on the walker's own waited "
+                    "object)\n", mmcs_l46_cadence_ms);
         }
     }
     /* L36: the post-exit requeue daemon — slot idx 3 (evt 0x2A0)
