@@ -3947,6 +3947,44 @@ static uint32_t mmcs_l37_quiet;
 static uint8_t mmcs_l37_sig[MMCS_L19_NSIG];
 static int mmcs_l37_sig_have;
 
+/* MMCS fork (L41): MMCS_L41EV — the told-waiter WAIT-RETURN requeue
+ * (S185, decoded 2026-11-21). The L40 frontier decode: the requeued
+ * launcher 906ddacc dies because its preempted ctx (pc 0x9083b682,
+ * the post-jsr retry site inside FUN_9083b668 — the KCall-backed
+ * wait-submit wrapper, KCall fn 0x90826b88 via the trampoline
+ * 0x908230e6) returns through `lds.l @r15+,pr; rts` at 0x9083b696-9a
+ * with pr = kstack [sp+0x10] — and that cell is CLOBBERED: the
+ * process-death observation tell planted its S131 marshal block
+ * (0xe4 bytes, copier 0xc00360f4, planted at ~sp-0x1bc) over the
+ * wrapper frame while the thread sat preempted (three runs, three
+ * run-varying kernel-RAM data-page pointers: 0x88f3a000 / 0x88c7e000
+ * / 0x88cb8000 / 0x88e6f000 — the pr cell and the retry frame are
+ * unrecoverable; on HW the preemption window is microseconds and the
+ * frame is intact). The rts lands in a kernel-RAM data page, the
+ * illegal (pc < 0xFFFF8000, not retagged) forwards as 0xC000001D
+ * through the c004dba2 stub -> the marshal 0x90825694 -> the CRT
+ * filter -> ExitThread -> KillThread: the "requeued launcher dies in
+ * the death cascade" of L40 §4. THE FIX — the stock semantics for a
+ * waiter whose waited process died is the CLEAN WAIT-RETURN: rewrite
+ * the requeue to resume the thread at its own wait-return site
+ * (0x9083e24e, the instruction after the launcher lane's
+ * `jsr 0x90837fa8` — the wait trampoline) with the stock post-wait
+ * register state, through the exact struct cells the vendor switcher
+ * restores (r8 +0x94 / r9 +0x98 / r10 +0x9c / sp +0xb0 / pc +0xb4;
+ * verified cell-for-cell against the live resume register dump).
+ * The RunApps frame anchor: the fn's saved-pr cell at [sp_site+0x10]
+ * (= preempt-sp + 0x50) must read a k.coredll window address — the
+ * live guard that the anchor frame survived the clobber (otherwise
+ * fall back to the plain requeue). Site constants: r8=0x8867ed24
+ * (pSignalStarted cell), r9=0x8867aa00, r10=arg (the creation arg =
+ * hProc 0x00400002), sp_site = preempt_sp + 0x40. The continuation:
+ * 0x9084b9c8 (close) -> 0x9083dff8 -> jsr [pSignalStarted] ->
+ * 0x9082daa8 -> 0x9084887c -> the vendor KillThread tail — 100%
+ * vendor code, the launch loop the S156 matrix pre-decoded.
+ * Env MMCS_L41EV (default off; rides the L37 daemon's delivery). */
+static int mmcs_l41_armed;
+static uint32_t mmcs_l41_rewrites;
+
 /* the ctx-pc acceptance windows (VA): kernel+XIP, k.coredll servants,
  * user — with the OAL idle loop AND the switcher machinery carved out
  * (a thread parked inside the OAL window is the idle context, and a
@@ -3987,8 +4025,7 @@ static void mmcs_l37_scan(void)
             mmcs_l37_armed = 0;
         }
         return;
-    }
-    mmcs_l19_signature(sig);
+    }    mmcs_l19_signature(sig);
     bool moved = mmcs_l37_sig_have
                  && memcmp(sig, mmcs_l37_sig, MMCS_L19_NSIG) != 0;
     memcpy(mmcs_l37_sig, sig, MMCS_L19_NSIG);
@@ -4067,6 +4104,41 @@ static void mmcs_l37_scan(void)
     if (!cand) {
         return;                       /* not the lost-preempt park shape */
     }
+    /* L41: the told-waiter wait-return rewrite — when the preempted ctx
+     * is exactly the FUN_9083b668 post-jsr retry site, the wrapper's
+     * return frame is tell-clobbered (see the block comment above);
+     * resume the thread at its own stock wait-return site instead */
+    uint32_t l41_new_pc = 0;
+    if (mmcs_l41_armed && cand_pc == 0x9083b682) {
+        uint32_t th_pa = cand - 0x80000000;
+        uint32_t arg = 0, anchor = 0;
+        cpu_physical_memory_read(th_pa + 0x88, &arg, 4);
+        /* the surviving-frame guard: the RunApps fn's saved-pr cell
+         * (D0 kstack VA — resolve through the PGOWN/FILEVIEW tables) */
+        uint32_t sp_site = cand_sp + 0x40;
+        uint32_t anchor_pa = mmcs_l32_stack_pa(sp_site + 0x10);
+        if (anchor_pa) {
+            cpu_physical_memory_read(anchor_pa, &anchor, 4);
+        }
+        if (arg == 0x00400002
+            && anchor >= 0xC0021000 && anchor < 0xC0083000) {
+            uint32_t rgprs[3];
+            rgprs[0] = 0x8867ed24;        /* r8  +0x94 */
+            rgprs[1] = 0x8867aa00;        /* r9  +0x98 */
+            rgprs[2] = arg;               /* r10 +0x9c */
+            cpu_physical_memory_write(th_pa + 0x94, rgprs, sizeof rgprs);
+            cpu_physical_memory_write(th_pa + 0xb0,
+                                       &(uint32_t){ sp_site }, 4);
+            cpu_physical_memory_write(th_pa + 0xb4,
+                                       &(uint32_t){ 0x9083e24e }, 4);
+            l41_new_pc = 0x9083e24e;
+            mmcs_l41_rewrites++;
+        } else {
+            fprintf(stderr, "MMCS-L41: told-waiter rewrite SKIPPED for "
+                    "thread %08x (arg %08x anchor %08x - frame guard "
+                    "failed, plain requeue)\n", cand, arg, anchor);
+        }
+    }
     /* deliver: install, THEN patch the pool (.Lt +0x6c thread VA, .Lm
      * +0x68 marker-cell VA) — the .Lt patch-order bug class (L36
      * finding): patch-then-install silently restores the default .Lt */
@@ -4097,9 +4169,12 @@ static void mmcs_l37_scan(void)
     e->pending = 1;
     mmcs_l37_total++;
     fprintf(stderr, "MMCS-L37: t=%" PRId64 "ms lost-preempt requeue thread "
-            "%08x (state16 %08x, ctx pc %08x sp %08x, delivery %u/%u)\n",
+            "%08x (state16 %08x, ctx pc %08x sp %08x, delivery %u/%u%s)\n",
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), cand, cand_st,
-            cand_pc, cand_sp, mmcs_l37_total, mmcs_l37_max_deliv);
+            l41_new_pc ? l41_new_pc : cand_pc, cand_sp,
+            mmcs_l37_total, mmcs_l37_max_deliv,
+            l41_new_pc ? "; L41 told-waiter wait-return rewrite applied"
+                       : "");
 }
 
 /* MMCS fork (L19): MMCS_L19TH=threadVA@ms[,threadVA@ms] — the THREAD-
@@ -4462,6 +4537,12 @@ static void mmcs_l16_boot_parse(void)
                     "0x2c0 wired on first delivery)\n",
                     mmcs_l37_cadence_ms, mmcs_l37_max_deliv,
                     MMCS_L37_STUB_VA);
+            if (getenv("MMCS_L41EV")) {
+                mmcs_l41_armed = 1;
+                fprintf(stderr, "MMCS-L41: told-waiter wait-return requeue "
+                        "armed (the 0x9083b682 class resumes at its own "
+                        "wait-return site 0x9083e24e)\n");
+            }
         }
     }
     if (getenv("MMCS_L26EV")) {
