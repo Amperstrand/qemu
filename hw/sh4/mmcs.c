@@ -2518,12 +2518,68 @@ static uint64_t mmcs_tick_l37;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                * re-arms the chain only when set) */
 
+/* MMCS fork (L38): MMCS_L38TIMER — the OAL timer-chain fn1 seed (the
+ * S179 mechanism-(b) lane, decoded 2026-11-21).
+ *
+ * DECODE (this lane, live + static, with the extu.b correction): the
+ * OAL dispatch thunks (0x908084b4 etc.) compute their slot as
+ * `mov #-72/-76/-68,r3; extu.b r3,r3` — extu.b ZERO-extends, so the
+ * slots are at [table+0xB8]/[+0xB4]/[+0xBC] (NOT the -0x48/-0x4c/
+ * -0x44 the L37-era negative reading assumed; those cells are the
+ * ROM template's 0x1010101 filler and the thunk never reads them).
+ * The vtable RAM ([0x88602bec] -> 0x8867aa08) is the copy of the ROM
+ * template at 0x90da9d0c, which SHIPS: fn1 [0x8867aac0] = fn2a
+ * [0x8867aab4-slot table+0xB4] = 0x9082e598 (a default NOT-IMPLEMENTED
+ * stub that returns benignly), fn1b [table+0xBC] = 0x908419f0 (a real
+ * shipped fn), the tick core's time cells [table+0xC8] (CurMSec-class)
+ * and [table+0xC4] (resched-time) = 0. On HW the OAL init rebinds fn1/
+ * fn2a to the real timer handlers; under emulation the rebinding never
+ * runs, so the timer-ISR entry 0x90809d78 calls the NO-OP stub every
+ * tick (exec-window proven: the full ISR path runs — entry -> fn1
+ * thunk -> 0x9082e598 -> timer-fn2 0x90808478 -> fn2-tail 0x90807e54
+ * -> rts — but no time cell ever moves; the L37 "erased slots" premise
+ * re-read: the slots are BOUND to the shipped default stub).
+ *
+ * The SEED: the vendor tick core 0x90808980 is the in-image function
+ * matching the fn1 protocol exactly (no args; clears the TCR UNIE-class
+ * bit at 0xffd80010; [table+0xC8] += [0x88602c60+0x14]; the 64-bit
+ * counter at [0x88602c60+0x20/0x24] += [0x88602c60+0x18]; returns
+ * [table+0xC8] >= [table+0xC4] — the resched-consider boolean). MMCS_
+ * L38TIMER=1 binds it into the fn1 slot (once, idempotent; only when
+ * the slot still holds the shipped default). fn2a stays the default
+ * stub (absorbed) and fn1b keeps its shipped value. Default OFF. */
+static void mmcs_l38timer_seed(void)
+{
+    static int done;
+    if (done || !getenv("MMCS_L38TIMER")) {
+        return;
+    }
+    uint32_t tab = 0;
+    cpu_physical_memory_read(0x08602BEC, &tab, 4);
+    if (tab != 0x8867AA08) {
+        return;                       /* table not bound yet */
+    }
+    uint32_t fn1 = 0;
+    cpu_physical_memory_read(0x0867AAC0, &fn1, 4);
+    if (fn1 != 0x9082E598 && fn1 != 0x1010101 && fn1 != 0) {
+        done = 1;                     /* someone bound it for real */
+        return;
+    }
+    cpu_physical_memory_write(0x0867AAC0,
+                              &(uint32_t){ 0x90808980 }, 4);
+    done = 1;
+    fprintf(stderr, "MMCS-L38TIMER: t=%" PRId64 "ms OAL fn1 slot bound "
+            "(0x%08x -> 90808980 the vendor tick core)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), fn1);
+}
+
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
     bool hdevt = mmcs_hdevt_pending > 0;
     bool l16 = false;
     mmcs_tick_live = 1;
+    mmcs_l38timer_seed();
     if (hdevt) {
         mmcs_inject_evt(0x200);
         if (--mmcs_hdevt_pending == 0) {
@@ -3058,34 +3114,63 @@ static void mmcs_l19_signature(uint8_t *out)
  * (+0x20 kstack base in the D0 window, +0x24 == 0x10000, +0x2c kstack
  * low, ctx pc (+0xb4) == 0x90837cf6, state16 runstate == 2, wait-obj
  * (+0x14c) in the D0 stack window, waitblk (+0x1f8) == 0) and deliver
- * the v6 completion for the first: MakeRun(thread) + the resched
+ * the v7 completion for the first: MakeRun(thread) + the resched
  * protocol stores + pick=thread + r14=pCurTh + the vendor switcher.
  * NO event-set: the stack wait structs are not EVNT-class (layout
  * unknown — the walker would corrupt fields); the woken thread re-
  * checks its own wait condition (the DoWait loop reads state16, finds
- * 0x4000 clear, exits the loop into its post-wait path). In-stub
- * guard: only MakeRun when the target is STILL BLOCKED(2) — chained
- * re-deliveries no-op; a thread that re-enters the wait is re-served
- * next cadence. MAIN's wait (wait-obj 0) is EXCLUDED (the FSReady
- * gate must be earned). Bounds: one delivery per cadence, 60 quiet
- * scans park, movement re-arms (the L19 discipline), hard cap
+ * 0x4000 clear, exits the loop into its post-wait path: the satisfied
+ * re-evaluation at 0x90837d22 re-issues BlockWithHelper unless the
+ * wait structs now satisfy — MakeRun itself is vendor-faithful for a
+ * BLOCKED target: 0x90825ee4 guards only the [th+0xE] suspend byte,
+ * then state16 = (state16 & ~3) | 1 and the pRunnable-band enqueue).
+ * In-stub guard: only MakeRun when the target is STILL BLOCKED(2) —
+ * chained re-deliveries no-op; a thread that re-enters the wait is
+ * re-served next cadence. MAIN's wait (wait-obj 0) is EXCLUDED (the
+ * FSReady gate must be earned). Bounds: one delivery per cadence, 60
+ * quiet scans park, movement re-arms (the L19 discipline), hard cap
  * MMCS_L26EV_MAX (default 64). Stub at KILLSTK 0xBF00E200 (idx 2,
  * evt 0x280 — free when MMCS_L16EV is not armed), slot stays wired
  * (daemon mode). Needs MMCS_KILLSTK + MMCS_TICK (the delivery rides
- * the tick chain). */
+ * the tick chain).
+ *
+ * L38 (S179): the delivery path is FIXED — two live-caught bugs (the
+ * L36 session's marker readback + this lane's disasm). (1) The .Lt
+ * PATCH-ORDER bug: the daemon patched .Lt BEFORE installing the stub
+ * array, so the install silently restored the default .Lt
+ * (0x906dd000) and every delivery acted on the WRONG thread. Now
+ * install first, then patch the pool (.Lt +0x6c thread VA, .Lm +0x68
+ * marker-cell VA) — the L36/L37 discipline. (2) The GUARD INVERSION:
+ * the v6 stub's byte decode is `and #3; cmp/eq #2; BF mk; BRA Lret`
+ * — it skipped MakeRun exactly when the target was STILL BLOCKED(2)
+ * (the documented intent inverted in the builder's BF/BRA pair; the
+ * stale comment said the opposite). The v7 stub guard is
+ * `cmp/eq #2; BT mk` — accept BLOCKED(2), skip everything else. The
+ * v7 stub also carries the L16/L36/L37 stage markers (1-5 at
+ * [.Lm]=stub+0xF0) for the marker-readback delivery proof. */
 static uint8_t mmcs_l26_stub[] = {
-    0x22, 0x4f, 0xe6, 0x2f, 0x0f, 0xd4, 0x43, 0x50,
-    0x03, 0xc9, 0x02, 0x88, 0x01, 0x8b, 0x14, 0xa0,
-    0x09, 0x00, 0x09, 0x00, 0x0c, 0xd3, 0x0b, 0x43,
-    0x09, 0x00, 0x01, 0xe1, 0x0b, 0xd2, 0x12, 0x22,
-    0x01, 0xe1, 0x09, 0x00, 0x0a, 0xd2, 0x12, 0x22,
-    0x06, 0xd4, 0x09, 0x00, 0x09, 0xd2, 0x42, 0x22,
-    0x09, 0xd2, 0x20, 0x5e, 0x09, 0xd3, 0x0b, 0x43,
-    0x09, 0x00, 0xf6, 0x6e, 0x26, 0x4f, 0x00, 0xe0,
-    0x0b, 0x00, 0x09, 0x00, 0x00, 0xd0, 0x6d, 0x90,
-    0xe4, 0x5e, 0x82, 0x90, 0x84, 0x98, 0x67, 0x88,
-    0x88, 0x98, 0x67, 0x88, 0xa4, 0xef, 0x67, 0x88,
-    0x94, 0x98, 0x67, 0x88, 0x68, 0x2b, 0x82, 0x90,
+    0x22, 0x4f, 0xe6, 0x2f, 0x19, 0xd4, 0x43, 0x50,  /* +00 */
+    0x03, 0xc9, 0x02, 0x88, 0x02, 0x89, 0x25, 0xa0,  /* +08 accept BLOCKED(2) */
+    0x09, 0x00, 0x01, 0xe2, 0x14, 0xd2, 0x12, 0x22,  /* +10 marker 1 */
+    0x15, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x02, 0xe2,  /* +18 MakeRun */
+    0x11, 0xd2, 0x12, 0x22, 0x01, 0xe1, 0x09, 0x00,  /* +20 marker 2, resched byte */
+    0x12, 0xd2, 0x12, 0x22, 0x01, 0xe1, 0x09, 0x00,  /* +28 drain2 word */
+    0x11, 0xd2, 0x12, 0x22, 0x03, 0xe2, 0x09, 0x00,  /* +30 marker 3 */
+    0x0b, 0xd2, 0x12, 0x22, 0x0b, 0xd4, 0x09, 0x00,  /* +38 .Lt reload */
+    0x0e, 0xd2, 0x42, 0x22, 0x0e, 0xd2, 0x20, 0x5e,  /* +40 pick, r14=pCurTh */
+    0x04, 0xe2, 0x09, 0x00, 0x06, 0xd2, 0x12, 0x22,  /* +48 marker 4 */
+    0x0c, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x05, 0xe2,  /* +50 switcher */
+    0x03, 0xd2, 0x12, 0x22, 0xf6, 0x6e, 0x26, 0x4f,  /* +58 marker 5, epilogue */
+    0x00, 0xe0, 0x0b, 0x00, 0x09, 0x00, 0x09, 0x00,  /* +60 */
+    /* pool */
+    0x00, 0x00, 0x00, 0x00,   /* +0x68 .Lm: marker cell VA (patched) */
+    0x00, 0xd0, 0x6d, 0x90,   /* +0x6c .Lt: thread VA (patched) */
+    0xe4, 0x5e, 0x82, 0x90,   /* .Lmk: 0x90825ee4 MakeRun */
+    0x84, 0x98, 0x67, 0x88,   /* .Lf: 0x88679884 resched byte */
+    0x88, 0x98, 0x67, 0x88,   /* .Lf2: 0x88679888 drain2 word */
+    0xa4, 0xef, 0x67, 0x88,   /* .Lpick: 0x8867efa4 */
+    0x94, 0x98, 0x67, 0x88,   /* .Lpcur: 0x88679894 */
+    0x68, 0x2b, 0x82, 0x90,   /* .Lsw: 0x90822b68 switcher */
 };
 #define MMCS_L26_STUB_VA   0xBF00E200
 #define MMCS_L26_SLOT_PA   0x0867A050   /* evt 0x280, idx 2 */
@@ -3153,11 +3238,20 @@ static void mmcs_l26_scan(void)
             || tva == pcur) {
             continue;
         }
-        /* deliver: patch .Lt (+0x44) with the thread VA, install the
-         * stub, wire the slot once, arm one delivery */
-        cpu_physical_memory_write(0x1F00E200 + 0x44, &tva, 4);
+        /* deliver: install, THEN patch the pool (.Lt +0x6c thread VA,
+         * .Lm +0x68 marker-cell VA) and init the marker cell to a
+         * known sentinel — the L38 fix (the old patch-then-install
+         * order silently restored the default .Lt=0x906dd000 and the
+         * v6 guard's inversion then no-op'ed every delivery on the
+         * BLOCKED wrong target; live-caught by the L36 marker
+         * readback) — the L36/L37 discipline */
         cpu_physical_memory_write(0x1F00E200, mmcs_l26_stub,
                                   sizeof mmcs_l26_stub);
+        cpu_physical_memory_write(0x1F00E200 + 0x6c, &tva, 4);
+        cpu_physical_memory_write(0x1F00E200 + 0x68,
+                                  &(uint32_t){ MMCS_L26_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(0x1F00E2F0,
+                                  &(uint32_t){ MMCS_L26_STUB_VA + 0xf0 }, 4);
         uint32_t slot_cur = 0;
         cpu_physical_memory_read(MMCS_L26_SLOT_PA, &slot_cur, 4);
         if (slot_cur != MMCS_L26_STUB_VA) {
@@ -3222,7 +3316,7 @@ static void mmcs_l26_scan(void)
  * ([event+0x8d] |= 1, the EventModify SET state byte) + repair the
  * wait-context linkage ([pTh+0x1F8] = the wait entry, the entry type
  * byte +0x18 = 4 the EVNT class) + wake the waiter with the proven
- * v6 completion stub (the L26 machinery: MakeRun + the resched
+ * v7 completion stub (the L26 machinery: MakeRun + the resched
  * protocol + pick + the vendor switcher). The D0-stack reads go
  * through the PGOWN/FILEVIEW va->pa tables (P3 stacks, no P1
  * identity). KNOWN GATE (the S153 frontier): the woken walker
@@ -3378,7 +3472,7 @@ static void mmcs_l32_scan(void)
          * re-evaluation on [pTh+0x1F8] -> the wait entry, whose +0x18
          * type byte selects the object dispatch — both zero in the
          * unlinked-launch class; the EVENT type = 4 per the CINFO
-         * numbering) + deliver the wake (the L26 v6 stub) */
+         * numbering) + deliver the wake (the L26 v7 stub) */
         uint32_t sigbyte = 0;
         cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sigbyte, 1);
         if (sigbyte & 1) {
@@ -3412,9 +3506,18 @@ static void mmcs_l32_scan(void)
                 break;
             }
         }
-        cpu_physical_memory_write(0x1F00EC00 + 0x44, &tva, 4);
+        /* deliver: install, THEN patch the pool (.Lt +0x6c thread VA,
+         * .Lm +0x68 marker-cell VA) + init the marker cell — the L38
+         * .Lt patch-order fix (same class as L26; the old order
+         * restored the default .Lt and the v6 guard inversion then
+         * rejected the BLOCKED wrong target) */
         cpu_physical_memory_write(0x1F00EC00, mmcs_l26_stub,
                                   sizeof mmcs_l26_stub);
+        cpu_physical_memory_write(0x1F00EC00 + 0x6c, &tva, 4);
+        cpu_physical_memory_write(0x1F00EC00 + 0x68,
+                                  &(uint32_t){ MMCS_L32_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(0x1F00ECF0,
+                                  &(uint32_t){ MMCS_L32_STUB_VA + 0xf0 }, 4);
         uint32_t slot_cur = 0;
         cpu_physical_memory_read(MMCS_L32_SLOT_PA, &slot_cur, 4);
         if (slot_cur != MMCS_L32_STUB_VA) {
