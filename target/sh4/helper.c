@@ -423,6 +423,71 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * (P2 0xBF00FF00) STAYS — it is the stub-page provider for
      * the HDEVT/L16EV/L26EV/L32EV daemons (mmcs.c). The L11
      * decode lives in git history.) */
+    /* MMCS fork (L44): MMCS_L44DBG — the memset-guard death-class
+     * diagnostic (default off). Static decode (L44, entry-anchored
+     * disasm): 0xc005fb6c is memset's OWN 4-byte fill store
+     * `mov.l r9,@r4` (memset 0xc005fa94..0xc005fba4 has NO argument
+     * validation; its tail call through pool [0xc005fba0] is the SH4
+     * CRT braf jump-table fill dispatcher 0xc0071764 — the S189
+     * "CRT argument-validation fallback" reading was a PTR_FUN label
+     * misread). The class = a kernel-mode WRITE fault at the store:
+     * TEA is the faulting destination (the dead-process buffer), and
+     * the raise forwards through the c0036xxx wrapper (pr=c0036368 =
+     * its fallback-call return) -> c004db6c -> jmp c002f0a0 ->
+     * 0xfffffdc7 (the KSLOT RaiseException, pr preserved by both
+     * jmps). Hook (1): any kernel-mode fault inside the memset window
+     * prints TEA + the live memset regs (r4 cursor / r5 val / r6
+     * remaining = the bound) + pr + kstack + pCurTh. Hook (2): the
+     * KSLOT raise (evt 0x180 at pc 0xfffffdc7 with r4=0xc0000005)
+     * dumps the marshalled record at r7 — the +0x90/+0x94 planted
+     * user-forward cells and the +0xb0/+0xb4 real-ctx save point (the
+     * S131 layout) carry the ORIGINAL fault context. */
+    if (do_exp && (env->sr & (1u << SR_MD)) && getenv("MMCS_L44DBG")) {
+        static int nl44a, nl44b;
+        if (env->pc >= 0xc005fa94u && env->pc < 0xc005fba4u
+            && nl44a++ < 64) {
+            uint32_t pth = 0;
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            fprintf(stderr, "MMCS-L44DBG memset-fault evt=%03x pc=%08x "
+                    "tea=%08x(dst) r4=%08x(cursor) r5=%08x(val) "
+                    "r6=%08x(remaining) pr=%08x r15=%08x(kstk) "
+                    "pCurTh=%08x\n", cs->exception_index, env->pc,
+                    env->tea, env->gregs[4], env->gregs[5], env->gregs[6],
+                    env->pr, env->gregs[15], pth);
+        }
+        /* (1b) every kernel-mode PROTECTION violation (evt 0x060 /
+         * 0x0a0 write-protect / init-page-write class) at ANY pc —
+         * the fatal c0000005 faults are here, wherever the CRT store
+         * lives (memset/memcpy/copy loops). */
+        if ((cs->exception_index == 0x060
+             || cs->exception_index == 0x0a0) && nl44a++ < 64) {
+            uint32_t pth = 0;
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            fprintf(stderr, "MMCS-L44DBG prot-fault evt=%03x pc=%08x "
+                    "tea=%08x(dst) r4=%08x r5=%08x r6=%08x r7=%08x "
+                    "pr=%08x r15=%08x(kstk) pCurTh=%08x\n",
+                    cs->exception_index, env->pc, env->tea,
+                    env->gregs[4], env->gregs[5], env->gregs[6],
+                    env->gregs[7], env->pr, env->gregs[15], pth);
+        }
+        if (cs->exception_index == 0x180 && env->pc == 0xfffffdc7u
+            && env->gregs[4] == 0xc0000005u && nl44b++ < 16) {
+            uint32_t rp = mmcs_utlb_va2pa(env, env->gregs[7]);
+            if (!rp) {
+                rp = mmcs_stack_va2pa(env->gregs[7]);
+            }
+            fprintf(stderr, "MMCS-L44DBG kslot-raise r15=%08x r7=%08x(rec) "
+                    "rec_pa=%08x rec:", env->gregs[15], env->gregs[7], rp);
+            if (rp) {
+                for (int i = 0x00; i <= 0xe0; i += 4) {
+                    uint32_t w = 0;
+                    cpu_physical_memory_read(rp + i, (void *)&w, 4);
+                    fprintf(stderr, " +%02x=%08x", i, w);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     /* MMCS fork: syscall tracer — log every trapa with args (flycast
      * wince.h pattern: decode API calls at the trap boundary; our CE5
      * calibration: TRA 0x71 = RegQueryValueExW per the REGFIX hook). */
