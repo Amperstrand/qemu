@@ -2518,7 +2518,12 @@ static uint32_t mmcs_l32_max_deliv = 64;
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
 static uint64_t mmcs_tick_l37;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
-                               * re-arms the chain only when set) */
+                                * re-arms the chain only when set) */
+static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
+                                * carries no vmstate (S163), so TSTR reads
+                                * 0 after a restore even when the fresh
+                                * boot programmed it — the L43 TSTR
+                                * sub-gate skips on restores (logged) */
 
 /* MMCS fork (L38): MMCS_L38TIMER — the OAL timer-chain fn1 seed (the
  * S179 mechanism-(b) lane, decoded 2026-11-21).
@@ -2745,6 +2750,82 @@ static void mmcs_l42_scan(void)
     run_on_cpu(first_cpu, mmcs_l42kill_work, RUN_ON_CPU_NULL);
 }
 
+/* MMCS fork (L43): MMCS_TICK_EVT — select the host tick's event code
+ * (the timer-chain repair spec 2026-11-21, Option (a) RANK 1). The
+ * stock MMCS_TICK delivery emits EVT 0x440 (TUNI2), whose dispatch
+ * slot [0x8867a088] -> ISR 0x90809d78 walks fn slots that ship bound
+ * to the rts-stub 0x9082e598 — a dormant path on real HW too (TMU2
+ * never started, TSTR=0x03). The vendor 1ms system tick is TMU0
+ * underflow (EVT 0x400 = TUNI0), dispatched at [0x8867a080] ->
+ * 0x90808980, the ONLY in-image writer of CurMSec [P+0xC8] (P =
+ * [0x8867aa04] = 0x8867aa08). MMCS_TICK_EVT=400 selects that
+ * delivery: 100% vendor code thereafter (CurMSec advance, the
+ * expiry-return resched-consider -> bResched, drain1, sleeper wakes,
+ * the quantum re-arm). Default/unset = 0x440 = byte-identical to the
+ * pre-L43 delivery.
+ * Arm-time sanity gates (READ-ONLY guest checks, run ONCE at the
+ * first delivery after the tick delay — the boot must have settled;
+ * on any failure REFUSE-TO-ARM + warn and fall back to the stock
+ * 0x440 delivery; NEVER write guest state):
+ *   [0x8867aa04] == 0x8867aa08 && [0x88602bec] == 0x8867aa08 (P bound)
+ *   [0x8867a080] == 0x90808980  (the TUNI0 ISR installed)
+ *   [0x88602c74] == 1           (msPerTick; 0 => the ISR silently
+ *                                no-ops — logged loudly per the spec)
+ *   TSTR[0xFFD80004] bit0       (TMU0 started; S133 observed 0x03)
+ * HARD HAZARD (spec §5 #6): nothing may ever feed [0x8860200c] (the
+ * fn2-counter) — that fires fn1b 0x908419f0 = trapa#1 + debug-print
+ * + self-spin FATAL. This knob writes NO guest state at all. */
+static uint32_t mmcs_tick_evt(void)
+{
+    static uint32_t code;
+    static int init;
+
+    if (!init) {
+        const char *v = getenv("MMCS_TICK_EVT");
+
+        init = 1;
+        code = 0x440;
+        if (v && *v && strcmp(v, "0")) {
+            uint32_t sel = strtoul(v, NULL, 16);
+            uint32_t pk = 0, po = 0, slot = 0, mspertick = 0, tstr = 0;
+            int tstr_ok, tstr_skip = mmcs_snap_restored;
+
+            cpu_physical_memory_read(0x0867AA04, &pk, 4);
+            cpu_physical_memory_read(0x08602BEC, &po, 4);
+            cpu_physical_memory_read(0x0867A080, &slot, 4);
+            cpu_physical_memory_read(0x08602C74, &mspertick, 4);
+            cpu_physical_memory_read(0xFFD80004, &tstr, 4);
+            tstr_ok = (tstr & 1) || tstr_skip;
+            if (sel == 0x440) {
+                /* explicit stock selection — no gates, no change */
+            } else if (pk == 0x8867AA08 && po == 0x8867AA08
+                       && slot == 0x90808980 && mspertick == 1
+                       && tstr_ok) {
+                code = sel;
+                fprintf(stderr, "MMCS-TICK_EVT: t=%" PRId64 "ms gates PASS "
+                        "(P=%08x/%08x slot[8867a080]=%08x msPerTick=%u "
+                        "TSTR=%02x%s) — delivering evt %03x (the vendor "
+                        "TUNI0 tick path)\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                        pk, po, slot, mspertick, tstr & 0xff,
+                        tstr_skip ? " (gate skipped: restore — tmu012 has "
+                        "no vmstate, S163)" : "", code);
+            } else {
+                fprintf(stderr, "MMCS-TICK_EVT: t=%" PRId64 "ms REFUSED to "
+                        "arm evt %03x (P=%08x/%08x slot[8867a080]=%08x "
+                        "msPerTick=%u%s TSTR=%02x%s) — falling back to the "
+                        "stock 0x440 delivery (read-only gates, no guest "
+                        "writes)\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), sel,
+                        pk, po, slot, mspertick,
+                        mspertick == 0 ? " (SILENT NO-OP RISK)" : "",
+                        tstr & 0xff, tstr_ok ? "" : " (TMU0 not started)");
+            }
+        }
+    }
+    return code;
+}
+
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
@@ -2816,7 +2897,10 @@ static void mmcs_tick_deliver(void *opaque)
             }
         }
         if (!l16) {
-            mmcs_inject_evt(0x440);
+            /* L43: MMCS_TICK_EVT selects the delivered event code
+             * (0x440 stock / 0x400 = the vendor TUNI0 tick ISR path;
+             * arm-time gated read-only, see mmcs_tick_evt) */
+            mmcs_inject_evt(mmcs_tick_evt());
         }
     }
     if (!hdevt && !l16 && getenv("MMCS_TMUDEBUG")
@@ -5313,6 +5397,9 @@ static int mmcs_machine_post_load(void *opaque, int version_id)
     mmcs_tick_l37 = s->tick_l37;
     mmcs_tick_live = s->tick_live;
     mmcs_hdevt_pending = s->hdevt_pending;
+    mmcs_snap_restored = 1;   /* L43: TSTR reads 0 after restore (tmu012
+                               * has no vmstate) — the TICK_EVT sub-gate
+                               * skips, see mmcs_tick_evt */
 
     /* Re-arm the free-floating tick chain (the scheduler tick + every
      * daemon scan rides it; anonymous QEMUTimers are not migrated).
@@ -6667,9 +6754,15 @@ static void mmcs_init(MachineState *machine)
                                             mmcs_tick_deliver, NULL);
                 timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
                           + atoi(getenv("MMCS_TICK_DELAY") ? : "12000"));
-                fprintf(stderr, "MMCS: TICK evt 0x440 every 1ms "
-                        "(delay %sms)\n",
-                        getenv("MMCS_TICK_DELAY") ? : "12000");
+                const char *ev = getenv("MMCS_TICK_EVT");
+                fprintf(stderr, "MMCS: TICK evt %s every 1ms "
+                        "(delay %sms)%s\n",
+                        (ev && *ev && strcmp(ev, "0")) ? ev : "440",
+                        getenv("MMCS_TICK_DELAY") ? : "12000",
+                        (ev && *ev && strcmp(ev, "0")
+                         && strtoul(ev, NULL, 16) != 0x440)
+                        ? " — L43 selection, arm-time gates at first tick"
+                        : "");
                 /* MMCS fork (L14): the parked boot-thread event-set
                  * delivery (see mmcs_hdevt_fire; needs KILLSTK + TICK) */
                 /* MMCS fork (L15): MMCS_RINGNOP — unblock the uHAL
