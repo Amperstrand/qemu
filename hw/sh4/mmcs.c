@@ -2514,13 +2514,20 @@ static uint32_t mmcs_l32_max_deliv = 64;
 static void mmcs_l46_scan(void);
 static uint32_t mmcs_l46_armed;
 static uint32_t mmcs_l46_cadence_ms = 2000;
+/* L47: the true-base wake-eval ctx repair (repeating; see
+ * mmcs_l47_scan) */
+static void mmcs_l47_scan(void);
+static uint32_t mmcs_l47_armed;
+static uint32_t mmcs_l47_cadence_ms = 2000;
+static uint32_t mmcs_l47_max_deliv = 8;
+static uint32_t mmcs_l47_total;
 
 /* savestate lane: the tick-chain cadence counters were function-local
  * statics — hoisted so the snapshot can stream them (losing them
  * shifts every daemon scan phase by up to one cadence period after a
  * restore, which breaks identical-continuation verify). */
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
-static uint64_t mmcs_tick_l37, mmcs_tick_l46;
+static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2873,6 +2880,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l46_armed && ++mmcs_tick_l46 >= mmcs_l46_cadence_ms) {
             mmcs_tick_l46 = 0;
             mmcs_l46_scan();
+        }
+        /* L47: the true-base wake-eval ctx repair (same class;
+         * repeating, delivery-capped — see mmcs_l47_scan) */
+        if (mmcs_l47_armed && ++mmcs_tick_l47 >= mmcs_l47_cadence_ms) {
+            mmcs_tick_l47 = 0;
+            mmcs_l47_scan();
         }
         /* L36: the post-exit requeue daemon (same class) */
         if (mmcs_l36_armed && ++mmcs_tick_l36 >= mmcs_l36_cadence_ms) {
@@ -4157,6 +4170,225 @@ static void mmcs_l46_scan(void)
     }
 }
 
+/* MMCS fork (L47): MMCS_L47FIX — the TRUE-BASE wake-eval ctx repair
+ * (S195/S196, decoded 2026-11-21; the S195 datum's named last layer).
+ *
+ * THE DECODE (the wake evaluation fn 0x90828200, KCall'd from the park
+ * face 0x90837cf6 via pool 0x90837dac): the eval reads its wait ENTRY
+ * pointer from [pTh+0x1F8], the waited OBJECT at entry+0x14, the TYPE
+ * BYTE at entry+0x18 (dispatch: 4/13 = the real EVNT path; 1/0xff =
+ * the marked class; else = default), the SIG BYTE at obj+0x8D, and on
+ * a signaled EVNT consumes it (sig := byte[obj+0x8E]) then runs the
+ * satisfy bookkeeping ([pTh+0x1F8] := [entry+0x10], [wobj+4]/[wobj+8]
+ * rotation, byte[pTh+0xF] := 0) returning [entry+0x20] as the wait
+ * result. THE TRUE ENTRY BASE on the walker's live stack = wobj+0x08
+ * (there entry+0x14 = the event, entry+0x18's byte = the flags word's
+ * low byte = 04 EVNT, entry+0x20 = wobj+0x28 = the WAIT_OBJECT_0
+ * result cell).
+ *
+ * WHY THE L46 REPAIR NEVER COMPLETED THE WAIT (live-caught, P6-P8
+ * boots): the L46 planted [pTh+0x1F8] = wobj+0x10 — 8 HIGH — so the
+ * eval dereferenced the THREAD TCB as the object (its +0x8d byte is
+ * not the event's sig) and its type-4 repair write landed on wobj+0x28
+ * (the result cell, making a satisfied return read 4). And the failed
+ * eval's re-block path ZEROES [pTh+0x1F8] again, while the L26 scan
+ * filter itself requires [th+0x1F8]==0 (the wblk cell) — so a standing
+ * one-shot ctx plant either never survives to the next eval or blocks
+ * the very wake that would run it. The type byte (the flags word at
+ * wobj+0x20) is ALSO boot-unstable (0003fb04 vs 00000000 across
+ * boots).
+ *
+ * THE FIX — a REPEATING repair that re-plants every cadence AND
+ * delivers its own v7 wake (the L46 stub recipe verbatim): [pTh+0x1F8]
+ * = wobj+0x08 (the true base), the type byte (wobj+0x20 low byte) |=
+ * 0x04, the result cell [wobj+0x28] := 0, the sig byte |= 1 (the stock
+ * SET). With the true base the vendor eval completes the wait natively
+ * (consume + satisfy + WAIT_OBJECT_0) and the create body's stock
+ * postwait predicate ([lppi+0] != 0 — already passing on the non-zero
+ * teardown sentinel) lets CreateProcessW return through 100% vendor
+ * code. Self-healing: if a cycle still fails, the next cadence
+ * re-plants (the shape guard = the walker still parked at the dead
+ * interlock; natural stop when the wait completes).
+ *
+ * Discriminators: the L46 shape verbatim (the create-body window
+ * [0x9082ce00,0x9082ed00), the filesys post-create witness [th+0x150],
+ * the linked waiter-list, sig 0x00 = still dead, is_cpw).
+ * Env MMCS_L47FIX (default OFF; MMCS_L47FIX_MS cadence default 2000;
+ * MMCS_L47FIX_MAX delivery cap default 8). Shares the L32 slot (evt
+ * 0x220 / ents[0] / stub 0xBF00EC00) — pending/slot-guarded, disjoint
+ * from the one-shot L46 by the cap counter. Needs MMCS_KILLSTK +
+ * MMCS_TICK. */
+static void mmcs_l47_scan(void)
+{
+    if (!mmcs_l47_armed || mmcs_l47_total >= mmcs_l47_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj, wret;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        memcpy(&wret, arena + o + 0x150, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || wret < 0xC0000000 || wret >= 0xC1000000
+            || tva == pcur) {
+            continue;
+        }
+        /* resolve the waited object through the walker's own
+         * wait-array entry (the L32EV resolver; keeps the matched
+         * wi for the entry-base derivation below) */
+        uint32_t obj = 0, wi_found = 0;
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 != tva) {
+                continue;
+            }
+            uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+            if (pa2) {
+                cpu_physical_memory_read(pa2, &obj, 4);
+            }
+            wi_found = wi;
+            break;
+        }
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* not an arena kernel object */
+        }
+        uint8_t sig47 = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sig47, 1);
+        if (sig47 & 1) {
+            continue;               /* signaled — vendor world moving */
+        }
+        uint32_t wlh = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 8, &wlh, 4);
+        if (wlh == 0) {
+            continue;               /* unlinked = L32EV's class */
+        }
+        /* the create-body kstack witness (is_cpw — the L46 window) */
+        uint32_t ssp = 0, is_cpw = 0;
+        cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &ssp, 4);
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* DELIVER — the true-base plants + the L46 stub recipe */
+        if (mmcs_l16_ents[0].pending) {
+            return;                 /* L32/L46 mid-delivery — retry */
+        }
+        /* The eval's entry base is FRAME-WOBBLE-DEPENDENT (live-caught:
+         * the waiter-entry fields sit at wobj+0x10 in one boot and
+         * wobj+0x18 in another — the L46-commit's sp-wobble class).
+         * The invariant: the eval wants the entry whose +0x14 cell
+         * holds THE EVENT = the resolver's wi MINUS 8. Derive it
+         * dynamically and VERIFY against the resolved object. */
+        if (!wi_found || wi_found < 8) {
+            continue;               /* resolver lost the entry — skip */
+        }
+        uint32_t entry47 = wobj + wi_found - 8;
+        uint32_t pa_e = mmcs_l32_stack_pa(entry47 + 0x14);
+        uint32_t objchk = 0;
+        if (pa_e) {
+            cpu_physical_memory_read(pa_e, &objchk, 4);
+        }
+        if (!pa_e || objchk != obj) {
+            fprintf(stderr, "MMCS-L47: entry verify FAILED (entry %08x "
+                    "objchk %08x vs obj %08x) - skip\n",
+                    entry47, objchk, obj);
+            continue;
+        }
+        /* (1) the ctx cell: the true entry base */
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
+                                  &entry47, 4);
+        /* (2) the type byte: entry+0x18's low byte must carry EVNT(4)
+         * — naturally 04 in every observed layout; force idempotently */
+        uint32_t pa_t = mmcs_l32_stack_pa(entry47 + 0x18);
+        if (pa_t) {
+            uint32_t fw = 0;
+            cpu_physical_memory_read(pa_t, &fw, 4);
+            if ((fw & 0xff) != 0x04) {
+                fw = (fw & 0xffffff00) | 0x04;
+                cpu_physical_memory_write(pa_t, &fw, 4);
+            }
+        }
+        /* (3) the result cell entry+0x20 := 0 (WAIT_OBJECT_0+0) */
+        uint32_t pa_r = mmcs_l32_stack_pa(entry47 + 0x20);
+        uint32_t zero47 = 0;
+        if (pa_r) {
+            cpu_physical_memory_read(pa_r, &zero47, 4);
+            if (zero47 != 0) {
+                zero47 = 0;
+                cpu_physical_memory_write(pa_r, &zero47, 4);
+            }
+        }
+        /* (4) the stock SET: sig byte |= 1 */
+        sig47 |= 1;
+        cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig47, 1);
+        /* (5) the v7 stub wake (the L46 recipe verbatim) */
+        cpu_physical_memory_write(0x1F00EC00, mmcs_l26_stub,
+                                  sizeof mmcs_l26_stub);
+        cpu_physical_memory_write(0x1F00EC00 + 0x6c, &tva, 4);
+        cpu_physical_memory_write(0x1F00EC00 + 0x68,
+                                  &(uint32_t){ MMCS_L32_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(0x1F00ECF0,
+                                  &(uint32_t){ MMCS_L32_STUB_VA + 0xf0 }, 4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L32_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L32_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L47: slot evt 0x220 busy (%08x) - "
+                        "retry next cadence\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L32_SLOT_PA,
+                                      &(uint32_t){ MMCS_L32_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[0];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L32_STUB_VA;
+        e->evt_code = 0x220;
+        e->slot_pa = MMCS_L32_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l47_total++;
+        fprintf(stderr, "MMCS-L47: t=%" PRId64 "ms true-base ctx repair "
+                "%u/%u: walker %08x wobj %08x entry %08x obj %08x sig "
+                "00->01 (type byte forced 4, result cell 0)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l47_total,
+                mmcs_l47_max_deliv, tva, wobj, entry47, obj);
+        return;                     /* one delivery per cadence */
+    }
+}
+
 /* MMCS fork (L36): MMCS_L36EV — the post-exit requeue daemon (the
  * S173 frontier, decoded 2026-11-20).
  *
@@ -5020,6 +5252,31 @@ static void mmcs_l16_boot_parse(void)
                     "armed (one-shot, cadence %ums; stock completion "
                     "SET + v7 wake on the walker's own waited "
                     "object)\n", mmcs_l46_cadence_ms);
+        }
+    }
+    /* L47: the true-base wake-eval ctx repair (repeating, capped;
+     * shares the L32 slot machinery, pending/slot-guarded — see
+     * mmcs_l47_scan) */
+    if (getenv("MMCS_L47FIX")) {
+        if (getenv("MMCS_L19TH")) {
+            fprintf(stderr, "MMCS-L47: shares slot idx 0 (evt 0x220) "
+                    "with MMCS_L19TH — drop L19TH; not arming L47\n");
+        } else {
+            mmcs_l47_cadence_ms =
+                atoi(getenv("MMCS_L47FIX_MS") ? : "2000");
+            if (!mmcs_l47_cadence_ms) {
+                mmcs_l47_cadence_ms = 2000;
+            }
+            mmcs_l47_max_deliv =
+                atoi(getenv("MMCS_L47FIX_MAX") ? : "8");
+            if (!mmcs_l47_max_deliv) {
+                mmcs_l47_max_deliv = 8;
+            }
+            mmcs_l47_armed = 1;
+            fprintf(stderr, "MMCS-L47: true-base wake-eval ctx repair "
+                    "armed (repeating, cadence %ums, cap %u; entry base "
+                    "wobj+8 + type byte 4 + result cell 0 + stock SET + "
+                    "v7 wake)\n", mmcs_l47_cadence_ms, mmcs_l47_max_deliv);
         }
     }
     /* L36: the post-exit requeue daemon — slot idx 3 (evt 0x2A0)
