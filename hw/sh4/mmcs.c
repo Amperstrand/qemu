@@ -2637,6 +2637,114 @@ static void mmcs_l39tbind_seed(void)
     done = 1;
 }
 
+/* MMCS fork (L42): MMCS_L42KILL — the impossible-user-forward spin
+ * kill continuation (S187). DECODE (live, exec+int windows + park
+ * walks, this lane): after the L41 told-waiter wait-return rewrite
+ * completes the kernel launcher's stock continuation (close(FSReady
+ * hEvent) -> 0x9083dff8 -> pSignalStarted(0) via [0x8867ed24]=
+ * c00309a0 -> filesys SignalStarted c00badf0 -> the signaler chain
+ * -> the handle-close walk -> close([0x8867aa00]) -> 0x9084887c ->
+ * the reschedule park at the OAL idle), the LATE death-tell (the
+ * S131 marshal 0x90825694, pending on the kstack since the t~14s
+ * death cascade — the same never-consumed block the L41 decode
+ * found clobbering the wait frame) fires and REWRITES the
+ * launcher's saved ctx to a USER-mode forward: ctx+0xb0 :=
+ * 0x400080f0 (the marshalled user exception record pointer in slot
+ * 0; a stock user-thread SP cell reads the 0x2xxxx low identity
+ * window, never 0x4xxxxxxx), ctx+0xb4 := 0. The switcher then tries
+ * to return this KERNEL thread to user mode: the PSL-return
+ * trampoline 0x90822d80 walks the current (kernel-space) page
+ * tables for the user VA (level loads at 0x90822dbe / the walker
+ * helper 0x9082ee98 at 0x9082eed0 / the pager's PTE write at
+ * 0x90823cbc); the resolution can never succeed under the kernel
+ * address space, and the retry loop spins at 0x90822dbe with
+ * SR.BL set (0x70008001) — the load never retires (QEMU's
+ * BL early-return in do_interrupt re-requests the reset and leaves
+ * pc unchanged: "Stopped execution of TB chain before [90822dbe]"
+ * x515K in -d exec), ticks stop being serviced, the daemon
+ * movement signatures freeze (the L26/L37 daemons park on false
+ * quiet), and the machine burns on the spin. An exception-boundary
+ * hook CANNOT see this class (the deep-spin faults never deliver;
+ * the pre-rewrite formation faults don't yet carry the planted
+ * ctx) — the intercept must be the host-side pc sample. On HW a
+ * kernel thread NEVER carries a user-mode forward — unreachable
+ * vendor state — and the vendor's own semantics for this thread at
+ * this point are its own function tail: the launcher fn 0x9083e1ec
+ * ends `jsr 0x9083be50; mov #0,r4` (KillThread(0), the temp
+ * supervisor's stock self-kill — the same tail the L41 tape
+ * watched the thread executing toward when the tell hijacked it).
+ * FIX (the L39KILL dispatch shape, driven from the host tick
+ * daemon via run_on_cpu — the S161 handoff pattern): sample the
+ * live pc every cadence; 3 consecutive samples inside the
+ * trampoline/walker windows WHILE pCurTh carries the impossible
+ * user-forward shape (alive RUNNING state16, ctx+0xb0 in the user
+ * window) = the spin class -> rewrite the live cpu: SR.BL/RB
+ * cleared (the kill continuation runs at the normal kernel level,
+ * bank 0), r15 := P2 0xBF00FF00 (the kill-stack RAM page at phys
+ * 0x1F000000, mapped every boot), r4 := 0, pc := 0x9083be50 —
+ * the vendor's own KillThread, so the launcher's death completes
+ * natively (the death is COMPLETED, not suppressed). Hard cap 4
+ * dispatches. The sustain counter is ephemeral (no savestate row:
+ * a restore re-detects the spin within 3 cadences; the default
+ * boot never arms this knob). Env MMCS_L42KILL, default off;
+ * MMCS_L42KILL_MS cadence (default 500). */
+static int mmcs_l42_armed;
+static uint32_t mmcs_l42_cadence_ms = 500;
+static int mmcs_l42_sustain;
+static int mmcs_l42_dispatched;
+static uint64_t mmcs_tick_l42;
+
+static void mmcs_l42kill_work(CPUState *cs, run_on_cpu_data data)
+{
+    SuperHCPU *cpu = SUPERH_CPU(cs);
+    CPUSH4State *env = &cpu->env;
+    uint32_t pc = env->pc;
+
+    if (!((pc >= 0x90822d80u && pc < 0x90822e00u)
+          || (pc >= 0x9082ee98u && pc < 0x9082ef10u)
+          || (pc >= 0x90823cb0u && pc < 0x90823d30u))) {
+        mmcs_l42_sustain = 0;           /* not the spin windows */
+        return;
+    }
+    uint32_t pcur = 0, st = 0, ctxa = 0, ctxb = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    if (pcur < 0x90680000u || pcur >= 0x90700000u) {
+        return;
+    }
+    cpu_physical_memory_read((pcur & 0x1fffffffu) + 0xc, &st, 4);
+    /* BOTH ctx save points: the tell plants its user forward at the
+     * +0x90/+0x94 slot (live-proven: 0x400080f0/0 while the +0xb0/
+     * +0xb4 slot holds the real kernel ctx); the +0xb0 read stays as
+     * the secondary class witness */
+    cpu_physical_memory_read((pcur & 0x1fffffffu) + 0x90, &ctxa, 4);
+    cpu_physical_memory_read((pcur & 0x1fffffffu) + 0xb0, &ctxb, 4);
+    bool user_fwd = (ctxa >= 0x40000000u && ctxa < 0x48000000u)
+                    || (ctxb >= 0x40000000u && ctxb < 0x48000000u);
+    if ((st & 3) != 0 || (st & 8) != 0 || !user_fwd) {
+        return;                         /* in-window but not the shape
+                                         * yet — neither resets nor
+                                         * advances the sustain */
+    }
+    if (++mmcs_l42_sustain < 3 || mmcs_l42_dispatched >= 4) {
+        return;
+    }
+    mmcs_l42_dispatched++;
+    fprintf(stderr, "MMCS-L42KILL: t=%" PRId64 "ms impossible-user-forward "
+            "spin (pc=%08x pCurTh=%08x st16=%08x ctx +0x90/+0xb0=%08x/%08x) -> vendor "
+            "kill continuation 9083be50 (%d)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), pc, pcur, st, ctxa, ctxb,
+            mmcs_l42_dispatched);
+    env->sr &= ~((1u << SR_BL) | (1u << SR_RB));
+    env->gregs[15] = 0xBF00FF00u;
+    env->gregs[4] = 0;
+    env->pc = 0x9083BE50u;
+}
+
+static void mmcs_l42_scan(void)
+{
+    run_on_cpu(first_cpu, mmcs_l42kill_work, RUN_ON_CPU_NULL);
+}
+
 static void mmcs_tick_deliver(void *opaque)
 {
     static uint64_t ntick;
@@ -2684,6 +2792,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l37_armed && ++mmcs_tick_l37 >= mmcs_l37_cadence_ms) {
             mmcs_tick_l37 = 0;
             mmcs_l37_scan();
+        }
+        /* L42: the impossible-user-forward spin kill (host pc sample;
+         * the deep-spin faults never reach the exception boundary) */
+        if (mmcs_l42_armed && ++mmcs_tick_l42 >= mmcs_l42_cadence_ms) {
+            mmcs_tick_l42 = 0;
+            mmcs_l42_scan();
         }
         /* L16: service one pending event-wake per tick (after the
          * HDEVT chain; same slot-consuming semantics, same guard).
@@ -4177,6 +4291,7 @@ static void mmcs_l37_scan(void)
                        : "");
 }
 
+
 /* MMCS fork (L19): MMCS_L19TH=threadVA@ms[,threadVA@ms] — the THREAD-
  * level enqueue completion (v5 stub; the original decode comment was
  * truncated by the L32 block insertion — see git history for the full
@@ -4544,6 +4659,17 @@ static void mmcs_l16_boot_parse(void)
                         "wait-return site 0x9083e24e)\n");
             }
         }
+    }
+    if (getenv("MMCS_L42KILL")) {
+        mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
+        if (!mmcs_l42_cadence_ms) {
+            mmcs_l42_cadence_ms = 500;
+        }
+        mmcs_l42_armed = 1;
+        fprintf(stderr, "MMCS-L42KILL: impossible-user-forward spin kill "
+                "armed (cadence %ums, sustain 3, cap 4 dispatches; the "
+                "90822dbe-class spin routes into the vendor kill "
+                "continuation 9083be50)\n", mmcs_l42_cadence_ms);
     }
     if (getenv("MMCS_L26EV")) {
         if (getenv("MMCS_L16EV")) {
