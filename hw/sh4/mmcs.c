@@ -3573,6 +3573,61 @@ static void mmcs_l26_scan(void)
                 "thread %08x (wait-obj %08x, kstk %08x, delivery "
                 "%u/%u)\n", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
                 tva, wobj, kbase, mmcs_l26_total, mmcs_l26_max_deliv);
+        /* MMCS fork (L45): MMCS_L45DBG — the create-interlock split
+         * tape (S191, diagnostic-only, default OFF). At each walker
+         * delivery, print the S191 gate cells: (1) the waited event's
+         * sig byte (+0x8d) — the walker's object never signals; (2)
+         * the state of the two 0x90835f14-class shim threads (the
+         * create-interlock signalers; both end in the kill grave
+         * st16=0x18, ctx 0x9083c102); (3) the sig byte of the
+         * observed psi.he target (the 8Hz create-retry storm's SET
+         * landing object, arena-census-stable 0x90690898 in the
+         * L45 boots — the SPLIT half the walker never waits on).
+         * Pure readback; no guest writes; caps at the L26 delivery
+         * cadence (it only fires inside this daemon's delivery). */
+        if (getenv("MMCS_L45DBG")) {
+            uint32_t evobj = 0, ent2 = 0;
+            for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+                uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+                uint32_t w1 = 0;
+                if (!pa1) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa1, &w1, 4);
+                if (w1 != tva) {
+                    continue;
+                }
+                uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+                if (pa2) {
+                    cpu_physical_memory_read(pa2, &evobj, 4);
+                }
+                ent2 = wobj + wi;
+                break;
+            }
+            uint8_t sig45 = 0, sig45b = 0;
+            if (evobj >= 0x90680000 && evobj < 0x90780000) {
+                cpu_physical_memory_read(evobj - 0x80000000 + 0x8d,
+                                         &sig45, 1);
+            }
+            cpu_physical_memory_read(0x90690898 - 0x80000000 + 0x8d,
+                                     &sig45b, 1);
+            fprintf(stderr, "MMCS-L45DBG: entry %08x waited-obj %08x "
+                    "sig %02x; psi.he-target 90690898 sig %02x; "
+                    "shims:", ent2, evobj, sig45, sig45b);
+            for (uint32_t stva = 0x906900c0; ; stva = 0x90690c7c) {
+                uint32_t s16 = 0, pcw = 0;
+                cpu_physical_memory_read(stva - 0x80000000 + 0xc,
+                                         &s16, 4);
+                cpu_physical_memory_read(stva - 0x80000000 + 0xb4,
+                                         &pcw, 4);
+                fprintf(stderr, " %08x st16=%08x ctx=%08x",
+                        stva, s16, pcw);
+                if (stva == 0x90690c7c) {
+                    break;
+                }
+            }
+            fprintf(stderr, "\n");
+        }
         return;                     /* one per cadence */
     }
 }
