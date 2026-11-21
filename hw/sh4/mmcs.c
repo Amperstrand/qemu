@@ -2497,6 +2497,12 @@ static void mmcs_l36_scan(void);
 static int mmcs_l36_armed;
 static uint32_t mmcs_l36_cadence_ms = 2000;
 static uint32_t mmcs_l36_max_deliv = 16;
+/* L37: the KCall-exit lost-preempt CLASS daemon (full block + decode
+ * below) — the generic superset of the per-site requeue daemons */
+static void mmcs_l37_scan(void);
+static int mmcs_l37_armed;
+static uint32_t mmcs_l37_cadence_ms = 2000;
+static uint32_t mmcs_l37_max_deliv = 16;
 /* L32: the create-completion event daemon (full block + decode below) */
 static void mmcs_l32_scan(void);
 static int mmcs_l32_armed;
@@ -2508,6 +2514,7 @@ static uint32_t mmcs_l32_max_deliv = 64;
  * shifts every daemon scan phase by up to one cadence period after a
  * restore, which breaks identical-continuation verify). */
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
+static uint64_t mmcs_tick_l37;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                * re-arms the chain only when set) */
 
@@ -2551,6 +2558,11 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l36_armed && ++mmcs_tick_l36 >= mmcs_l36_cadence_ms) {
             mmcs_tick_l36 = 0;
             mmcs_l36_scan();
+        }
+        /* L37: the KCall-exit lost-preempt class daemon (same class) */
+        if (mmcs_l37_armed && ++mmcs_tick_l37 >= mmcs_l37_cadence_ms) {
+            mmcs_tick_l37 = 0;
+            mmcs_l37_scan();
         }
         /* L16: service one pending event-wake per tick (after the
          * HDEVT chain; same slot-consuming semantics, same guard).
@@ -3640,6 +3652,253 @@ static void mmcs_l36_scan(void)
             cand_pc, cand_sp, graves, mmcs_l36_total, mmcs_l36_max_deliv);
 }
 
+/* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
+ * daemon (the generic requeue fix at the vendor switcher boundary,
+ * decoded 2026-11-20).
+ *
+ * THE RECURRING CLASS (L36's successor fixed point, reproduced live
+ * with SCHEDTRACE in the successor combo + MMCS_L36EV armed): after the
+ * L36 delivery the requeued WIN32 servant RUNS one scheduling quantum
+ * (t=14263: q0=pick=pCurTh=servant, the MakeRun enqueue + the stub's
+ * protocol pick visible) and at t=14273 — one tick later, at a KCall
+ * exit (kcallflags cNest toggling back) — the vendor reschedule DEQUEUES
+ * it (q0->0) and recomputes pick=0: the switcher's KCNextThread path
+ * (0x90827452, entered from drain2 0x90827148 when dwKCRes[0x88679888]
+ * is set) clears wInfo&3 and dequeues the current thread, and the
+ * re-enqueue half never runs — the thread is left RUNNING(0)-but-not-
+ * queued, pCurTh keeps it, OEMIdle spins forever. The stock guarantee
+ * "a preempted runnable thread re-enters the runnable set" is lost at
+ * EVERY such switch.
+ *
+ * WHY THE STOCK PATH NEVER SELF-HEALS (premise VERIFIED live at the
+ * park, plain-run probes — no debugger): the vendor interrupt-exit
+ * nested-reschedule check `if((cNest==1)&&(bResched==1))` (0x90823066,
+ * the shexcept.src ieh48 mirror, word compare 0x0101 against
+ * KData+0x84) needs SOMEBODY to set bResched — the timer ISR chain
+ * (SetReschedule on quantum expiry). Under emulation that chain is
+ * dead: the OAL timer table slots ([0x8867aa08]-0x48/-0x4c, the fn1/
+ * fn2 indirection the timer ISR entry 0x90809d78 walks) read erased
+ * (0x1010101), and the scheduler time cells dwReschedTime[0x8867ef88]/
+ * dwPrevReschedTime[0x8867ef84]/CurMSec stay FROZEN at 0 across ticks
+ * (probe: identical 0x0 before and after 3s of live ticks) — the
+ * quantum-expiry compare in drain1 (0x9082702c, [table-0x38]-[-0x3c])
+ * never sees time pass, bResched latches only from our own daemon
+ * protocol stores, PendEvents1[0x886798b8] stays 0. A cNest underflow
+ * (0xff00, t=65s in the repro) shows the nesting counter itself
+ * drifting once the outermost-exit protocol is the only live half.
+ *
+ * FIX = the CLASS daemon: the same 100%-vendor requeue sequence as
+ * L36EV (MakeRun 0x90825ee4 + the resched protocol stores + pick +
+ * the vendor switcher 0x90822b68; stub guard state16&3 == 0), but the
+ * host scan drops every per-site qualifier: ANY arena thread with a
+ * D0 kstack whose state16 run-state is RUNNING(0)-out-of-queue, that
+ * is not pCurTh, not a kill-epilogue grave (ctx pc 0x9083c102), not
+ * zombie/dead-shaped, and whose saved ctx pc sits in a REAL code
+ * window (kernel+XIP [0x90800000,0x908C0000) excluding the OAL idle
+ * window [0x90808000,0x9080a000), the k.coredll servant window
+ * [0xC0021000,0xC0083000), or the user window [0x40000000,0x48000000)
+ * — the L36 scan's kernel-only window is why the recurrence parked:
+ * the dropped servant resumes mid-k.coredll, outside its filter).
+ * Gates: pick==0 && pRunnable==0 (nothing queued at all), the shared
+ * movement signature (quiet-park trigger, 60 quiet scans park,
+ * movement re-arms), one delivery per cadence (MMCS_L37EV_MS default
+ * 2000), hard cap MMCS_L37EV_MAX (default 16). Delivery verified by
+ * GUEST-WRITTEN MARKER READBACK (stage markers 1-5 at stub+0xF0) and
+ * the requeued thread's state16|1 readback — never breakpoint hits.
+ * Supersession scope (honest, A/B-recorded): the scan is a superset
+ * of the L19TH-v5/L36 per-site requeue shapes ONLY — the L16EV/L19EV
+ * event-wake class and the L26EV/L32EV BLOCKED-orphan classes are NOT
+ * subsumed (their targets sit at state16&3 != 0).
+ * Stub at KILLSTK 0xBF00EE00, dispatch slot evt 0x2C0 (PA 0x0867A058,
+ * idx 4; skip when MMCS_L16EV is armed). Needs MMCS_KILLSTK +
+ * MMCS_TICK. */
+static uint8_t mmcs_l37_stub[] = {
+    0x22, 0x4f, 0xe6, 0x2f, 0x19, 0xd4, 0x43, 0x50,  /* +00 */
+    0x03, 0xc9, 0x00, 0x88, 0x02, 0x89, 0x25, 0xa0,  /* +08 */
+    0x09, 0x00, 0x01, 0xe2, 0x14, 0xd2, 0x12, 0x22,  /* +10 */
+    0x15, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x02, 0xe2,  /* +18 */
+    0x11, 0xd2, 0x12, 0x22, 0x01, 0xe1, 0x09, 0x00,  /* +20 */
+    0x12, 0xd2, 0x12, 0x22, 0x01, 0xe1, 0x09, 0x00,  /* +28 */
+    0x11, 0xd2, 0x12, 0x22, 0x03, 0xe2, 0x09, 0x00,  /* +30 */
+    0x0b, 0xd2, 0x12, 0x22, 0x0b, 0xd4, 0x09, 0x00,  /* +38 */
+    0x0e, 0xd2, 0x42, 0x22, 0x0e, 0xd2, 0x20, 0x5e,  /* +40 */
+    0x04, 0xe2, 0x09, 0x00, 0x06, 0xd2, 0x12, 0x22,  /* +48 */
+    0x0c, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x05, 0xe2,  /* +50 */
+    0x03, 0xd2, 0x12, 0x22, 0xf6, 0x6e, 0x26, 0x4f,  /* +58 */
+    0x00, 0xe0, 0x0b, 0x00, 0x09, 0x00, 0x09, 0x00,  /* +60 */
+    /* pool */
+    0x00, 0x00, 0x00, 0x00,   /* +0x68 .Lm: marker cell VA (patched) */
+    0x00, 0xd0, 0x6d, 0x90,   /* +0x6c .Lt: thread VA (patched) */
+    0xe4, 0x5e, 0x82, 0x90,   /* .Lmk: 0x90825ee4 MakeRun */
+    0x84, 0x98, 0x67, 0x88,   /* .Lf: 0x88679884 resched byte */
+    0x88, 0x98, 0x67, 0x88,   /* .Lf2: 0x88679888 drain2 word */
+    0xa4, 0xef, 0x67, 0x88,   /* .Lpick: 0x8867efa4 */
+    0x94, 0x98, 0x67, 0x88,   /* .Lpcur: 0x88679894 */
+    0x68, 0x2b, 0x82, 0x90,   /* .Lsw: 0x90822b68 switcher */
+};
+#define MMCS_L37_STUB_VA   0xBF00EE00
+#define MMCS_L37_SLOT_PA   0x0867A058   /* evt 0x2C0, idx 4 */
+#define MMCS_L37_QUIET_PARK 60
+static uint32_t mmcs_l37_total;
+static uint32_t mmcs_l37_quiet;
+static uint8_t mmcs_l37_sig[MMCS_L19_NSIG];
+static int mmcs_l37_sig_have;
+
+/* the ctx-pc acceptance windows (VA): kernel+XIP, k.coredll servants,
+ * user — with the OAL idle loop AND the switcher machinery carved out
+ * (a thread parked inside the OAL window is the idle context, and a
+ * ctx pc inside the resched-entry/switcher/idle block 0x90822a80..
+ * 0x90822c80 or the KCall-exit protocol window means the thread was
+ * mid-switch — KCNextThread already dequeued it; MakeRun-ing it would
+ * resume a half-switched context — live-caught in the cen1 park dump:
+ * the freed 0x906ddaa0 shape, ctx b4=0x9082bbf4 = the switcher's own
+ * per-switch callback) */
+static bool mmcs_l37_pc_ok(uint32_t pc)
+{
+    if (pc >= 0x90800000 && pc < 0x908C0000) {
+        if (pc >= 0x90808000 && pc < 0x9080A000) {
+            return false;              /* OAL idle/timer window */
+        }
+        if (pc >= 0x90822a80 && pc < 0x90822c80) {
+            return false;              /* resched entry + switcher + idle */
+        }
+        if (pc >= 0x908230a0 && pc < 0x90823160) {
+            return false;              /* rte-exit family + KCall wrapper */
+        }
+        return true;
+    }
+    if (pc >= 0xC0021000 && pc < 0xC0083000) {
+        return true;                   /* k.coredll servant window */
+    }
+    return pc >= 0x40000000 && pc < 0x48000000;
+}
+
+static void mmcs_l37_scan(void)
+{
+    uint8_t sig[MMCS_L19_NSIG];
+
+    if (mmcs_l37_total >= mmcs_l37_max_deliv) {
+        if (mmcs_l37_armed) {
+            fprintf(stderr, "MMCS-L37: hard cap %u deliveries reached - "
+                    "daemon parked\n", mmcs_l37_total);
+            mmcs_l37_armed = 0;
+        }
+        return;
+    }
+    mmcs_l19_signature(sig);
+    bool moved = mmcs_l37_sig_have
+                 && memcmp(sig, mmcs_l37_sig, MMCS_L19_NSIG) != 0;
+    memcpy(mmcs_l37_sig, sig, MMCS_L19_NSIG);
+    mmcs_l37_sig_have = 1;
+    if (moved) {
+        mmcs_l37_quiet = 0;
+        if (!mmcs_l37_armed) {
+            mmcs_l37_armed = 1;
+            fprintf(stderr, "MMCS-L37: t=%" PRId64 "ms movement while "
+                    "parked - re-armed (%u deliveries used)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l37_total);
+        }
+    } else if (mmcs_l37_armed && ++mmcs_l37_quiet >= MMCS_L37_QUIET_PARK) {
+        fprintf(stderr, "MMCS-L37: t=%" PRId64 "ms %u quiet scans - "
+                "daemon parked at %u deliveries\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l37_quiet,
+                mmcs_l37_total);
+        mmcs_l37_armed = 0;
+        mmcs_l37_quiet = 0;
+    }
+    if (!mmcs_l37_armed) {
+        return;
+    }
+    /* the whole-system-blocked gate: nothing queued at all */
+    uint32_t pick = 0, prun = 0;
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    if (pick != 0 || prun != 0) {
+        return;
+    }
+    /* the CLASS arena scan: ANY alive D0-kstack thread left
+     * RUNNING(0)-but-not-queued by a KCall-exit switch */
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    uint32_t cand = 0, cand_pc = 0, cand_sp = 0, cand_st = 0;
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, pc0, pc1;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&pc0, arena + o + 0xb0, 4);
+        memcpy(&pc1, arena + o + 0xb4, 4);
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000) {
+            continue;
+        }
+        uint32_t tva = 0x90680000 + o;
+        /* the kill-epilogue graves (both ctx save points) */
+        if (pc0 == 0x9083c102 || pc1 == 0x9083c102) {
+            continue;
+        }
+        if (cand || tva == pcur) {
+            continue;
+        }
+        /* the class state: RUNNING(0)-out-of-queue, not dead (bit 3
+         * is the L18 DEAD marker), not zombie-shaped */
+        if ((st16 & 3) != 0 || (st16 & 8) != 0
+            || (st16 & 0x02000000) != 0) {
+            continue;
+        }
+        /* the ctx must sit in a real code window */
+        uint32_t pc = mmcs_l37_pc_ok(pc0) ? pc0
+                    : mmcs_l37_pc_ok(pc1) ? pc1 : 0;
+        if (!pc) {
+            continue;
+        }
+        cand = tva;
+        cand_pc = pc;
+        cand_sp = (pc == pc0) ? pc1 : pc0;
+        cand_st = st16;
+    }
+    if (!cand) {
+        return;                       /* not the lost-preempt park shape */
+    }
+    /* deliver: install, THEN patch the pool (.Lt +0x6c thread VA, .Lm
+     * +0x68 marker-cell VA) — the .Lt patch-order bug class (L36
+     * finding): patch-then-install silently restores the default .Lt */
+    cpu_physical_memory_write(0x1F00EE00, mmcs_l37_stub,
+                              sizeof mmcs_l37_stub);
+    cpu_physical_memory_write(0x1F00EE00 + 0x6c, &cand, 4);
+    cpu_physical_memory_write(0x1F00EE00 + 0x68,
+                              &(uint32_t){ MMCS_L37_STUB_VA + 0xf0 }, 4);
+    cpu_physical_memory_write(0x1F00EEF0,
+                              &(uint32_t){ MMCS_L37_STUB_VA + 0xf0 }, 4);
+    uint32_t slot_cur = 0;
+    cpu_physical_memory_read(MMCS_L37_SLOT_PA, &slot_cur, 4);
+    if (slot_cur != MMCS_L37_STUB_VA) {
+        if (slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L37: slot evt 0x2c0 busy (%08x) - "
+                    "scan skipped\n", slot_cur);
+            return;
+        }
+        cpu_physical_memory_write(MMCS_L37_SLOT_PA,
+                                  &(uint32_t){ MMCS_L37_STUB_VA }, 4);
+    }
+    struct mmcs_l16_ent *e = &mmcs_l16_ents[4];
+    e->evt_va = cand;
+    e->stub_va = MMCS_L37_STUB_VA;
+    e->evt_code = 0x2C0;
+    e->slot_pa = MMCS_L37_SLOT_PA;
+    e->daemon = 1;
+    e->pending = 1;
+    mmcs_l37_total++;
+    fprintf(stderr, "MMCS-L37: t=%" PRId64 "ms lost-preempt requeue thread "
+            "%08x (state16 %08x, ctx pc %08x sp %08x, delivery %u/%u)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), cand, cand_st,
+            cand_pc, cand_sp, mmcs_l37_total, mmcs_l37_max_deliv);
+}
+
 /* MMCS fork (L19): MMCS_L19TH=threadVA@ms[,threadVA@ms] — the THREAD-
  * level enqueue completion (v5 stub; the original decode comment was
  * truncated by the L32 block insertion — see git history for the full
@@ -3976,6 +4235,30 @@ static void mmcs_l16_boot_parse(void)
                     "wired on first delivery)\n",
                     mmcs_l36_cadence_ms, mmcs_l36_max_deliv,
                     MMCS_L36_STUB_VA);
+        }
+    }
+    /* L37: the KCall-exit lost-preempt CLASS daemon — slot idx 4
+     * (evt 0x2C0) would collide with MMCS_L16EV list entries >= 4 */
+    if (getenv("MMCS_L37EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L37: shares slot idx 4 (evt 0x2c0) "
+                    "with MMCS_L16EV — drop L16EV; not arming L37\n");
+        } else {
+            mmcs_l37_cadence_ms =
+                atoi(getenv("MMCS_L37EV_MS") ? : "2000");
+            if (!mmcs_l37_cadence_ms) {
+                mmcs_l37_cadence_ms = 2000;
+            }
+            mmcs_l37_max_deliv = atoi(getenv("MMCS_L37EV_MAX") ? : "16");
+            if (!mmcs_l37_max_deliv) {
+                mmcs_l37_max_deliv = 16;
+            }
+            mmcs_l37_armed = 1;
+            fprintf(stderr, "MMCS-L37: lost-preempt class requeue daemon "
+                    "armed (cadence %ums, cap %u; stub %08x slot evt "
+                    "0x2c0 wired on first delivery)\n",
+                    mmcs_l37_cadence_ms, mmcs_l37_max_deliv,
+                    MMCS_L37_STUB_VA);
         }
     }
     if (getenv("MMCS_L26EV")) {
@@ -4475,17 +4758,20 @@ struct MmcsSnap {
     struct mmcs_pgown_ent pgown[MMCS_PGOWN_SLOTS];
     uint32_t pgown_nins, pgown_npin, pgown_novr;
     struct mmcs_l16_ent l16[MMCS_L16_MAX];
-    int32_t l19_armed, l26_armed, l32_armed, l36_armed;
+    int32_t l19_armed, l26_armed, l32_armed, l36_armed, l37_armed;
     uint32_t l19_cadence, l26_cadence, l32_cadence, l36_cadence;
-    uint32_t l19_max, l26_max, l32_max, l36_max;
-    uint32_t l19_total, l26_total, l32_total, l36_total;
+    uint32_t l37_cadence;
+    uint32_t l19_max, l26_max, l32_max, l36_max, l37_max;
+    uint32_t l19_total, l26_total, l32_total, l36_total, l37_total;
     uint8_t l19_sig[MMCS_L19_NSIG];
     uint8_t l26_sig[MMCS_L19_NSIG];
     uint8_t l32_sig[MMCS_L19_NSIG];
     uint8_t l36_sig[MMCS_L19_NSIG];
-    int32_t l19_have, l26_have, l32_have, l36_have;
+    uint8_t l37_sig[MMCS_L19_NSIG];
+    int32_t l19_have, l26_have, l32_have, l36_have, l37_have;
     uint32_t l19_quiet, l19_nopick, l26_quiet, l32_quiet, l36_quiet;
-    uint64_t tick_l19, tick_l26, tick_l32, tick_l36;
+    uint32_t l37_quiet;
+    uint64_t tick_l19, tick_l26, tick_l32, tick_l36, tick_l37;
     int32_t tick_live, hdevt_pending;
 };
 static struct MmcsSnap mmcs_snap;
@@ -4510,35 +4796,43 @@ static int mmcs_machine_pre_save(void *opaque)
     s->l26_armed = mmcs_l26_armed;
     s->l32_armed = mmcs_l32_armed;
     s->l36_armed = mmcs_l36_armed;
+    s->l37_armed = mmcs_l37_armed;
     s->l19_cadence = mmcs_l19_cadence_ms;
     s->l26_cadence = mmcs_l26_cadence_ms;
     s->l32_cadence = mmcs_l32_cadence_ms;
     s->l36_cadence = mmcs_l36_cadence_ms;
+    s->l37_cadence = mmcs_l37_cadence_ms;
     s->l19_max = mmcs_l19_max_deliv;
     s->l26_max = mmcs_l26_max_deliv;
     s->l32_max = mmcs_l32_max_deliv;
     s->l36_max = mmcs_l36_max_deliv;
+    s->l37_max = mmcs_l37_max_deliv;
     s->l19_total = mmcs_l19_total;
     s->l26_total = mmcs_l26_total;
     s->l32_total = mmcs_l32_total;
     s->l36_total = mmcs_l36_total;
+    s->l37_total = mmcs_l37_total;
     memcpy(s->l19_sig, mmcs_l19_sig, MMCS_L19_NSIG);
     memcpy(s->l26_sig, mmcs_l26_sig, MMCS_L19_NSIG);
     memcpy(s->l32_sig, mmcs_l32_sig, MMCS_L19_NSIG);
     memcpy(s->l36_sig, mmcs_l36_sig, MMCS_L19_NSIG);
+    memcpy(s->l37_sig, mmcs_l37_sig, MMCS_L19_NSIG);
     s->l19_have = mmcs_l19_sig_have;
     s->l26_have = mmcs_l26_sig_have;
     s->l32_have = mmcs_l32_sig_have;
     s->l36_have = mmcs_l36_sig_have;
+    s->l37_have = mmcs_l37_sig_have;
     s->l19_quiet = mmcs_l19_quiet;
     s->l19_nopick = mmcs_l19_nopick;
     s->l26_quiet = mmcs_l26_quiet;
     s->l32_quiet = mmcs_l32_quiet;
     s->l36_quiet = mmcs_l36_quiet;
+    s->l37_quiet = mmcs_l37_quiet;
     s->tick_l19 = mmcs_tick_l19;
     s->tick_l26 = mmcs_tick_l26;
     s->tick_l32 = mmcs_tick_l32;
     s->tick_l36 = mmcs_tick_l36;
+    s->tick_l37 = mmcs_tick_l37;
     s->tick_live = mmcs_tick_live;
     s->hdevt_pending = mmcs_hdevt_pending;
     return 0;
@@ -4564,35 +4858,43 @@ static int mmcs_machine_post_load(void *opaque, int version_id)
     mmcs_l26_armed = s->l26_armed;
     mmcs_l32_armed = s->l32_armed;
     mmcs_l36_armed = s->l36_armed;
+    mmcs_l37_armed = s->l37_armed;
     mmcs_l19_cadence_ms = s->l19_cadence;
     mmcs_l26_cadence_ms = s->l26_cadence;
     mmcs_l32_cadence_ms = s->l32_cadence;
     mmcs_l36_cadence_ms = s->l36_cadence;
+    mmcs_l37_cadence_ms = s->l37_cadence;
     mmcs_l19_max_deliv = s->l19_max;
     mmcs_l26_max_deliv = s->l26_max;
     mmcs_l32_max_deliv = s->l32_max;
     mmcs_l36_max_deliv = s->l36_max;
+    mmcs_l37_max_deliv = s->l37_max;
     mmcs_l19_total = s->l19_total;
     mmcs_l26_total = s->l26_total;
     mmcs_l32_total = s->l32_total;
     mmcs_l36_total = s->l36_total;
+    mmcs_l37_total = s->l37_total;
     memcpy(mmcs_l19_sig, s->l19_sig, MMCS_L19_NSIG);
     memcpy(mmcs_l26_sig, s->l26_sig, MMCS_L19_NSIG);
     memcpy(mmcs_l32_sig, s->l32_sig, MMCS_L19_NSIG);
     memcpy(mmcs_l36_sig, s->l36_sig, MMCS_L19_NSIG);
+    memcpy(mmcs_l37_sig, s->l37_sig, MMCS_L19_NSIG);
     mmcs_l19_sig_have = s->l19_have;
     mmcs_l26_sig_have = s->l26_have;
     mmcs_l32_sig_have = s->l32_have;
     mmcs_l36_sig_have = s->l36_have;
+    mmcs_l37_sig_have = s->l37_have;
     mmcs_l19_quiet = s->l19_quiet;
     mmcs_l19_nopick = s->l19_nopick;
     mmcs_l26_quiet = s->l26_quiet;
     mmcs_l32_quiet = s->l32_quiet;
     mmcs_l36_quiet = s->l36_quiet;
+    mmcs_l37_quiet = s->l37_quiet;
     mmcs_tick_l19 = s->tick_l19;
     mmcs_tick_l26 = s->tick_l26;
     mmcs_tick_l32 = s->tick_l32;
     mmcs_tick_l36 = s->tick_l36;
+    mmcs_tick_l37 = s->tick_l37;
     mmcs_tick_live = s->tick_live;
     mmcs_hdevt_pending = s->hdevt_pending;
 
@@ -4697,35 +4999,43 @@ static const VMStateDescription vmstate_mmcs_snap = {
         VMSTATE_INT32(l26_armed, struct MmcsSnap),
         VMSTATE_INT32(l32_armed, struct MmcsSnap),
         VMSTATE_INT32(l36_armed, struct MmcsSnap),
+        VMSTATE_INT32(l37_armed, struct MmcsSnap),
         VMSTATE_UINT32(l19_cadence, struct MmcsSnap),
         VMSTATE_UINT32(l26_cadence, struct MmcsSnap),
         VMSTATE_UINT32(l32_cadence, struct MmcsSnap),
         VMSTATE_UINT32(l36_cadence, struct MmcsSnap),
+        VMSTATE_UINT32(l37_cadence, struct MmcsSnap),
         VMSTATE_UINT32(l19_max, struct MmcsSnap),
         VMSTATE_UINT32(l26_max, struct MmcsSnap),
         VMSTATE_UINT32(l32_max, struct MmcsSnap),
         VMSTATE_UINT32(l36_max, struct MmcsSnap),
+        VMSTATE_UINT32(l37_max, struct MmcsSnap),
         VMSTATE_UINT32(l19_total, struct MmcsSnap),
         VMSTATE_UINT32(l26_total, struct MmcsSnap),
         VMSTATE_UINT32(l32_total, struct MmcsSnap),
         VMSTATE_UINT32(l36_total, struct MmcsSnap),
+        VMSTATE_UINT32(l37_total, struct MmcsSnap),
         VMSTATE_UINT8_ARRAY(l19_sig, struct MmcsSnap, MMCS_L19_NSIG),
         VMSTATE_UINT8_ARRAY(l26_sig, struct MmcsSnap, MMCS_L19_NSIG),
         VMSTATE_UINT8_ARRAY(l32_sig, struct MmcsSnap, MMCS_L19_NSIG),
         VMSTATE_UINT8_ARRAY(l36_sig, struct MmcsSnap, MMCS_L19_NSIG),
+        VMSTATE_UINT8_ARRAY(l37_sig, struct MmcsSnap, MMCS_L19_NSIG),
         VMSTATE_INT32(l19_have, struct MmcsSnap),
         VMSTATE_INT32(l26_have, struct MmcsSnap),
         VMSTATE_INT32(l32_have, struct MmcsSnap),
         VMSTATE_INT32(l36_have, struct MmcsSnap),
+        VMSTATE_INT32(l37_have, struct MmcsSnap),
         VMSTATE_UINT32(l19_quiet, struct MmcsSnap),
         VMSTATE_UINT32(l19_nopick, struct MmcsSnap),
         VMSTATE_UINT32(l26_quiet, struct MmcsSnap),
         VMSTATE_UINT32(l32_quiet, struct MmcsSnap),
         VMSTATE_UINT32(l36_quiet, struct MmcsSnap),
+        VMSTATE_UINT32(l37_quiet, struct MmcsSnap),
         VMSTATE_UINT64(tick_l19, struct MmcsSnap),
         VMSTATE_UINT64(tick_l26, struct MmcsSnap),
         VMSTATE_UINT64(tick_l32, struct MmcsSnap),
         VMSTATE_UINT64(tick_l36, struct MmcsSnap),
+        VMSTATE_UINT64(tick_l37, struct MmcsSnap),
         VMSTATE_INT32(tick_live, struct MmcsSnap),
         VMSTATE_INT32(hdevt_pending, struct MmcsSnap),
         VMSTATE_END_OF_LIST()
@@ -5979,7 +6289,7 @@ static void mmcs_init(MachineState *machine)
                 if (getenv("MMCS_L16EV") || getenv("MMCS_L18EV")
                     || getenv("MMCS_L19EV") || getenv("MMCS_L19TH")
                     || getenv("MMCS_L26EV") || getenv("MMCS_L32EV")
-                    || getenv("MMCS_L36EV")) {
+                    || getenv("MMCS_L36EV") || getenv("MMCS_L37EV")) {
                     if (!mmcs_env_on("MMCS_KILLSTK")
                         || !mmcs_env_on("MMCS_TICK")) {
                         fprintf(stderr, "MMCS-L16: needs MMCS_KILLSTK"
