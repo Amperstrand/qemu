@@ -3706,7 +3706,21 @@ static void mmcs_l26_scan(void)
  * 0xBF00EC00 (the L19TH idx-0 slot, evt 0x220 — skip when L19TH is
  * armed). Needs MMCS_KILLSTK + MMCS_TICK. */
 #define MMCS_L32_STUB_VA   0xBF00EC00
-#define MMCS_L32_SLOT_PA   0x0867A030   /* evt 0x220, idx 0 */
+/* MMCS fork (L48): the slot PA repair — the dispatch table read is
+ * handler = *(u32*)(0x8867a000 + (evt>>3)) (the L13 decode, proven
+ * live: evt 0xAE0 -> 0x8867a15c; the L16EV table below agrees), so evt
+ * 0x220's slot is 0x8867a044, NOT 0x8867a030 — the L32-era 0x30 was a
+ * transcription slip 0x14 bytes low (the evt-0x180 slot, never
+ * dispatched). LIVE-CAUGHT (the L48 session, marker readback): the
+ * L26 stub (evt 0x280 -> 0x50, CORRECT) executed (marker 1) while the
+ * L32/L46/L47 stub at the wrong slot NEVER did (marker = the planted
+ * sentinel) — every apparent L32/L46 "v7 wake" was actually carried
+ * by the co-armed L26 daemon's MakeRun, and the L47's f1f8 plant
+ * (which makes the walker FAIL the L26 wblk==0 filter) actively
+ * blocked the only working wake channel. The wrong-slot guard also
+ * explains the L46-era mysteries (deliveries that "fired" only at
+ * L26 cadences). */
+#define MMCS_L32_SLOT_PA   0x0867A044   /* evt 0x220 (evt>>3 = 0x44) */
 #define MMCS_L32_QUIET_PARK 60
 static uint32_t mmcs_l32_total;
 
