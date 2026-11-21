@@ -2490,7 +2490,9 @@ static uint32_t mmcs_l19_cadence_ms = 1000;
 /* L26: the DoWait-orphan wake daemon (full block + decode below) */
 static void mmcs_l26_scan(void);
 static int mmcs_l26_armed;
+static int mmcs_l26m_armed;
 static uint32_t mmcs_l26_cadence_ms = 2000;
+static uint32_t mmcs_l32_stack_pa(uint32_t va);  /* L40: the L26M guard */
 static uint32_t mmcs_l26_max_deliv = 64;
 /* L36: the post-exit requeue daemon (full block + decode below) */
 static void mmcs_l36_scan(void);
@@ -3300,6 +3302,41 @@ static void mmcs_l26_scan(void)
             || wblk != 0
             || tva == pcur) {
             continue;
+        }
+        /* MMCS fork (L40): MMCS_L26M — the marked-entry guard (the
+         * WEDGE decode, 2026-11-21). The DoWait waiter's wait entry
+         * sits at wait-obj+0x10 (live: 906feb58's d006fd6c wobj ->
+         * the d006fd7c entry {.., event@+0x14, type@+0x18, pTh@+0x1c});
+         * the kernel's wait dispatcher (0x90837ab0) keys its per-type
+         * path on the entry's type BYTE at +0x18: type 4/13 = the real
+         * EVNT evaluation, type 1/0xff = the marked/teardown class ->
+         * the unlink-and-retry path. Waking a thread whose entry is
+         * MARKED (0xff) starts the kernel evaluation spin (the L40
+         * WEDGE: the woken thread loops forever between the outer wait
+         * face (0x908378ce..da, `bf` on the submit's nonzero return),
+         * the KCall trampoline's defer check (0x90823112: cNest!=1 &&
+         * dwKCRes!=1 -> set bResched, return, retry) and the unlink
+         * helper 0x90827930 / the walk helper 0x90827964 — live
+         * pc-census 15/24 samples at 0x90827930, cells frozen, the
+         * daemons' movement signature FALSE-QUIET). Live-tested: the
+         * cNest seed, the dwKCRes seed and the type-repair each
+         * advance the spin exactly ONE layer then it re-forms — the
+         * completion half needs the live scheduler. The guard skips
+         * the marked class (let it stay blocked) so the park stays
+         * clean instead of burning. Env MMCS_L26M, default off. */
+        if (mmcs_l26m_armed) {
+            uint32_t pa_t = mmcs_l32_stack_pa(wobj + 0x28);
+            uint8_t tb = 0xff;
+            if (pa_t) {
+                cpu_physical_memory_read(pa_t, &tb, 1);
+            }
+            if (tb == 0xff) {
+                fprintf(stderr, "MMCS-L26M: t=%" PRId64 "ms skip thread "
+                        "%08x (wait-obj %08x) - MARKED entry (the wedge "
+                        "class)\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, wobj);
+                continue;
+            }
         }
         /* deliver: install, THEN patch the pool (.Lt +0x6c thread VA,
          * .Lm +0x68 marker-cell VA) and init the marker cell to a
@@ -4447,6 +4484,12 @@ static void mmcs_l16_boot_parse(void)
                     "wired on first delivery)\n",
                     mmcs_l26_cadence_ms, mmcs_l26_max_deliv,
                     MMCS_L26_STUB_VA);
+            if (getenv("MMCS_L26M")) {
+                mmcs_l26m_armed = 1;
+                fprintf(stderr, "MMCS-L26M: marked-entry guard armed "
+                        "(skip the wedge class: wait entries whose "
+                        "+0x18 type byte is 0xff)\n");
+            }
         }
     }
     mmcs_l19_cadence_ms = atoi(getenv("MMCS_L19EV_MS") ? : "1000");
