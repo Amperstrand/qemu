@@ -3559,6 +3559,70 @@ static void mmcs_l26_scan(void)
                 continue;
             }
         }
+        /* MMCS fork (L49/S197): the create-walker class exclusion —
+         * the co-delivery kill guard. DECODE (live, the -d int register
+         * tape at the park-loop poll 0x90837cfa `mov.w @(12,r8),r0` +
+         * the L44DBG kslot-raise record dumps + the L26EV-off A/B,
+         * 2026-11-22): the L48 "walker dies on dead-process memory"
+         * reading is REFUTED — the walker's death (exp=180, spc in
+         * c00361xx) is OUR OWN co-timed L26 stub delivery poisoning
+         * the resumed register file: both daemons fire at the same
+         * 2000ms cadence boundary; the L47 evt-0x220 wake lands first
+         * (the resumed r8 = the parked TCB cell 906cb240 -> the poll
+         * reads the state word -> benign, the cycle completes), then
+         * the L26 evt-0x280 stub hits the re-parked walker and its
+         * delivery-context registers pass through the switcher into
+         * the resumed frame (int tape: r17=bf00e200 the L26 stub
+         * page, r22=0x280, r8=0x289d a daemon-internal value) — the
+         * poll [r8+12] = [0x28a9] on NO page -> unresolvable 0x040 ->
+         * the c0000005 raise -> the vendor kill grave. A/B: with the
+         * L26 delivery removed the walker SURVIVES every completion
+         * cycle (deliveries 1-3, parked-cycling alive at 40s, no
+         * raise, serial 720). Post-L48 the walker's wake is owned by
+         * the native evt-0x220 channel (the L32 slot fix made the
+         * L47FIX's stub the true carrier); the L26's delivery to the
+         * same thread is the pre-L48 carrier leftover — redundant and
+         * lethal. GUARD (the L46 LINKED discriminator): when the L47
+         * daemon is armed, resolve the candidate's waited object
+         * through its own wait-array entry (pTh match) and SKIP when
+         * it is the LINKED create-interlock shape (an arena object
+         * with a non-zero waiter-list head) — the R1-vs-R3 class
+         * disjointness the delivery-decision table already asserts.
+         * Default world untouched (the guard is read-only and gated on
+         * MMCS_L47FIX arming). */
+        if (mmcs_l47_armed) {
+            uint32_t obj49 = 0;
+            for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+                uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+                uint32_t w1 = 0;
+                if (!pa1) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa1, &w1, 4);
+                if (w1 != tva) {
+                    continue;
+                }
+                uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+                if (pa2) {
+                    cpu_physical_memory_read(pa2, &obj49, 4);
+                }
+                break;
+            }
+            if (obj49 >= 0x90680000 && obj49 < 0x90780000) {
+                uint32_t wlh49 = 0;
+                cpu_physical_memory_read(obj49 - 0x80000000 + 8, &wlh49, 4);
+                if (wlh49 != 0) {
+                    fprintf(stderr, "MMCS-L49: t=%" PRId64 "ms skip thread "
+                            "%08x (wait-obj %08x, obj %08x LINKED) - the "
+                            "create-interlock class is the L47 channel's "
+                            "domain (the co-delivery register poison, "
+                            "S197)\n",
+                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                            wobj, obj49);
+                    continue;
+                }
+            }
+        }
         /* deliver: install, THEN patch the pool (.Lt +0x6c thread VA,
          * .Lm +0x68 marker-cell VA) and init the marker cell to a
          * known sentinel — the L38 fix (the old patch-then-install
