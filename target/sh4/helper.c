@@ -1156,6 +1156,38 @@ void superh_cpu_do_interrupt(CPUState *cs)
         cs->exception_index = -1;
         return;
     }
+    /* MMCS fork (L61/S211): MMCS_L61EV — THE RING DATA-PAGE
+     * STORE-DROP. The post-launch-loop world (the L60 exit): the uHAL
+     * ring's second-stage init HAS run (the handle resolves, the ring
+     * struct at the 0x8862ada0-class cell is mapped) — the RINGFIX
+     * NULL-sub-state fault never fires. But the ring DATA buffer sits
+     * at VA 0x18e7c000 (buffer base + wptr, e.g. tea 0x18e7c2d0) on a
+     * page NO context ever maps: every exception report's copy store
+     * `mov.b r1,@(r0,r3)` (path A 0x9080757e, path B 0x908075b6)
+     * write-misses and the dispatch re-executes the SAME store forever
+     * — 422,490 identical excp=060 faults in one 7s window (the
+     * S122-L2 fault-logging storm class redux, now at the DATA page).
+     * The RINGFIX precedent (write-dropped): retire the store without
+     * effect — the ring bookkeeping stores that follow (ring[4]/[8]
+     * wrap+advance, all in the MAPPED ring struct) complete, the
+     * report fn returns, the exception handler finishes. The dropped
+     * bytes are the debug print only (the ring is never control
+     * flow). Guards: excp 0x60 (write miss) + the two exact store
+     * pcs of the ring-writer fn_9080755c — no other write path.
+     * NOTE: a file-static (NOT a CPU vmstate field) — snapshot
+     * compatibility with the pre-L61 chain is the law (a vmstate
+     * field addition rejects every older .vmstate: "Missing section
+     * footer for cpu"). */
+    static int mmcs_l61ev_armed = -1;
+    if (mmcs_l61ev_armed < 0) {
+        mmcs_l61ev_armed = getenv("MMCS_L61EV") != NULL;
+    }
+    if (mmcs_l61ev_armed && cs->exception_index == 0x060
+        && (env->pc == 0x908075b6 || env->pc == 0x9080757e)) {
+        env->pc += 2;                   /* retire the store: dropped */
+        cs->exception_index = -1;
+        return;
+    }
     /* MMCS fork: ILKFIX emulation half — interlocked ops whose KData
      * slots hold live vendor data (see tlb_fill MMCS_ILKFIX) execute as
      * exceptions instead (exp 0x180 illegal on the data bytes, or 0x040/
