@@ -2212,6 +2212,20 @@ void mmcs_inject_evt(uint32_t evt)
     if (mmcs_cpu) {
         CPUSH4State *env = &mmcs_cpu->env;
         static int n;
+        /* MMCS fork (L56d): the tick yields to an unconsumed wake-class
+         * injection. The unconditional intevt overwrite raced the L56
+         * wake out of existence in the live spinner world (EVTDBG
+         * census: 23,392 takes all vec=400, ZERO vec=320) — the next
+         * 1ms tick's 0x400 replaced the unconsumed 0x320 before the
+         * KCall masked windows let the CPU accept it. Dead-idle worlds
+         * took the wake within µs, so L54/L55 never met the race.
+         * Wake-class = intevt < 0x400 (0x200 HDEVT, 0x280 L26, 0x2c0
+         * L37, 0x2e0 L52, 0x320 L54/55/56, 0x3E0 VINTC); tick-over-
+         * tick overwrite is unchanged — the default world stays
+         * byte-identical. */
+        if (env->mmcs_evt_inject && env->intevt < 0x400 && evt >= 0x400) {
+            return;                 /* keep the wake armed; drop this tick */
+        }
         env->intevt = evt;
         env->mmcs_evt_inject = 1;
         cpu_reset_interrupt(CPU(mmcs_cpu), CPU_INTERRUPT_HARD);
