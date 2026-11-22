@@ -5069,7 +5069,13 @@ static void mmcs_l52_scan(void)
             || (st16 & 3) != 0                 /* RUNNING/lost-preempt */
             || (st16 >> 24) != 0               /* bF cleared */
             || ctxpc != MMCS_L52_EPILOGUE_PC   /* frozen at the epilogue */
-            || pick != 0 || prun != 0) {       /* the idle world gate */
+            /* the dead-idle world gate: pick==0 (nothing queued) OR
+             * pick==tva (the drain2 keep-current bookkeeping — the
+             * LIVE S200 shape: the tape reads pick == walker while
+             * the CPU idles; someone ELSE's pick = vendor world
+             * mid-flight, skip) */
+            || (pick != 0 && pick != tva)
+            || prun != 0) {
             continue;
         }
         /* the create-body kstack witness (is_cpw — the L46 window) */
