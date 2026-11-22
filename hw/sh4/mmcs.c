@@ -2557,6 +2557,9 @@ static uint32_t mmcs_l50_armed;
 static uint32_t mmcs_l50_cadence_ms = 250;
 static uint32_t mmcs_l50_max_lines = 600;
 static uint32_t mmcs_l50_lines;
+/* L55: the S203 psi-array resolve diagnostic (READ-ONLY; rides the
+ * L50 tape lines — see the dump block in mmcs_l50_dbg) */
+static uint32_t mmcs_l55dbg_armed;
 
 /* savestate lane: the tick-chain cadence counters were function-local
  * statics — hoisted so the snapshot can stream them (losing them
@@ -2567,6 +2570,17 @@ static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
 static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l54;
+static uint64_t mmcs_tick_l55;
+/* L55: the WAIT-ALL chained dual-entry multi-satisfy (S203; the scan
+ * body + the delivery state live down at the L54 cluster — forward
+ * declarations for the tick chain) */
+static void mmcs_l55_scan(void);
+static int mmcs_l55_armed;
+static uint32_t mmcs_l55_cadence_ms;
+static uint32_t mmcs_l55_max_deliv;
+static uint32_t mmcs_l55_total;
+static uint32_t mmcs_l55_key;
+static uint32_t mmcs_l55_stable;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2959,6 +2973,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l54_armed && ++mmcs_tick_l54 >= mmcs_l54_cadence_ms) {
             mmcs_tick_l54 = 0;
             mmcs_l54_scan();
+        }
+        /* L55: the WAIT-ALL chained dual-entry multi-satisfy (the
+         * S203 class — the internal satisfaction check's honest
+         * exit through the stock multi-completion shape) */
+        if (mmcs_l55_armed && ++mmcs_tick_l55 >= mmcs_l55_cadence_ms) {
+            mmcs_tick_l55 = 0;
+            mmcs_l55_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -4748,6 +4769,93 @@ static void mmcs_l50_dbg(void)
                 }
             }
         }
+        /* MMCS fork (L55): MMCS_L55DBG — the S203 psi-array resolve
+         * (READ-ONLY). The kstack witness cell [sp+0x20]-class holds
+         * the create body's psi-array pointer (d0043124-class — the
+         * user handle-table pages, unreachable by the monitor's flat
+         * PA map). Resolve through the L32 page-table resolver, dump
+         * the array + one level of its D0-pointers (the group hunt).
+         * PLUS the group-shape scan: the runner's subarray = a run of
+         * element words; the pending gate (word & 0xFFFFFF3F) <=
+         * 0x1000; hunt {satisfied, pending} adjacent pairs + the
+         * back-pointers to them (the group entries). Default OFF; no
+         * guest writes. */
+        if (mmcs_l55dbg_armed) {
+            static uint32_t l55_pairs_seen;
+            for (int cw = 20; cw <= 28; cw += 4) {
+                uint32_t cpa = mmcs_l32_stack_pa(ssp + cw);
+                uint32_t cand = 0;
+                if (cpa) {
+                    cpu_physical_memory_read(cpa, &cand, 4);
+                }
+                if (cpa && cand >= 0xD0000000 && cand < 0xDC000000) {
+                    fprintf(stderr, " L55[sp+%x]->%08x:", cw, cand);
+                    for (uint32_t wi = 0; wi < 12; wi++) {
+                        uint32_t wpa = mmcs_l32_stack_pa(cand + wi * 4);
+                        uint32_t w = 0;
+                        if (wpa) {
+                            cpu_physical_memory_read(wpa, &w, 4);
+                        } else {
+                            w = 0xdeadbee0 + wi;
+                        }
+                        fprintf(stderr, " %08x", w);
+                    }
+                    /* one level: the first two in-range pointers */
+                    for (uint32_t wi = 0; wi < 12; wi++) {
+                        uint32_t wpa = mmcs_l32_stack_pa(cand + wi * 4);
+                        uint32_t w = 0;
+                        if (!wpa) {
+                            continue;
+                        }
+                        cpu_physical_memory_read(wpa, &w, 4);
+                        if (w >= 0xD0000000 && w < 0xDC000000
+                            && w != cand) {
+                            fprintf(stderr, " |d[%x]->%08x:", wi * 4, w);
+                            for (uint32_t wj = 0; wj < 8; wj++) {
+                                uint32_t p2 = mmcs_l32_stack_pa(w + wj * 4);
+                                uint32_t v2 = 0;
+                                if (p2) {
+                                    cpu_physical_memory_read(p2, &v2, 4);
+                                } else {
+                                    v2 = 0xdeadbee0 + wj;
+                                }
+                                fprintf(stderr, " %08x", v2);
+                            }
+                        }
+                    }
+                }
+            }
+            /* THE GROUP-SHAPE SCAN (bounded: the first 6 prints, once
+             * each — the arena copy is already in hand) */
+            if (l55_pairs_seen < 6) {
+                for (uint32_t o2 = 0; o2 + 8 <= sizeof arena; o2 += 4) {
+                    uint32_t w0, w1;
+                    memcpy(&w0, arena + o2, 4);
+                    memcpy(&w1, arena + o2 + 4, 4);
+                    if ((w0 & 0xFFFFFF3F) > 0x1000 && w1 != 0
+                        && (w1 & 0xFFFFFF3F) <= 0x1000
+                        && w1 >= 0x400) {
+                        /* back-pointer hunt: a word == 0x90680000+o2 */
+                        uint32_t bp = 0;
+                        for (uint32_t o3 = 0; o3 + 4 <= sizeof arena;
+                             o3 += 4) {
+                            uint32_t w3;
+                            memcpy(&w3, arena + o3, 4);
+                            if (w3 == 0x90680000 + o2) {
+                                bp = 0x90680000 + o3;
+                                break;
+                            }
+                        }
+                        fprintf(stderr, "\nMMCS-L55: PAIR @%08x: %08x "
+                                "%08x (bp %08x)", 0x90680000 + o2,
+                                w0, w1, bp);
+                        if (++l55_pairs_seen >= 6) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         fprintf(stderr, "\n");
         mmcs_l50_lines++;
         return;                     /* one walker per cadence */
@@ -5709,6 +5817,443 @@ static void mmcs_l54_scan(void)
     mmcs_l54_stable = 0;
 }
 
+/* MMCS fork (L55): MMCS_L55EV — THE WAIT'S INTERNAL SATISFACTION
+ * CHECK: the chained DUAL-ENTRY delivery (S203, decoded 2026-11-22).
+ *
+ * THE DECODE (this session, Verified disasm + the live probes):
+ * the wait fn 0x90830444's TAIL 0x9083d41c is zone-gated OFF in this
+ * world ([base+0x368] reads 0 live) — the re-submit is NOT the tail;
+ * the cycle runs in the park fn 0x90837bcc's FACE LOOP (the eval
+ * KCall fn_90828244): each eval consumes ONE completed-list head
+ * ([pTh+0x1F8]), and when the head is EMPTY + the tmo cell
+ * [pTh+0x200] == -1 the re-block path fires (verdict := 0, bF := 2,
+ * state := BLOCKED, [base+0x88] := 1 — the frozen KCall-return park
+ * at the face pc 0x90837cf6). The L54 delivery plants ONE completed
+ * entry per cycle: the satisfy consumes it (the count [pTh+0x66]
+ * walks +1), the park fn returns 0x1000, but the WAIT-ALL driver
+ * (0x90837e24 — the park fn's caller at 0x90837ed2, its per-element
+ * validate loop 0x90837e78 resolving each psi word through
+ * 0x9082d460 into the driver's results array) re-checks the OTHER
+ * element, finds it still owed, and re-submits — the same frames
+ * rebuild at the same sp. ONE delivery can never finish a
+ * two-element WAIT-ALL: the stock world satisfies BOTH before the
+ * re-check (the completed list carries both entries chained via
+ * +0x10; the face's cleanup-dispatch loop 0x90837d3a walks the whole
+ * chain).
+ *
+ * THE FIX — the stock manual-reset shape + the ghost's sig: the
+ * eval's type-4 satisfy runs [obj+0x8D] := [obj+0x8E] (Verified
+ * 0x908283ae-0x908283b8) — the L47/L54 world set 0x8D only (the
+ * auto-reset shape: one satisfy consumes the bit and the driver-
+ * level re-check reads it CLEAR — the re-submit forever). The
+ * stock manual-reset event keeps BOTH cells set (0x8D for the
+ * wake, 0x8E as the post-consume sig), and the ghost namespace
+ * node (the psi element whose +0xC target IS the event — Observed
+ * [wobj+0xDC] = 9069a7e8 with [9069a7e8+0xC] = 9069a588) carries
+ * its own sig byte. The delivery: the L47 plants verbatim (the
+ * type byte, the dual 0x1000 cells, the completed head, the
+ * verdict re-arm) + the {0x8D, 0x8E} pair + the verified ghost's
+ * sig (only when its +0xC == the event; never a feeder event,
+ * never a waiter-list change — the R13 exclusion holds) + THE V9
+ * WAKE (the L54 recipe verbatim).
+ *
+ * Filter: the L54 discriminators VERBATIM (arena, BLOCKED, the face
+ * pc, tva == pCurTh, the dead-idle world gate, the wobj resolution,
+ * the is_cpw witness, the 2-cadence stability) MINUS the
+ * single-entry break, PLUS n >= 2 (the WAIT-ALL shape) and the
+ * per-entry frame-wobble verify. Self-terminating; capped (default
+ * 4). Default OFF; the default-off world is untouched. When L55EV
+ * and L54EV are both set, L54 stands down (the L55 delivery is a
+ * superset — the single-entry world stays the L54's). */
+static void mmcs_l55_scan(void)
+{
+    if (!mmcs_l55_armed || mmcs_l55_total >= mmcs_l55_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    /* THE DEAD-IDLE WORLD GATE (the L52b refinement, verbatim) */
+    if (prun != 0 || (pick != 0 && pick != pcur)) {
+        return;
+    }
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj, wret;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        memcpy(&wret, arena + o + 0x150, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || ctxpc != 0x90837cf6
+            || tva != pcur) {
+            continue;
+        }
+        /* THE S204 SHAPE (the S203 exit's successor): the walker
+         * RUNNABLE-at-the-face ((st16&3)==0) with the STANDING
+         * satisfied state (the non-empty completed head
+         * [pTh+0x1F8]; bF may be 1 (the satisfy in flight) or 0
+         * (the wait done, the return pending)) — the CPU never
+         * switched back (the dead-idle world with pCurTh STALE ==
+         * walker). Wake-only: no plants — the state is already the
+         * stock satisfied shape. */
+        if ((st16 & 3) == 0) {
+            uint8_t bf = 0;
+            cpu_physical_memory_read(tva - 0x80000000 + 0xF, &bf, 1);
+            uint32_t f1f8 = 0;
+            cpu_physical_memory_read(tva - 0x80000000 + 0x1F8,
+                                     &f1f8, 4);
+            if (f1f8 == 0) {
+                continue;
+            }
+            /* the create-body kstack witness (is_cpw) */
+            uint32_t ssp = 0, is_cpw = 0;
+            cpu_physical_memory_read(tva - 0x80000000 + 0xb0,
+                                     &ssp, 4);
+            if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+                for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                    uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                    uint32_t w3 = 0;
+                    if (!pa3) {
+                        continue;
+                    }
+                    cpu_physical_memory_read(pa3, &w3, 4);
+                    if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                        is_cpw = 1;
+                        break;
+                    }
+                }
+            }
+            if (!is_cpw) {
+                continue;
+            }
+            uint32_t key = tva ^ f1f8;
+            if (mmcs_l55_key != key) {
+                mmcs_l55_key = key;
+                mmcs_l55_stable = 1;
+                fprintf(stderr, "MMCS-L55: t=%" PRId64 "ms S204 "
+                        "runnable-at-face seen: th %08x *CUR* "
+                        "st16=%08x bF=%02x f1f8=%08x (stability "
+                        "%u/2; pick %08x)\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                        tva, st16, bf, f1f8, mmcs_l55_stable, pick);
+                return;
+            }
+            if (++mmcs_l55_stable < 2) {
+                return;
+            }
+            /* WAKE-ONLY — the v9 stub + the slot (the L54 recipe
+             * verbatim, no plants) */
+            cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                      sizeof mmcs_l54_stub);
+            cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+            cpu_physical_memory_write(
+                0x1F00E600 + 0x84,
+                &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+            cpu_physical_memory_write(
+                0x1F00E6F0,
+                &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+            uint32_t slot_cur = 0;
+            cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+            if (slot_cur != MMCS_L54_STUB_VA) {
+                if (slot_cur != 0x90822e40) {
+                    fprintf(stderr, "MMCS-L55: slot evt 0x320 busy "
+                            "(%08x) - retry next cadence\n", slot_cur);
+                    return;
+                }
+                cpu_physical_memory_write(
+                    MMCS_L54_SLOT_PA,
+                    &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+            }
+            struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+            e->evt_va = tva;
+            e->stub_va = MMCS_L54_STUB_VA;
+            e->evt_code = 0x320;
+            e->slot_pa = MMCS_L54_SLOT_PA;
+            e->daemon = 1;
+            e->pending = 1;
+            mmcs_l55_total++;
+            fprintf(stderr, "MMCS-L55: t=%" PRId64 "ms S204 wake-only "
+                    "%u/%u: walker %08x *CUR* bF=%02x f1f8=%08x (the "
+                    "standing satisfied state; the v9 wake; markers "
+                    "at %08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                    mmcs_l55_total, mmcs_l55_max_deliv, tva, bf, f1f8,
+                    MMCS_L54_STUB_VA + 0xf0);
+            return;
+        }
+        if ((st16 & 3) != 2
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || wret < 0xC0000000 || wret >= 0xC1000000) {
+            continue;
+        }
+        /* collect ALL pTh-matched wait-array entries (the L54
+         * resolver's walk without the first-match break) */
+        uint32_t wis[4], objs[4];
+        int n = 0;
+        for (uint32_t wi = 0; wi <= 0xC0 && n < 4; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 != tva) {
+                continue;
+            }
+            uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+            uint32_t obj = 0;
+            if (pa2) {
+                cpu_physical_memory_read(pa2, &obj, 4);
+            }
+            if (obj < 0x90680000 || obj >= 0x90780000) {
+                continue;           /* not an arena kernel object */
+            }
+            wis[n] = wi;
+            objs[n] = obj;
+            n++;
+        }
+        if (n < 1) {
+            continue;               /* no resolved entry — not ours */
+        }
+        /* the per-entry sig gate: all consumed (the cycling world —
+         * a signaled entry means the vendor world is moving) */
+        int skip = 0;
+        for (int i = 0; i < n; i++) {
+            uint8_t sig = 0;
+            cpu_physical_memory_read(objs[i] - 0x80000000 + 0x8d,
+                                     &sig, 1);
+            if (sig & 1) {
+                skip = 1;
+                break;
+            }
+            uint32_t wlh = 0;
+            cpu_physical_memory_read(objs[i] - 0x80000000 + 8,
+                                     &wlh, 4);
+            if (wlh == 0) {
+                skip = 1;           /* unlinked = L32EV's class */
+                break;
+            }
+        }
+        if (skip) {
+            continue;
+        }
+        /* the create-body kstack witness (is_cpw — the L46 window) */
+        uint32_t ssp = 0, is_cpw = 0;
+        cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &ssp, 4);
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* the per-entry base + frame-wobble verify (the L47
+         * discipline: entry = wobj + wi - 8, VERIFIED against the
+         * resolved object before any plant) */
+        uint32_t entries[4];
+        for (int i = 0; i < n; i++) {
+            if (wis[i] < 8) {
+                skip = 1;
+                break;
+            }
+            entries[i] = wobj + wis[i] - 8;
+            uint32_t pa_e = mmcs_l32_stack_pa(entries[i] + 0x14);
+            uint32_t objchk = 0;
+            if (pa_e) {
+                cpu_physical_memory_read(pa_e, &objchk, 4);
+            }
+            if (!pa_e || objchk != objs[i]) {
+                fprintf(stderr, "MMCS-L55: entry verify FAILED (entry "
+                        "%08x objchk %08x vs obj %08x) - skip\n",
+                        entries[i], objchk, objs[i]);
+                skip = 1;
+                break;
+            }
+        }
+        if (skip) {
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,objs} */
+        uint32_t key = tva;
+        for (int i = 0; i < n; i++) {
+            key ^= objs[i] * (i + 1);
+        }
+        if (mmcs_l55_key != key) {
+            mmcs_l55_key = key;
+            mmcs_l55_stable = 1;
+            fprintf(stderr, "MMCS-L55: t=%" PRId64 "ms WAIT-ALL park "
+                    "seen: th %08x *CUR* n=%d objs", qemu_clock_get_ms(
+                    QEMU_CLOCK_VIRTUAL), tva, n);
+            for (int i = 0; i < n; i++) {
+                fprintf(stderr, " %08x", objs[i]);
+            }
+            fprintf(stderr, " (stability %u/2; pick %08x)\n",
+                    mmcs_l55_stable, pick);
+            return;
+        }
+        if (++mmcs_l55_stable < 2) {
+            return;
+        }
+        /* DELIVER — the per-entry L47 plants, the manual-reset stock
+         * shape, the wake */
+        for (int i = 0; i < n; i++) {
+            /* the type byte: entry+0x18's low byte carries EVNT(4) */
+            uint32_t pa_t = mmcs_l32_stack_pa(entries[i] + 0x18);
+            if (pa_t) {
+                uint32_t fw = 0;
+                cpu_physical_memory_read(pa_t, &fw, 4);
+                if ((fw & 0xff) != 0x04) {
+                    fw = (fw & 0xffffff00) | 0x04;
+                    cpu_physical_memory_write(pa_t, &fw, 4);
+                }
+            }
+            /* the result cell := 0x1000 (guarded) */
+            uint32_t pa_r = mmcs_l32_stack_pa(entries[i] + 0x20);
+            if (pa_r) {
+                uint32_t cur = 0;
+                cpu_physical_memory_read(pa_r, &cur, 4);
+                if (cur != 0x1000) {
+                    cpu_physical_memory_write(pa_r,
+                                              &(uint32_t){ 0x1000 }, 4);
+                }
+            }
+            /* THE MANUAL-RESET STOCK SHAPE (the S203 decode): the
+             * eval's type-4 satisfy runs [obj+0x8D] := [obj+0x8E]
+             * (Verified 0x908283ae-0x908283b8) — the L47/L54 world
+             * set 0x8D only (the auto-reset shape: one satisfy
+             * consumes the bit, the driver-level re-check reads it
+             * CLEAR, the wait re-submits forever). The stock
+             * manual-reset event keeps BOTH set: 0x8D for the wake,
+             * 0x8E as the post-consume sig the re-check reads. */
+            uint8_t sig = 0;
+            cpu_physical_memory_read(objs[i] - 0x80000000 + 0x8d,
+                                     &sig, 1);
+            sig |= 1;
+            cpu_physical_memory_write(objs[i] - 0x80000000 + 0x8d,
+                                      &sig, 1);
+            uint8_t mark8e = 0;
+            cpu_physical_memory_read(objs[i] - 0x80000000 + 0x8e,
+                                     &mark8e, 1);
+            mark8e |= 1;
+            cpu_physical_memory_write(objs[i] - 0x80000000 + 0x8e,
+                                      &mark8e, 1);
+            /* the ghost node's own sig: the driver-level re-check
+             * may read the ELEMENT's object (the namespace node
+             * whose +0xC target IS this event — Observed [wobj+0xDC]
+             * = 9069a7e8, [9069a7e8+0xC] = 9069a588). Verified before
+             * the plant: only when the node targets THIS event. */
+            for (uint32_t goff = 0x80; goff <= 0x120; goff += 4) {
+                uint32_t pa_g = mmcs_l32_stack_pa(wobj + goff);
+                uint32_t ghost = 0;
+                if (!pa_g) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa_g, &ghost, 4);
+                if (ghost < 0x90680000 || ghost >= 0x90780000) {
+                    continue;
+                }
+                uint32_t gtarget = 0;
+                cpu_physical_memory_read(ghost - 0x80000000 + 0xC,
+                                         &gtarget, 4);
+                if (gtarget != objs[i]) {
+                    continue;
+                }
+                uint8_t gsig = 0;
+                cpu_physical_memory_read(ghost - 0x80000000 + 0x8d,
+                                         &gsig, 1);
+                if (!(gsig & 1)) {
+                    gsig |= 1;
+                    cpu_physical_memory_write(
+                        ghost - 0x80000000 + 0x8d, &gsig, 1);
+                    fprintf(stderr, "MMCS-L55: ghost node %08x sig "
+                            "00->01 (targets the event %08x)\n",
+                            ghost, objs[i]);
+                }
+            }
+        }
+        /* the completed head + the wait-result cache */
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
+                                  &entries[n - 1], 4);
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1fc,
+                                  &(uint32_t){ 0x1000 }, 4);
+        /* the S199 verdict re-arm — [sp+0x10] := 2 when 0 */
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            uint32_t pa_v = mmcs_l32_stack_pa(ssp + 0x10);
+            if (pa_v) {
+                uint32_t verdict = 0;
+                cpu_physical_memory_read(pa_v, &verdict, 4);
+                if (verdict == 0) {
+                    cpu_physical_memory_write(
+                        pa_v, &(uint32_t){ 2 }, 4);
+                }
+            }
+        }
+        /* THE V9 WAKE — install, THEN patch the pool (the L36
+         * order), then the slot (the L54 recipe verbatim) */
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        cpu_physical_memory_write(0x1F00E6F0,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L55: slot evt 0x320 busy (%08x) - "
+                        "retry next cadence\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L54_SLOT_PA,
+                                      &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l55_total++;
+        fprintf(stderr, "MMCS-L55: t=%" PRId64 "ms manual-reset "
+                "delivery %u/%u: walker %08x *CUR* n=%d entries",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l55_total,
+                mmcs_l55_max_deliv, tva, n);
+        for (int i = 0; i < n; i++) {
+            fprintf(stderr, " %08x->obj %08x", entries[i], objs[i]);
+        }
+        fprintf(stderr, " (the {8d,8e} stock shape + the ghost sig "
+                "+ the v9 wake; markers at %08x)\n",
+                MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no WAIT-ALL park this scan — reset the stability tracker */
+    mmcs_l55_key = 0;
+    mmcs_l55_stable = 0;
+}
+
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
  * daemon (the generic requeue fix at the vendor switcher boundary,
  * decoded 2026-11-20).
@@ -6407,6 +6952,11 @@ static void mmcs_l16_boot_parse(void)
         fprintf(stderr, "MMCS-L50: create-retry exit tape armed "
                 "(read-only, cadence %ums, max %u lines)\n",
                 mmcs_l50_cadence_ms, mmcs_l50_max_lines);
+        if (getenv("MMCS_L55DBG")) {
+            mmcs_l55dbg_armed = 1;
+            fprintf(stderr, "MMCS-L55: psi-array resolve diagnostic "
+                    "armed (read-only, rides the L50 lines)\n");
+        }
     }
     /* L36: the post-exit requeue daemon — slot idx 3 (evt 0x2A0)
      * would collide with MMCS_L16EV list entries >= 3 */
@@ -6528,6 +7078,36 @@ static void mmcs_l16_boot_parse(void)
                     "wired on first delivery; the L47 satisfy for "
                     "tva==pcur in the dead-idle world)\n",
                     mmcs_l54_cadence_ms, mmcs_l54_max_deliv,
+                    MMCS_L54_STUB_VA);
+            if (getenv("MMCS_L55EV")) {
+                fprintf(stderr, "MMCS-L54: L55EV also set — standing "
+                        "down (the L55 multi-satisfy is a superset)\n");
+                mmcs_l54_armed = 0;
+            }
+        }
+    }
+    /* L55: the WAIT-ALL chained dual-entry multi-satisfy — same slot
+     * discipline as L54 (idx 7 / evt 0x320, the v9 stub shared) */
+    if (getenv("MMCS_L55EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L55: shares slot idx 7 (evt 0x320) "
+                    "with MMCS_L16EV — drop L16EV; not arming L55\n");
+        } else {
+            mmcs_l55_cadence_ms =
+                atoi(getenv("MMCS_L55EV_MS") ? : "2000");
+            if (!mmcs_l55_cadence_ms) {
+                mmcs_l55_cadence_ms = 2000;
+            }
+            mmcs_l55_max_deliv = atoi(getenv("MMCS_L55EV_MAX") ? : "4");
+            if (!mmcs_l55_max_deliv) {
+                mmcs_l55_max_deliv = 4;
+            }
+            mmcs_l55_armed = 1;
+            fprintf(stderr, "MMCS-L55: manual-reset delivery armed "
+                    "(cadence %ums, cap %u; stub %08x slot evt 0x320 "
+                    "wired on first delivery; the {8d,8e} stock shape "
+                    "+ the ghost sig for the S203 cycling wait)\n",
+                    mmcs_l55_cadence_ms, mmcs_l55_max_deliv,
                     MMCS_L54_STUB_VA);
         }
     }
