@@ -2518,6 +2518,16 @@ static uint32_t mmcs_l53_max_deliv = 4;
 static uint32_t mmcs_l53_total;
 static uint32_t mmcs_l53_key;        /* stability key {thread,entry} */
 static uint32_t mmcs_l53_stable;     /* consecutive matching scans */
+/* L54: the stale-pCurTh re-park wake — the S202 class (the L47
+ * satisfy re-targeted at tva==pcur, gated on the dead-idle world;
+ * see mmcs_l54_scan) */
+static void mmcs_l54_scan(void);
+static int mmcs_l54_armed;
+static uint32_t mmcs_l54_cadence_ms = 2000;
+static uint32_t mmcs_l54_max_deliv = 4;
+static uint32_t mmcs_l54_total;
+static uint32_t mmcs_l54_key;        /* stability key {thread,obj} */
+static uint32_t mmcs_l54_stable;     /* consecutive matching scans */
 /* L37: the KCall-exit lost-preempt CLASS daemon (full block + decode
  * below) — the generic superset of the per-site requeue daemons */
 static void mmcs_l37_scan(void);
@@ -2556,6 +2566,7 @@ static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
 static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
 static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
+static uint64_t mmcs_tick_l54;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2942,6 +2953,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l53_armed && ++mmcs_tick_l53 >= mmcs_l53_cadence_ms) {
             mmcs_tick_l53 = 0;
             mmcs_l53_scan();
+        }
+        /* L54: the stale-pCurTh re-park wake (the S202 class — the
+         * L47 satisfy for tva==pcur through the v9 wake stub) */
+        if (mmcs_l54_armed && ++mmcs_tick_l54 >= mmcs_l54_cadence_ms) {
+            mmcs_tick_l54 = 0;
+            mmcs_l54_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -5370,6 +5387,328 @@ static void mmcs_l53_scan(void)
     mmcs_l53_stable = 0;
 }
 
+/* MMCS fork (L54): MMCS_L54EV — THE STALE-pCurTh RE-PARK WAKE (S202,
+ * decoded 2026-11-22; the S201 rung made the park fn RETURN r0=r10
+ * through 100% vendor code — then the fold pass completed and the
+ * wait fn's tail 0x9083d41c re-parked the walker at the face with
+ * pCurTh STALE == the walker: the S181 dead-idle world).
+ *
+ * THE STALL (Observed, the L53 verify tape): the walker 906cb240
+ * re-parked BLOCKED at pc=0x90837cf6 (st16=02001042, bF=02, sp=
+ * d00bf628, wobj=d00bf640, tmo=ffffffff INFINITE), f1f8=0 (drained),
+ * t1fc=00001000 (the L50b cache intact), the live kstack return at
+ * [sp+0x58]=0x908305a8 = fn_90830444's TAIL jsr 0x9083d41c (the
+ * block-until-signaled submit — the fold-pass frames already
+ * returned; the [sp+4]=0x9082ec86 residue is the earlier cycle's),
+ * pick=0/pRunnable=0, pCurTh STALE == the walker. The L47 daemon's
+ * tva != pcur exclusion can never fire; the L52 daemon wants
+ * bF==0 + the epilogue pc; the L53 signature is gone — the wake
+ * channel is starved BY the stale-pCurTh shape.
+ *
+ * THE MECHANISM (Verified disasm, the L54 Part 1 decode): the
+ * create body's wait is a WAIT-ALL (fn_90830444 flags bit 12 → the
+ * fold pass 0x90830518-0x90830546); post-S201 the fold completed
+ * and the tail's submit parked the walker — a STOCK park waiting
+ * for the interlock event the dead loader will never set. The
+ * stock wake (the event SET chain) died with the loader world.
+ *
+ * THE FIX — the L47-class satisfy RE-TARGETED at tva==pcur, gated
+ * on the dead-idle world (the L52b refinement: pick==0 OR
+ * pick==cand — someone ELSE's pick = vendor mid-flight, SKIP),
+ * delivered through THE V9 STUB = the L52 v8 recipe with the L26
+ * v7 guard class for the BLOCKED shape:
+ *   in-stub guard: (state16 & 3) == 2 (BLOCKED — MakeRun's class)
+ *   THE POISON-NEUTRALIZER PRELOAD: r8-r13 := [th+0x94..0xA8] —
+ *     the switcher's entry save lands on the walker's OWN ctx
+ *     (r14 == pCurTh == walker, stale) AND the resume-at-the-face
+ *     needs the walker's true r8 (the entry pointer) for the
+ *     [r8+12] state poll — the ctx-block preload IS the
+ *     stock-faithful frame restore for this shape (the L49 §8.2
+ *     family neutralized)
+ *   MakeRun 0x90825ee4 (the requeue) + the resched protocol
+ *   stores ([0x88679884]:=1, [0x88679888]:=1) + pick:=walker +
+ *   r14:=[0x88679894] + jsr the vendor switcher 0x90822b68 →
+ *   drains recompute pick==r14 → the 0x90822bcc resume path →
+ *   spc=[th+0xB4]=0x90837cf6 → rte → the poll → the eval (with
+ *   the plants: the REAL type-4 satisfy) → the park fn returns
+ *   0x1000 → the 0x9083d41c tail RETURNS → fn_90830444 returns →
+ *   the servant marshal → the create body proceeds →
+ *   CreateProcessW RETURNS to c00ce888.
+ * The plants are the L47 chain verbatim (the true base, the type
+ * byte, the dual 0x1000 result cells, the verdict re-arm, the sig
+ * SET). The co-delivery hazard stays covered by the L49 guard
+ * (the L26 scan skips the LINKED create-interlock class whenever
+ * MMCS_L47FIX is armed — the standing combo always co-arms).
+ *
+ * Host filter: the L47 discriminators (arena, BLOCKED(2), the face
+ * pc, the wobj resolution through the walker's OWN pTh-matched
+ * wait-array entry, sig==0 consumed, wlh!=0 LINKED, the is_cpw
+ * witness, the [th+0x150] filesys witness) MINUS the tva!=pcur
+ * exclusion PLUS tva == pCurTh (THE discriminator — the inverse of
+ * L47) + the dead-idle world gate + 2-cadence stability keyed
+ * {thread,obj} (the L46 discipline). Repeating, delivery-capped
+ * (default 4), SELF-TERMINATING (the shape dies when the wait
+ * completes or the world moves).
+ *
+ * Stub v9 at KILLSTK 0xBF00E600 (block idx 6 — free while
+ * MMCS_L16EV is off), dispatch slot evt 0x320 (PA 0x0867A064,
+ * ents[7] — evt 0x300 is reserved for the L18 self-registered
+ * ISR). Env MMCS_L54EV (default OFF; MMCS_L54EV_MS cadence default
+ * 2000; MMCS_L54EV_MAX cap default 4). Needs MMCS_TICK. */
+static uint8_t mmcs_l54_stub[] = {
+    /* prologue + the state guard (state16&3 == 2, the BLOCKED family) */
+    0x22, 0x4f, 0xe6, 0x2f, 0x20, 0xd4, 0x43, 0x50,  /* +0x00 */
+    0x03, 0xc9, 0x02, 0x88, 0x01, 0x89, 0x34, 0xa0,
+    0x09, 0x00,
+    /* (the v8's bF==0 guard dropped — the BLOCKED waiter's bF is
+     * the waiting flag itself; nops keep the layout) */
+    0x09, 0x00, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,  /* +0x10 */
+    /* the poison-neutralizer preload: r8-r13 := [th+0x94..0xA8] */
+    0x43, 0x62, 0x64, 0x72, 0x30, 0x72,
+    0x26, 0x68, 0x26, 0x69, 0x26, 0x6a, 0x26, 0x6b,  /* +0x20 */
+    0x26, 0x6c, 0x26, 0x6d,
+    /* marker 1; MakeRun(walker) */
+    0x15, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x15, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x09, 0x00,  /* +0x30 */
+    /* marker 2; the resched protocol stores */
+    0x11, 0xd2, 0x02, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x12, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,  /* +0x40 */
+    0x11, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    /* marker 3; pick := walker; r14 := pCurTh; marker 4 */
+    0x0b, 0xd2, 0x03, 0xe1, 0x12, 0x22, 0x09, 0x00,  /* +0x50 */
+    0x0e, 0xd2, 0x42, 0x22, 0x0e, 0xd2, 0x20, 0x5e,
+    0x07, 0xd2, 0x04, 0xe1, 0x12, 0x22, 0x09, 0x00,  /* +0x60 */
+    /* the vendor switcher jsr; marker 5 (no-switch tell); epilogue */
+    0x0c, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x09, 0x00,
+    0x03, 0xd2, 0x05, 0xe1, 0x12, 0x22, 0xf6, 0x6e,  /* +0x70 */
+    0x26, 0x4f, 0x00, 0xe0, 0x0b, 0x00, 0x09, 0x00,
+    /* pool (patched at delivery: .Lm +0x84, .Lcand +0x88) */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* +0x80 */
+    0xe4, 0x5e, 0x82, 0x90,   /* +0x8c .Lmk: 0x90825ee4 MakeRun */
+    0x84, 0x98, 0x67, 0x88,   /* +0x90 .Lf: 0x88679884 resched flag */
+    0x88, 0x98, 0x67, 0x88,   /* +0x94 .Lf2: 0x88679888 drain2 word */
+    0xa4, 0xef, 0x67, 0x88,   /* +0x98 .Lpick: 0x8867efa4 */
+    0x94, 0x98, 0x67, 0x88,   /* +0x9c .Lpcur: 0x88679894 */
+    0x68, 0x2b, 0x82, 0x90,   /* +0xa0 .Lsw: 0x90822b68 the switcher */
+};
+#define MMCS_L54_STUB_VA   0xBF00E600
+#define MMCS_L54_SLOT_PA   0x0867A064   /* evt 0x320, idx 7 */
+
+static void mmcs_l54_scan(void)
+{
+    if (!mmcs_l54_armed || mmcs_l54_total >= mmcs_l54_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    /* THE DEAD-IDLE WORLD GATE (the L52b refinement): pick==0 OR
+     * pick==cand (the keep-current bookkeeping); someone ELSE's
+     * pick = vendor mid-flight — SKIP */
+    if (prun != 0 || (pick != 0 && pick != pcur)) {
+        return;
+    }
+    for (uint32_t o = 0; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj, wret;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        memcpy(&wret, arena + o + 0x150, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || wret < 0xC0000000 || wret >= 0xC1000000
+            || tva != pcur) {           /* THE discriminator — the
+                                          * INVERSE of the L47 scan */
+            continue;
+        }
+        /* resolve the waited object through the walker's own
+         * wait-array entry (the L32EV/L47 resolver) */
+        uint32_t obj = 0, wi_found = 0;
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 != tva) {
+                continue;
+            }
+            uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+            if (pa2) {
+                cpu_physical_memory_read(pa2, &obj, 4);
+            }
+            wi_found = wi;
+            break;
+        }
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* not an arena kernel object */
+        }
+        uint8_t sig54 = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sig54, 1);
+        if (sig54 & 1) {
+            continue;               /* signaled — vendor world moving */
+        }
+        uint32_t wlh = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 8, &wlh, 4);
+        if (wlh == 0) {
+            continue;               /* unlinked = L32EV's class */
+        }
+        /* the create-body kstack witness (is_cpw — the L46 window) */
+        uint32_t ssp = 0, is_cpw = 0;
+        cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &ssp, 4);
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* the eval's entry base derived dynamically (the L47
+         * frame-wobble discipline: entry = wobj + wi - 8, VERIFIED
+         * against the resolved object before planting) */
+        if (!wi_found || wi_found < 8) {
+            continue;               /* resolver lost the entry — skip */
+        }
+        uint32_t entry54 = wobj + wi_found - 8;
+        uint32_t pa_e = mmcs_l32_stack_pa(entry54 + 0x14);
+        uint32_t objchk = 0;
+        if (pa_e) {
+            cpu_physical_memory_read(pa_e, &objchk, 4);
+        }
+        if (!pa_e || objchk != obj) {
+            fprintf(stderr, "MMCS-L54: entry verify FAILED (entry %08x "
+                    "objchk %08x vs obj %08x) - skip\n",
+                    entry54, objchk, obj);
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,obj} (the L46/L52
+         * discipline — the shape must persist across scans) */
+        uint32_t key = tva ^ obj;
+        if (mmcs_l54_key != key) {
+            mmcs_l54_key = key;
+            mmcs_l54_stable = 1;
+            fprintf(stderr, "MMCS-L54: t=%" PRId64 "ms stale-pCurTh park "
+                    "seen: th %08x *CUR* st16=%08x pc=%08x obj %08x "
+                    "sig %02x wlh %08x (stability %u/2; pick %08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, st16,
+                    ctxpc, obj, sig54, wlh, mmcs_l54_stable, pick);
+            return;
+        }
+        if (++mmcs_l54_stable < 2) {
+            return;
+        }
+        /* DELIVER — the L47 plants, then the v9 wake */
+        /* (1) the ctx cell: the true entry base */
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
+                                  &entry54, 4);
+        /* (2) the type byte: entry+0x18's low byte carries EVNT(4) */
+        uint32_t pa_t = mmcs_l32_stack_pa(entry54 + 0x18);
+        if (pa_t) {
+            uint32_t fw = 0;
+            cpu_physical_memory_read(pa_t, &fw, 4);
+            if ((fw & 0xff) != 0x04) {
+                fw = (fw & 0xffffff00) | 0x04;
+                cpu_physical_memory_write(pa_t, &fw, 4);
+            }
+        }
+        /* (3) the result cells := 0x1000 (the satisfy tail + the
+         * wait-result cache — the S198 dual-cell write) */
+        uint32_t res54 = 0x1000;
+        uint32_t pa_r = mmcs_l32_stack_pa(entry54 + 0x20);
+        if (pa_r) {
+            uint32_t cur = 0;
+            cpu_physical_memory_read(pa_r, &cur, 4);
+            if (cur != 0x1000) {
+                cpu_physical_memory_write(pa_r, &res54, 4);
+            }
+        }
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1fc,
+                                  &res54, 4);
+        /* (3b) the S199 verdict re-arm — [sp+0x10] := 2 when 0 */
+        {
+            uint32_t vsp = 0;
+            cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &vsp, 4);
+            if (vsp >= 0xD0000000 && vsp < 0xDC000000) {
+                uint32_t pa_v = mmcs_l32_stack_pa(vsp + 0x10);
+                if (pa_v) {
+                    uint32_t verdict = 0;
+                    cpu_physical_memory_read(pa_v, &verdict, 4);
+                    if (verdict == 0) {
+                        cpu_physical_memory_write(
+                            pa_v, &(uint32_t){ 2 }, 4);
+                    }
+                }
+            }
+        }
+        /* (4) the stock SET: sig byte |= 1 */
+        sig54 |= 1;
+        cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig54, 1);
+        /* (5) THE V9 WAKE — install, THEN patch the pool (the L36
+         * order), then the slot */
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        cpu_physical_memory_write(0x1F00E6F0,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L54: slot evt 0x320 busy (%08x) - "
+                        "retry next cadence\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L54_SLOT_PA,
+                                      &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l54_total++;
+        fprintf(stderr, "MMCS-L54: t=%" PRId64 "ms stale-pCurTh wake "
+                "%u/%u: walker %08x *CUR* obj %08x entry %08x sig "
+                "00->01 (the L47 plants + the v9 wake: MakeRun + the "
+                "resched hand-off; markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l54_total,
+                mmcs_l54_max_deliv, tva, obj, entry54,
+                MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no stale-pCurTh park this scan — reset the stability tracker */
+    mmcs_l54_key = 0;
+    mmcs_l54_stable = 0;
+}
+
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
  * daemon (the generic requeue fix at the vendor switcher boundary,
  * decoded 2026-11-20).
@@ -6165,6 +6504,32 @@ static void mmcs_l16_boot_parse(void)
                 "restore armed (cadence %ums, cap %u; the cleanup-loop "
                 "self-loop [E+16]:=0 class — no stub, no slot)\n",
                 mmcs_l53_cadence_ms, mmcs_l53_max_deliv);
+    }
+    /* L54: the stale-pCurTh re-park wake — slot idx 7 (evt 0x320)
+     * would collide with MMCS_L16EV list entries >= 4 (evt 0x300 is
+     * reserved for the L18 self-registered ISR) */
+    if (getenv("MMCS_L54EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L54: shares slot idx 7 (evt 0x320) "
+                    "with MMCS_L16EV — drop L16EV; not arming L54\n");
+        } else {
+            mmcs_l54_cadence_ms =
+                atoi(getenv("MMCS_L54EV_MS") ? : "2000");
+            if (!mmcs_l54_cadence_ms) {
+                mmcs_l54_cadence_ms = 2000;
+            }
+            mmcs_l54_max_deliv = atoi(getenv("MMCS_L54EV_MAX") ? : "4");
+            if (!mmcs_l54_max_deliv) {
+                mmcs_l54_max_deliv = 4;
+            }
+            mmcs_l54_armed = 1;
+            fprintf(stderr, "MMCS-L54: stale-pCurTh re-park wake armed "
+                    "(cadence %ums, cap %u; stub %08x slot evt 0x320 "
+                    "wired on first delivery; the L47 satisfy for "
+                    "tva==pcur in the dead-idle world)\n",
+                    mmcs_l54_cadence_ms, mmcs_l54_max_deliv,
+                    MMCS_L54_STUB_VA);
+        }
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
