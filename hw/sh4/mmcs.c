@@ -2499,6 +2499,16 @@ static void mmcs_l36_scan(void);
 static int mmcs_l36_armed;
 static uint32_t mmcs_l36_cadence_ms = 2000;
 static uint32_t mmcs_l36_max_deliv = 16;
+/* L52: the post-completion resched hand-off daemon (the S200
+ * frontier — the pCurTh-frozen-at-epilogue class L36/L37 exclude;
+ * full block + decode below) */
+static void mmcs_l52_scan(void);
+static int mmcs_l52_armed;
+static uint32_t mmcs_l52_cadence_ms = 2000;
+static uint32_t mmcs_l52_max_deliv = 4;
+static uint32_t mmcs_l52_total;
+static uint32_t mmcs_l52_key;        /* stability key {thread,pc} */
+static uint32_t mmcs_l52_stable;     /* consecutive matching scans */
 /* L37: the KCall-exit lost-preempt CLASS daemon (full block + decode
  * below) — the generic superset of the per-site requeue daemons */
 static void mmcs_l37_scan(void);
@@ -2535,6 +2545,7 @@ static uint32_t mmcs_l50_lines;
  * restore, which breaks identical-continuation verify). */
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
 static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
+static uint64_t mmcs_tick_l52;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2909,6 +2920,11 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l37_armed && ++mmcs_tick_l37 >= mmcs_l37_cadence_ms) {
             mmcs_tick_l37 = 0;
             mmcs_l37_scan();
+        }
+        /* L52: the post-completion resched hand-off (same class) */
+        if (mmcs_l52_armed && ++mmcs_tick_l52 >= mmcs_l52_cadence_ms) {
+            mmcs_tick_l52 = 0;
+            mmcs_l52_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -4655,15 +4671,20 @@ static void mmcs_l50_dbg(void)
              * the KCall'd reaper 0x90848214 unlinks the head of
              * 0x8867e740 (arg!=0) / 0x8867e748 (arg==0)) + the
              * record-decoder table base cell [KData+0x8C] —
-             * read-only, one line each */
+             * read-only, one line each. S200: + the resched hand-off
+             * cells (pick/pRunnable/flag/drain2/pCurTh — the idle
+             * world's evidence) */
             {
                 static const struct { uint32_t va; const char *tag; }
                 exreg[] = {
                     { 0x8867e740, "wl1" },
                     { 0x8867e748, "wl2" },
                     { 0x8867988c, "t8c" },
+                    { 0x8867efa0, "rq" },
+                    { 0x88679884, "rs" },
+                    { 0x88679894, "pc2" },
                 };
-                for (unsigned k = 0; k < 3; k++) {
+                for (unsigned k = 0; k < 6; k++) {
                     uint32_t buf[2];
                     cpu_physical_memory_read(
                         exreg[k].va - 0x80000000, buf, sizeof buf);
@@ -4904,6 +4925,228 @@ static void mmcs_l36_scan(void)
             "delivery %u/%u)\n",
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), cand, cand_st,
             cand_pc, cand_sp, graves, mmcs_l36_total, mmcs_l36_max_deliv);
+}
+
+/* MMCS fork (L52): MMCS_L52EV — the POST-COMPLETION RESCHED HAND-OFF
+ * (the S200 frontier, decoded 2026-11-22; the L51 verdict re-arm made
+ * the create-interlock COMPLETE through 100% vendor code and moved
+ * the stall one tower-level up).
+ *
+ * THE STALL (Observed, the L51 tape): the walker 906cb240 frozen
+ * RUNNABLE-at-return at pc=0x90837ae8 — the EPILOGUE of the
+ * wait-completion dispatcher 0x90837ab0 (the entry TYPE byte's
+ * dispatch to the KCall'd helpers 0x90827930/0x90827964 through the
+ * KCall dispatcher 0x908230e6) — st16=00001040 (low2=0 RUNNING,
+ * bF=00), wobj=0, *CUR*, pc constant t=18259..76852. The launch-loop
+ * TBs c00ce888/c00be89a already on the walker's outer frames.
+ *
+ * THE MECHANISM (Verified disasm): the KCall dispatcher's SR-masked
+ * return tail checks BYTE [0x88679884]==1 then WORD [0x88679888]==1 —
+ * either set → the resched path 0x9082312c saves the walker's resume
+ * point ([th+0xB4]:=pr=0x90837ae8, [th+0xB8]:=SSR, [th+0xB0]:=sp)
+ * and bra's the vendor switcher 0x90822b68 with r14=pCurTh. The
+ * switcher saved the live r8-r13 into [th+0x94..0xA8], drained, and
+ * took the pick==0 IDLE path (0x90822c3c) — the walker was never
+ * re-queued (the dead-loader world's lost preempt: state16 low2 stays
+ * 0, the pRunnable bands empty), so no drain ever recomputes pick to
+ * it; the CPU spins in the OAL idle loop with pCurTh STALE == walker.
+ * The L36EV/L37EV daemons EXCLUDE pCurTh; L26EV/L47 target BLOCKED
+ * shapes — nothing matches.
+ *
+ * THE FIX — the L18EV-v4/v5 resched hand-off recipe (the decision
+ * table action A), re-targeted at the pCurTh-frozen shape, delivered
+ * through 100% vendor code:
+ *   MakeRun(0x90825ee4)(walker) — PURE requeue (this session's full
+ *     decode: susp-byte guard [th+0xE], state16:=(state16&~3)|1, the
+ *     pRunnable-bands insert at 0x8867efa0, saves/restores r8/r9,
+ *     PLAIN rts — no internal resched tail)
+ *   [0x88679884]:=1 (the switcher-entry flag word)
+ *   [0x88679888]:=1 (the drain2 pick recompute)
+ *   pick [0x8867efa4]:=walker; r14:=[0x88679894] (== walker here)
+ *   jsr the vendor switcher 0x90822b68 — drains, pick==r14 → the
+ *   0x90822bcc resume path: spc=[th+0xB4], sp=[th+0xB0],
+ *   ssr=[th+0xB8] → rte → the walker executes the epilogue (add #16,
+ *   lds pr=[sp+0x10]=0x90837d40, rts, r8 from [sp+0x14]) → the
+ *   park-loop fn → CreateProcessW RETURNS to c00ce888 → the launch
+ *   loop iterates.
+ *
+ * THE S200-SPECIFIC HAZARD — THE POISON-NEUTRALIZER (the L49 §8.2
+ * register-poison family, now landing on the PRIZE thread): the
+ * switcher entry saves the DELIVERY context's live r8-r13 into
+ * [r14+0x94..0xA8] — and r14 == pCurTh == the WALKER (stale). In the
+ * L36/L37 world that save lands on the interrupted thread's own ctx;
+ * here it would OVERWRITE the walker's real saved r8-r13. r9-r13 are
+ * callee-saved and flow through 0x90837ab0 (its prologue saves only
+ * r8) — poisoning them corrupts the park-loop fn's live values. THE
+ * FIX: the v8 stub PRE-LOADS r8-r13 from the walker's own ctx block
+ * BEFORE the hand-off chain — the switcher's save then writes back
+ * the SAME values (identity). The tick int entry pushes its frame on
+ * the STACK, not into the TCB ctx (tape-proven: the walker ctx cells
+ * stay constant across 1ms ticks for 58 s), so the block holds the
+ * walker's real r8-r13 at delivery time.
+ *
+ * The v8 guard (in-stub): state16&3 == 0 AND the bF byte [th+0xF]
+ * == 0. Markers 1..4 at stub+0xF0 (1 guard passed, 2 MakeRun done,
+ * 3 protocol stores done, 4 pre-switcher); marker 5 only if the
+ * switcher RETURNS (= no switch — the no-progress tell).
+ *
+ * The daemon scan (host-side, the L47 discipline): arena thread +
+ * tva == pCurTh (THE discriminator — the inverse of L36/L37) +
+ * (st16&3)==0 + bF==0 + ctx pc == 0x90837ae8 (the frozen epilogue)
+ * + the is_cpw create-body witness + 2-cadence stability keyed
+ * {thread,pc} + the world gate pick==0 && pRunnable==0. Repeating,
+ * delivery-capped, SELF-TERMINATING (once the walker leaves the
+ * epilogue the discriminator stops matching).
+ *
+ * Stub at KILLSTK 0xBF00E400 (the L16 stub-base block idx 4 — free
+ * while MMCS_L16EV is off), dispatch slot evt 0x2E0 (PA 0x0867A05C,
+ * ents[5]). Env MMCS_L52EV (default OFF; MMCS_L52EV_MS cadence
+ * default 2000; MMCS_L52EV_MAX cap default 4). Needs MMCS_KILLSTK +
+ * MMCS_TICK. */
+static uint8_t mmcs_l52_stub[] = {
+    /* prologue + the state guard (state16&3 == 0, the RUNNING family) */
+    0x22, 0x4f, 0xe6, 0x2f, 0x20, 0xd4, 0x43, 0x50,  /* +0x00 */
+    0x03, 0xc9, 0x00, 0x88, 0x01, 0x89, 0x34, 0xa0,
+    0x09, 0x00,
+    /* the bF byte guard ([th+0xF] == 0 — the wait is done) */
+    0x4f, 0x84, 0x0c, 0x60, 0x00, 0x88, 0x2f, 0x8b,  /* +0x10 */
+    /* the poison-neutralizer preload: r8-r13 := [th+0x94..0xA8] */
+    0x43, 0x62, 0x64, 0x72, 0x30, 0x72,
+    0x26, 0x68, 0x26, 0x69, 0x26, 0x6a, 0x26, 0x6b,  /* +0x20 */
+    0x26, 0x6c, 0x26, 0x6d,
+    /* marker 1; MakeRun(walker) */
+    0x15, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x15, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x09, 0x00,  /* +0x30 */
+    /* marker 2; the resched protocol stores */
+    0x11, 0xd2, 0x02, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x12, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,  /* +0x40 */
+    0x11, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    /* marker 3; pick := walker; r14 := pCurTh; marker 4 */
+    0x0b, 0xd2, 0x03, 0xe1, 0x12, 0x22, 0x09, 0x00,  /* +0x50 */
+    0x0e, 0xd2, 0x42, 0x22, 0x0e, 0xd2, 0x20, 0x5e,
+    0x07, 0xd2, 0x04, 0xe1, 0x12, 0x22, 0x09, 0x00,  /* +0x60 */
+    /* the vendor switcher jsr; marker 5 (no-switch tell); epilogue */
+    0x0c, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x09, 0x00,
+    0x03, 0xd2, 0x05, 0xe1, 0x12, 0x22, 0xf6, 0x6e,  /* +0x70 */
+    0x26, 0x4f, 0x00, 0xe0, 0x0b, 0x00, 0x09, 0x00,
+    /* pool (patched at delivery: .Lm +0x84, .Lcand +0x88) */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* +0x80 */
+    0xe4, 0x5e, 0x82, 0x90,   /* +0x8c .Lmk: 0x90825ee4 MakeRun */
+    0x84, 0x98, 0x67, 0x88,   /* +0x90 .Lf: 0x88679884 resched flag */
+    0x88, 0x98, 0x67, 0x88,   /* +0x94 .Lf2: 0x88679888 drain2 word */
+    0xa4, 0xef, 0x67, 0x88,   /* +0x98 .Lpick: 0x8867efa4 */
+    0x94, 0x98, 0x67, 0x88,   /* +0x9c .Lpcur: 0x88679894 */
+    0x68, 0x2b, 0x82, 0x90,   /* +0xa0 .Lsw: 0x90822b68 the switcher */
+};
+#define MMCS_L52_STUB_VA   0xBF00E400
+#define MMCS_L52_SLOT_PA   0x0867A05C   /* evt 0x2E0, idx 5 */
+#define MMCS_L52_EPILOGUE_PC 0x90837AE8 /* the frozen dispatcher epilogue */
+
+static void mmcs_l52_scan(void)
+{
+    if (!mmcs_l52_armed || mmcs_l52_total >= mmcs_l52_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    for (uint32_t o = 0; o + 0x210 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, ctxsp;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&ctxsp, arena + o + 0xb0, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || tva != pcur                     /* THE discriminator */
+            || (st16 & 3) != 0                 /* RUNNING/lost-preempt */
+            || (st16 >> 24) != 0               /* bF cleared */
+            || ctxpc != MMCS_L52_EPILOGUE_PC   /* frozen at the epilogue */
+            || pick != 0 || prun != 0) {       /* the idle world gate */
+            continue;
+        }
+        /* the create-body kstack witness (is_cpw — the L46 window) */
+        uint32_t ssp = ctxsp;
+        int is_cpw = 0;
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,pc} (the L46 discipline) */
+        uint32_t key = tva ^ ctxpc;
+        if (mmcs_l52_key != key) {
+            mmcs_l52_key = key;
+            mmcs_l52_stable = 1;
+            fprintf(stderr, "MMCS-L52: t=%" PRId64 "ms frozen shape "
+                    "seen: th %08x *CUR* st16=%08x pc=%08x sp=%08x "
+                    "(stability %u/2)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, st16,
+                    ctxpc, ctxsp, mmcs_l52_stable);
+            return;
+        }
+        if (++mmcs_l52_stable < 2) {
+            return;
+        }
+        /* DELIVER — install, THEN patch the pool (the L36 order) */
+        cpu_physical_memory_write(0x1F00E400, mmcs_l52_stub,
+                                  sizeof mmcs_l52_stub);
+        cpu_physical_memory_write(0x1F00E400 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E400 + 0x84,
+                                  &(uint32_t){ MMCS_L52_STUB_VA + 0xf0 },
+                                  4);
+        cpu_physical_memory_write(0x1F00E4F0,
+                                  &(uint32_t){ MMCS_L52_STUB_VA + 0xf0 },
+                                  4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L52_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L52_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L52: slot evt 0x2e0 busy (%08x) - "
+                        "scan skipped\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L52_SLOT_PA,
+                                      &(uint32_t){ MMCS_L52_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[5];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L52_STUB_VA;
+        e->evt_code = 0x2E0;
+        e->slot_pa = MMCS_L52_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l52_total++;
+        fprintf(stderr, "MMCS-L52: t=%" PRId64 "ms resched hand-off "
+                "%u/%u: walker %08x *CUR* st16=%08x (MakeRun + stores + "
+                "pick + the vendor switcher; markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l52_total,
+                mmcs_l52_max_deliv, tva, st16,
+                MMCS_L52_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no frozen shape this scan — reset the stability tracker */
+    mmcs_l52_key = 0;
+    mmcs_l52_stable = 0;
 }
 
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
@@ -5657,6 +5900,31 @@ static void mmcs_l16_boot_parse(void)
                         "armed (the 0x9083b682 class resumes at its own "
                         "wait-return site 0x9083e24e)\n");
             }
+        }
+    }
+    /* L52: the post-completion resched hand-off — slot idx 5
+     * (evt 0x2E0) would collide with MMCS_L16EV list entries >= 5 */
+    if (getenv("MMCS_L52EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L52: shares slot idx 5 (evt 0x2e0) "
+                    "with MMCS_L16EV — drop L16EV; not arming L52\n");
+        } else {
+            mmcs_l52_cadence_ms =
+                atoi(getenv("MMCS_L52EV_MS") ? : "2000");
+            if (!mmcs_l52_cadence_ms) {
+                mmcs_l52_cadence_ms = 2000;
+            }
+            mmcs_l52_max_deliv = atoi(getenv("MMCS_L52EV_MAX") ? : "4");
+            if (!mmcs_l52_max_deliv) {
+                mmcs_l52_max_deliv = 4;
+            }
+            mmcs_l52_armed = 1;
+            fprintf(stderr, "MMCS-L52: post-completion resched hand-off "
+                    "armed (cadence %ums, cap %u; stub %08x slot evt "
+                    "0x2e0 wired on first delivery; the pCurTh-frozen-"
+                    "at-epilogue class)\n",
+                    mmcs_l52_cadence_ms, mmcs_l52_max_deliv,
+                    MMCS_L52_STUB_VA);
         }
     }
     if (getenv("MMCS_L42KILL")) {
