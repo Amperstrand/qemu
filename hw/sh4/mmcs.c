@@ -4454,6 +4454,35 @@ static void mmcs_l47_scan(void)
         }
         cpu_physical_memory_write(tva - 0x80000000 + 0x1fc,
                                   &res47, 4);
+        /* (3b) THE S199 VERDICT RE-ARM — the extractor/fold decode
+         * (L51): the walker parks at the face INSIDE the postwait
+         * helper's extractor call (the fold's own jsr return
+         * 0x9082ec86 sits at [sp+4]); the re-submitted wait's
+         * no-entry eval re-block ZEROED the park loop's verdict cell
+         * [sp+0x10], so at wake the loop exits without any eval and
+         * returns the stub-forged r0=0 — the 0x1000 dies between the
+         * fn's return and the fold. The stock submit ARMS the verdict
+         * (=2); the stock wake keeps it armed until an eval runs.
+         * Restore the stock word: at wake the vendor loop re-KCalls
+         * its own eval inline (with the plants above: the type-4
+         * satisfy — sig consumed, bF:=0, *verdict:=0 — returning
+         * [entry+0x20]=0x1000 as a REAL r0). Idempotent: only when
+         * the cell reads 0 (no stacking, no mid-cycle overwrite). */
+        {
+            uint32_t vsp = 0;
+            cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &vsp, 4);
+            if (vsp >= 0xD0000000 && vsp < 0xDC000000) {
+                uint32_t pa_v = mmcs_l32_stack_pa(vsp + 0x10);
+                if (pa_v) {
+                    uint32_t verdict = 0;
+                    cpu_physical_memory_read(pa_v, &verdict, 4);
+                    if (verdict == 0) {
+                        cpu_physical_memory_write(
+                            pa_v, &(uint32_t){ 2 }, 4);
+                    }
+                }
+            }
+        }
         /* (4) the stock SET: sig byte |= 1 */
         sig47 |= 1;
         cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig47, 1);
@@ -4604,12 +4633,15 @@ static void mmcs_l50_dbg(void)
                         wi_found + 8, flags);
             }
         }
-        /* the kstack witness words [sp, sp+0x100) — the frame chain
-         * (the 9082ec86-class returns name the layer; the body/wait
-         * frames carry the psi-array ptr) */
+        /* the kstack witness words — WIDENED (S199): [sp-0x40,
+         * sp+0x180) — the S198 window [sp,sp+0x100) cut off the
+         * outermost frames (the launch-loop TBs c00ce888/c00be89a
+         * sit at sp+0xe0) and the deeper KCall residue; the
+         * extractor/fold frames (the fold's jsr return 0x9082ec86
+         * at [sp+4], the verdict [sp+0x10]) stay in-frame */
         if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
             fprintf(stderr, " kstack:");
-            for (uint32_t sa = ssp; sa < ssp + 0x100; sa += 4) {
+            for (uint32_t sa = ssp - 0x40; sa < ssp + 0x180; sa += 4) {
                 uint32_t pa3 = mmcs_l32_stack_pa(sa);
                 uint32_t w3 = 0;
                 if (!pa3) {
@@ -4618,6 +4650,26 @@ static void mmcs_l50_dbg(void)
                     cpu_physical_memory_read(pa3, &w3, 4);
                 }
                 fprintf(stderr, " %08x", w3);
+            }
+            /* the extractor's global waiter lists (the S199 decode:
+             * the KCall'd reaper 0x90848214 unlinks the head of
+             * 0x8867e740 (arg!=0) / 0x8867e748 (arg==0)) + the
+             * record-decoder table base cell [KData+0x8C] —
+             * read-only, one line each */
+            {
+                static const struct { uint32_t va; const char *tag; }
+                exreg[] = {
+                    { 0x8867e740, "wl1" },
+                    { 0x8867e748, "wl2" },
+                    { 0x8867988c, "t8c" },
+                };
+                for (unsigned k = 0; k < 3; k++) {
+                    uint32_t buf[2];
+                    cpu_physical_memory_read(
+                        exreg[k].va - 0x80000000, buf, sizeof buf);
+                    fprintf(stderr, " %s: %08x %08x", exreg[k].tag,
+                            buf[0], buf[1]);
+                }
             }
         }
         /* the psi-side wait-array cells (the create body's r8+8 array:
