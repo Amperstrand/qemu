@@ -2521,13 +2521,20 @@ static uint32_t mmcs_l47_armed;
 static uint32_t mmcs_l47_cadence_ms = 2000;
 static uint32_t mmcs_l47_max_deliv = 8;
 static uint32_t mmcs_l47_total;
+/* L50: the create-retry exit tape (READ-ONLY diagnostic; see
+ * mmcs_l50_dbg) */
+static void mmcs_l50_dbg(void);
+static uint32_t mmcs_l50_armed;
+static uint32_t mmcs_l50_cadence_ms = 250;
+static uint32_t mmcs_l50_max_lines = 600;
+static uint32_t mmcs_l50_lines;
 
 /* savestate lane: the tick-chain cadence counters were function-local
  * statics — hoisted so the snapshot can stream them (losing them
  * shifts every daemon scan phase by up to one cadence period after a
  * restore, which breaks identical-continuation verify). */
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
-static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47;
+static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2886,6 +2893,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l47_armed && ++mmcs_tick_l47 >= mmcs_l47_cadence_ms) {
             mmcs_tick_l47 = 0;
             mmcs_l47_scan();
+        }
+        /* L50: the create-retry exit tape (READ-ONLY; rides the tick
+         * chain like the scans but never writes guest memory) */
+        if (mmcs_l50_armed && ++mmcs_tick_l50 >= mmcs_l50_cadence_ms) {
+            mmcs_tick_l50 = 0;
+            mmcs_l50_dbg();
         }
         /* L36: the post-exit requeue daemon (same class) */
         if (mmcs_l36_armed && ++mmcs_tick_l36 >= mmcs_l36_cadence_ms) {
@@ -4418,16 +4431,29 @@ static void mmcs_l47_scan(void)
                 cpu_physical_memory_write(pa_t, &fw, 4);
             }
         }
-        /* (3) the result cell entry+0x20 := 0 (WAIT_OBJECT_0+0) */
+        /* (3) the result cells := 0x1000 — WAIT_OBJECT_0 in the
+         * kernel's packed result form (bit 12 = the completion
+         * weight, bits 10-11 = the index; the 0x9082eca4 leaf adds
+         * the same 0x1000 per satisfied entry). TWO cells carry it:
+         * [entry+0x20] (the satisfy tail's return — eval#1) AND
+         * [pTh+0x1FC] (the wait-result CACHE — the bF==0 early-out's
+         * return, eval#2 — the park-loop fn returns the LAST eval's
+         * r10, and the loop re-arms once after a satisfy, so the
+         * cache is the value that actually flows up the tower). The
+         * stock wake chain writes the cache; the dead-loader world
+         * never does — the zero result keeps the entry word pending
+         * and the postwait gate re-waits forever (the S198 decode). */
+        uint32_t res47 = 0x1000;
         uint32_t pa_r = mmcs_l32_stack_pa(entry47 + 0x20);
-        uint32_t zero47 = 0;
         if (pa_r) {
-            cpu_physical_memory_read(pa_r, &zero47, 4);
-            if (zero47 != 0) {
-                zero47 = 0;
-                cpu_physical_memory_write(pa_r, &zero47, 4);
+            uint32_t cur = 0;
+            cpu_physical_memory_read(pa_r, &cur, 4);
+            if (cur != 0x1000) {
+                cpu_physical_memory_write(pa_r, &res47, 4);
             }
         }
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1fc,
+                                  &res47, 4);
         /* (4) the stock SET: sig byte |= 1 */
         sig47 |= 1;
         cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig47, 1);
@@ -4460,10 +4486,162 @@ static void mmcs_l47_scan(void)
         mmcs_l47_total++;
         fprintf(stderr, "MMCS-L47: t=%" PRId64 "ms true-base ctx repair "
                 "%u/%u: walker %08x wobj %08x entry %08x obj %08x sig "
-                "00->01 (type byte forced 4, result cell 0)\n",
+                "00->01 (type 4, result cells 1000: entry+0x20 + "
+                "th+0x1FC cache)\n",
                 qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l47_total,
                 mmcs_l47_max_deliv, tva, wobj, entry47, obj);
         return;                     /* one delivery per cadence */
+    }
+}
+
+/* MMCS fork (L50): MMCS_L50DBG — the create-retry exit tape.
+ *
+ * S198: after the L47 delivery completes the interlock state (sig
+ * consumed, bF cleared, the park loop exits), the create body
+ * RE-PARKS instead of returning. The completion chain (this
+ * session's decode): park loop 0x90837ce2 (verdict cell [sp+0x10],
+ * re-arm back-edge 0x90837d22 bf while NON-zero) -> eval 0x90828244
+ * (the satisfy never writes *result; only the bF==0 EARLY-OUT does,
+ * returning the [pTh+0x1FC] wait-result cache) -> 0x90848330 ->
+ * postwait helper 0x9082ec44 (0x1000 gate at 0x9082ec5e; the fold
+ * *state = [ws+0]|waitret at 0x9082ec88) -> walk 0x9082e7a0 ->
+ * submit 0x90830444 -> the outer face loop. This knob DUMPS the
+ * walker's cells every cadence (READ-ONLY — no writes, no wakes):
+ * the ctx cells, the wait chain (wobj/sig/flags), the [pTh+0x1FC]
+ * cache and the kstack witness words — the frames tell which layer
+ * holds the re-park. Default OFF; the default-off world is
+ * byte-identical (no guest writes at all). */
+static void mmcs_l50_dbg(void)
+{
+    if (!mmcs_l50_armed || mmcs_l50_lines >= mmcs_l50_max_lines) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    for (uint32_t o = 0; o + 0x210 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, ctxsp, wobj;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&ctxsp, arena + o + 0xb0, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000) {
+            continue;
+        }
+        /* the create-body kstack witness (the L46 window) — the tape's
+         * target discriminator, ANY state (parked or mid-cycle) */
+        uint32_t ssp = ctxsp;
+        int is_cpw = 0;
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        uint8_t bF = (st16 >> 24) & 0xff;   /* +0xF waiting flag */
+        uint32_t f1f8 = 0, t1fc = 0, t200 = 0;
+        memcpy(&f1f8, arena + o + 0x1f8, 4);
+        memcpy(&t1fc, arena + o + 0x1fc, 4);
+        memcpy(&t200, arena + o + 0x200, 4);
+        fprintf(stderr,
+                "MMCS-L50: t=%" PRId64 "ms th %08x%s st16=%08x bF=%02x "
+                "pc=%08x sp=%08x wobj=%08x f1f8=%08x t1fc=%08x t200=%08x",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                tva == pcur ? " *CUR*" : "", st16, bF, ctxpc, ctxsp, wobj,
+                f1f8, t1fc, t200);
+        /* the waited object chain (sig / flags word / waiter-list) */
+        if (wobj >= 0xD0000000 && wobj < 0xDC000000) {
+            uint32_t obj = 0, wi_found = 0;
+            for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+                uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+                uint32_t w1 = 0;
+                if (!pa1) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa1, &w1, 4);
+                if (w1 != tva) {
+                    continue;
+                }
+                uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+                if (pa2) {
+                    cpu_physical_memory_read(pa2, &obj, 4);
+                }
+                wi_found = wi;
+                break;
+            }
+            if (wi_found && obj >= 0x90680000 && obj < 0x90780000) {
+                uint8_t sig = 0, mark = 0;
+                uint32_t wlh = 0, flags = 0;
+                cpu_physical_memory_read(obj - 0x80000000 + 0x8d,
+                                         &sig, 1);
+                cpu_physical_memory_read(obj - 0x80000000 + 0x8f,
+                                         &mark, 1);
+                cpu_physical_memory_read(obj - 0x80000000 + 8, &wlh, 4);
+                uint32_t pa_f = mmcs_l32_stack_pa(wobj + wi_found + 0x10);
+                if (pa_f) {
+                    cpu_physical_memory_read(pa_f, &flags, 4);
+                }
+                fprintf(stderr, " obj=%08x sig=%02x mark=%02x wlh=%08x "
+                        "flags(+w%x)=%08x", obj, sig, mark, wlh,
+                        wi_found + 8, flags);
+            }
+        }
+        /* the kstack witness words [sp, sp+0x100) — the frame chain
+         * (the 9082ec86-class returns name the layer; the body/wait
+         * frames carry the psi-array ptr) */
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            fprintf(stderr, " kstack:");
+            for (uint32_t sa = ssp; sa < ssp + 0x100; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    w3 = 0xdeadbeef;
+                } else {
+                    cpu_physical_memory_read(pa3, &w3, 4);
+                }
+                fprintf(stderr, " %08x", w3);
+            }
+        }
+        /* the psi-side wait-array cells (the create body's r8+8 array:
+         * the packed {handle<<16 | status} entry words — S198's gate
+         * target; diagnostic dump of the two known psi neighborhoods) */
+        {
+            static const struct { uint32_t va; const char *tag; }
+            psireg[] = {
+                { 0x9069ad80, "psi-walker" },
+                { 0x90690950, "psi-storm" },
+            };
+            for (unsigned k = 0; k < 2; k++) {
+                uint32_t buf[8];
+                cpu_physical_memory_read(psireg[k].va - 0x80000000,
+                                         buf, sizeof buf);
+                fprintf(stderr, " %s:", psireg[k].tag);
+                for (unsigned j = 0; j < 8; j++) {
+                    fprintf(stderr, " %08x", buf[j]);
+                }
+            }
+        }
+        fprintf(stderr, "\n");
+        mmcs_l50_lines++;
+        return;                     /* one walker per cadence */
     }
 }
 
@@ -5356,6 +5534,24 @@ static void mmcs_l16_boot_parse(void)
                     "wobj+8 + type byte 4 + result cell 0 + stock SET + "
                     "v7 wake)\n", mmcs_l47_cadence_ms, mmcs_l47_max_deliv);
         }
+    }
+    /* L50: the create-retry exit tape (READ-ONLY diagnostic — no
+     * guest writes; safe to combine with everything) */
+    if (getenv("MMCS_L50DBG")) {
+        mmcs_l50_cadence_ms =
+            atoi(getenv("MMCS_L50DBG_MS") ? : "250");
+        if (!mmcs_l50_cadence_ms) {
+            mmcs_l50_cadence_ms = 250;
+        }
+        mmcs_l50_max_lines =
+            atoi(getenv("MMCS_L50DBG_MAX") ? : "600");
+        if (!mmcs_l50_max_lines) {
+            mmcs_l50_max_lines = 600;
+        }
+        mmcs_l50_armed = 1;
+        fprintf(stderr, "MMCS-L50: create-retry exit tape armed "
+                "(read-only, cadence %ums, max %u lines)\n",
+                mmcs_l50_cadence_ms, mmcs_l50_max_lines);
     }
     /* L36: the post-exit requeue daemon — slot idx 3 (evt 0x2A0)
      * would collide with MMCS_L16EV list entries >= 3 */
