@@ -2571,6 +2571,7 @@ static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
+static uint64_t mmcs_tick_l56;
 /* L55: the WAIT-ALL chained dual-entry multi-satisfy (S203; the scan
  * body + the delivery state live down at the L54 cluster — forward
  * declarations for the tick chain) */
@@ -2581,6 +2582,64 @@ static uint32_t mmcs_l55_max_deliv;
 static uint32_t mmcs_l55_total;
 static uint32_t mmcs_l55_key;
 static uint32_t mmcs_l55_stable;
+/* MMCS fork (L56): MMCS_L56EV — the post-return sticky-orphan
+ * pulse (the S205 class — the sibling waiter's own completion).
+ *
+ * THE WORLD (the L55 landing): the wait machinery completes
+ * end-to-end; the launcher thread (the spinner) runs the create-
+ * wait's coredll completion loop (c00bb414: while (counter <
+ * limit) WaitForMultipleObjects(1,&h,FALSE,INFINITE)) with the
+ * L55 standing shape ([obj+0x8D]=1 AND [obj+0x8E]=1) making every
+ * wait return INSTANT — 283K KCall cycles/s, counter FROZEN at
+ * 1/limit 6, serial 0B. THE SIBLING-CLASS WAITERS stay BLOCKED at
+ * the face: their events are THE STICKY CLASS ([+0x8D]==0 clear,
+ * [+0x8E]==1 — EventModify's deferred-routing bit, the eval's
+ * mark-arm trigger), waiters LINKED ([obj+8] != 0, the head
+ * entry's [+0x1C] == the thread), [+0x90]==0.
+ *
+ * THE STOCK MACHINERY (this session's decode): the walker
+ * fn_90827f68(obj,3) detaches the list ([obj+8]:=0), clears the
+ * sig, bumps [th+0x42] (wCount), zeros [th+0x34]/[th+0x74], marks
+ * the BLOCKED waiter RUNNABLE (st16|=3); MakeRunIfNeeded
+ * fn_908278e8 then requeues via MakeRun. The broadcast caller
+ * FUN_908433d4 pulses with type 3 ([obj+8D]:=(type==3)=1).
+ *
+ * THE DELIVERY (the composite the L40 seed experiments each
+ * advanced ONE layer of, now atomic + in a LIVE world): (1) THE
+ * UNMARK — the entry's type byte 0xff→4 (the wait-submit's own
+ * arm value; the marked path never reads the sig — L40 seed 4);
+ * (2) THE PULSE — the walker's object writes ([obj+8]:=0 detach,
+ * [obj+0x8D]|=1) + the walker's thread writes (wCount++ halfword,
+ * [th+0x34]:=0, [th+0x74]:=0, st16|=3); (3) THE RESULT PLANTS —
+ * the L54 recipe on the entry ([th+0x1F8]:=entry, entry+0x20 :=
+ * 0x1000, [th+0x1FC]:=0x1000, the verdict re-arm [sp+0x10]:=2);
+ * (4) THE V9 WAKE — the shared stub (0xBF00E600, slot evt 0x320,
+ * ents[7]; stands down while a pending L54/L55 delivery holds the
+ * channel): MakeRun + the resched protocol stores + pick + the
+ * vendor switcher — the preempt the standing-sig spin never
+ * yields. NO feeder event, NO waiter-list manufacture: every
+ * write is a vendor value the stock pulse/completion path itself
+ * writes.
+ *
+ * Gates (all readback): arena thread + BLOCKED(2) at the generic
+ * face 0x90837cf6 + bF==2 + susp [th+0xE]==0 + tmo [th+0x200]==-1
+ * + tva != pCurTh + the wobj resolver (pTh-matched entry) + THE
+ * STICKY CLASS on the object ({8D==0, 8E==1, +0x90==0, wlh!=0,
+ * [wlh+0x1C]==tva}) + the user-continuation witness [th+0x150] in
+ * the c00 window + NOT the kill grave (R14) + 2-cadence stability
+ * keyed {thread,obj} + THE LIVE-WORLD GATE (pick==0 OR pick==pcur
+ * — someone ELSE's pick = vendor mid-flight, SKIP) + cap (default
+ * 2), self-terminating (the shape dies when the wait returns).
+ * Env MMCS_L56EV (default OFF; MMCS_L56EV_MS cadence default
+ * 2000; MMCS_L56EV_MAX cap default 2). Needs MMCS_KILLSTK +
+ * MMCS_TICK. */
+static void mmcs_l56_scan(void);
+static int mmcs_l56_armed;
+static uint32_t mmcs_l56_cadence_ms;
+static uint32_t mmcs_l56_max_deliv;
+static uint32_t mmcs_l56_total;
+static uint32_t mmcs_l56_key;
+static uint32_t mmcs_l56_stable;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2980,6 +3039,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l55_armed && ++mmcs_tick_l55 >= mmcs_l55_cadence_ms) {
             mmcs_tick_l55 = 0;
             mmcs_l55_scan();
+        }
+        /* L56: the post-return sticky-orphan pulse (the S205 class
+         * — the sibling waiter's own completion) */
+        if (mmcs_l56_armed && ++mmcs_tick_l56 >= mmcs_l56_cadence_ms) {
+            mmcs_tick_l56 = 0;
+            mmcs_l56_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -6254,6 +6319,226 @@ static void mmcs_l55_scan(void)
     mmcs_l55_stable = 0;
 }
 
+static void mmcs_l56_scan(void)
+{
+    if (!mmcs_l56_armed || mmcs_l56_total >= mmcs_l56_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    /* THE LIVE-WORLD GATE (the dead-idle gate's post-return
+     * replacement): pick==0 (idle) OR pick==pcur (the keep-current
+     * bookkeeping — the spinner's steady state); someone ELSE's
+     * pick = vendor mid-flight — SKIP */
+    if (pick != 0 && pick != pcur) {
+        return;
+    }
+    for (uint32_t o = 0; o + 0x210 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, wobj, wret, tmo;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        memcpy(&wret, arena + o + 0x150, 4);
+        memcpy(&tmo, arena + o + 0x200, 4);
+        uint32_t tva = 0x90680000 + o;
+        uint8_t bf = arena[o + 0xf], susp = arena[o + 0xe];
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || (st16 & 3) != 2                 /* BLOCKED */
+            || ctxpc != 0x90837cf6              /* the generic face */
+            || bf != 2                          /* mid-wait flag */
+            || susp != 0                        /* not suspended */
+            || tmo != 0xffffffff                /* INFINITE wait */
+            || wobj < 0xD0000000 || wobj >= 0xDC000000
+            || wret < 0xC0000000 || wret >= 0xC1000000
+            || tva == pcur) {                   /* never the current */
+            continue;
+        }
+        /* resolve the waited object through the waiter's own
+         * wait-array entry (the L32EV/L47 resolver) */
+        uint32_t obj = 0, wi_found = 0;
+        for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+            uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+            uint32_t w1 = 0;
+            if (!pa1) {
+                continue;
+            }
+            cpu_physical_memory_read(pa1, &w1, 4);
+            if (w1 != tva) {
+                continue;
+            }
+            uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+            if (pa2) {
+                cpu_physical_memory_read(pa2, &obj, 4);
+            }
+            wi_found = wi;
+            break;
+        }
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* not an arena kernel object */
+        }
+        /* THE STICKY CLASS: {8D==0 clear, 8E==1 sticky, +0x90==0,
+         * LINKED waiters with the head entry owned by THIS thread} */
+        uint8_t sig56 = 0, sticky = 0, z90 = 1;
+        cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sig56, 1);
+        cpu_physical_memory_read(obj - 0x80000000 + 0x8e, &sticky, 1);
+        cpu_physical_memory_read(obj - 0x80000000 + 0x90, &z90, 1);
+        if ((sig56 & 1) || sticky != 1 || z90 != 0) {
+            continue;               /* not the sticky orphan shape */
+        }
+        uint32_t wlh = 0;
+        cpu_physical_memory_read(obj - 0x80000000 + 8, &wlh, 4);
+        if (wlh < 0xD0000000 || wlh >= 0xDC000000) {
+            continue;               /* unlinked / bogus list head */
+        }
+        uint32_t pa_h = mmcs_l32_stack_pa(wlh + 0x1c);
+        uint32_t headth = 0;
+        if (pa_h) {
+            cpu_physical_memory_read(pa_h, &headth, 4);
+        }
+        if (!pa_h || headth != tva) {
+            continue;               /* the head entry is not ours */
+        }
+        /* the entry verify (the L54 discipline): the resolver's
+         * entry base must round-trip to the same object */
+        if (!wi_found || wi_found < 8) {
+            continue;
+        }
+        uint32_t entry56 = wobj + wi_found - 8;
+        uint32_t pa_e = mmcs_l32_stack_pa(entry56 + 0x14);
+        uint32_t objchk = 0;
+        if (pa_e) {
+            cpu_physical_memory_read(pa_e, &objchk, 4);
+        }
+        if (!pa_e || objchk != obj) {
+            fprintf(stderr, "MMCS-L56: entry verify FAILED (entry %08x "
+                    "objchk %08x vs obj %08x) - skip\n",
+                    entry56, objchk, obj);
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,obj} */
+        uint32_t key = tva ^ obj;
+        if (mmcs_l56_key != key) {
+            mmcs_l56_key = key;
+            mmcs_l56_stable = 1;
+            fprintf(stderr, "MMCS-L56: t=%" PRId64 "ms sticky-orphan park "
+                    "seen: th %08x st16=%08x pc=%08x obj %08x sig %02x "
+                    "8e %02x wlh %08x wret %08x (stability %u/2; pick "
+                    "%08x pcur %08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, st16,
+                    ctxpc, obj, sig56, sticky, wlh, wret,
+                    mmcs_l56_stable, pick, pcur);
+            return;
+        }
+        if (++mmcs_l56_stable < 2) {
+            return;
+        }
+        /* channel guard: the v9 stub/slot is shared with L54/L55 */
+        if (mmcs_l16_ents[7].pending) {
+            return;                 /* a wake mid-flight — retry */
+        }
+        /* DELIVER (1) THE UNMARK: the entry's type byte 0xff->4 */
+        uint32_t pa_t = mmcs_l32_stack_pa(entry56 + 0x18);
+        if (pa_t) {
+            uint32_t fw = 0;
+            cpu_physical_memory_read(pa_t, &fw, 4);
+            if ((fw & 0xff) != 0x04) {
+                fw = (fw & 0xffffff00) | 0x04;
+                cpu_physical_memory_write(pa_t, &fw, 4);
+            }
+        }
+        /* (2) THE PULSE — the walker's object writes */
+        cpu_physical_memory_write(obj - 0x80000000 + 8,
+                                  &(uint32_t){ 0 }, 4);
+        sig56 |= 1;
+        cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig56, 1);
+        /* the walker's thread writes (wCount halfword++) */
+        uint32_t pa_w = tva - 0x80000000 + 0x42;
+        uint16_t wc = 0;
+        cpu_physical_memory_read(pa_w, &wc, 2);
+        wc++;
+        cpu_physical_memory_write(pa_w, &wc, 2);
+        cpu_physical_memory_write(tva - 0x80000000 + 0x34,
+                                  &(uint32_t){ 0 }, 4);
+        cpu_physical_memory_write(tva - 0x80000000 + 0x74,
+                                  &(uint32_t){ 0 }, 4);
+        st16 |= 3;
+        cpu_physical_memory_write(tva - 0x80000000 + 0xc, &st16, 4);
+        /* (3) THE RESULT PLANTS — the L54 recipe on the entry */
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
+                                  &entry56, 4);
+        uint32_t res56 = 0x1000;
+        uint32_t pa_r = mmcs_l32_stack_pa(entry56 + 0x20);
+        if (pa_r) {
+            cpu_physical_memory_write(pa_r, &res56, 4);
+        }
+        cpu_physical_memory_write(tva - 0x80000000 + 0x1fc,
+                                  &res56, 4);
+        {
+            uint32_t vsp = 0;
+            cpu_physical_memory_read(tva - 0x80000000 + 0xb0, &vsp, 4);
+            if (vsp >= 0xD0000000 && vsp < 0xDC000000) {
+                uint32_t pa_v = mmcs_l32_stack_pa(vsp + 0x10);
+                if (pa_v) {
+                    uint32_t verdict = 0;
+                    cpu_physical_memory_read(pa_v, &verdict, 4);
+                    if (verdict == 0) {
+                        cpu_physical_memory_write(
+                            pa_v, &(uint32_t){ 2 }, 4);
+                    }
+                }
+            }
+        }
+        /* (4) THE V9 WAKE — the shared stub, re-targeted */
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        cpu_physical_memory_write(0x1F00E6F0,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L56: slot evt 0x320 busy (%08x) - "
+                        "retry next cadence\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L54_SLOT_PA,
+                                      &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l56_total++;
+        fprintf(stderr, "MMCS-L56: t=%" PRId64 "ms sticky-orphan pulse "
+                "%u/%u: th %08x obj %08x entry %08x 8e=1 (the unmark + "
+                "the walker pulse {detach,8d|=1,wCount++,t34,t74,|3} + "
+                "the L54 plants + the v9 wake; markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l56_total,
+                mmcs_l56_max_deliv, tva, obj, entry56,
+                MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no sticky-orphan park this scan — reset the stability tracker */
+    mmcs_l56_key = 0;
+    mmcs_l56_stable = 0;
+}
+
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
  * daemon (the generic requeue fix at the vendor switcher boundary,
  * decoded 2026-11-20).
@@ -7111,10 +7396,36 @@ static void mmcs_l16_boot_parse(void)
                     MMCS_L54_STUB_VA);
         }
     }
+    /* L56: the post-return sticky-orphan pulse — same slot
+     * discipline as L54/L55 (idx 7 / evt 0x320, the v9 stub
+     * shared; the channel guard keeps one delivery in flight) */
+    if (getenv("MMCS_L56EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L56: shares slot idx 7 (evt 0x320) "
+                    "with MMCS_L16EV — drop L16EV; not arming L56\n");
+        } else {
+            mmcs_l56_cadence_ms =
+                atoi(getenv("MMCS_L56EV_MS") ? : "2000");
+            if (!mmcs_l56_cadence_ms) {
+                mmcs_l56_cadence_ms = 2000;
+            }
+            mmcs_l56_max_deliv = atoi(getenv("MMCS_L56EV_MAX") ? : "2");
+            if (!mmcs_l56_max_deliv) {
+                mmcs_l56_max_deliv = 2;
+            }
+            mmcs_l56_armed = 1;
+            fprintf(stderr, "MMCS-L56: sticky-orphan pulse armed "
+                    "(cadence %ums, cap %u; stub %08x slot evt 0x320 "
+                    "wired on first delivery; the unmark + the walker "
+                    "pulse + the L54 plants + the v9 wake for the "
+                    "S205 post-return sibling)\n",
+                    mmcs_l56_cadence_ms, mmcs_l56_max_deliv,
+                    MMCS_L54_STUB_VA);
+        }
+    }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
-        if (!mmcs_l42_cadence_ms) {
-            mmcs_l42_cadence_ms = 500;
+        if (!mmcs_l42_cadence_ms) {            mmcs_l42_cadence_ms = 500;
         }
         mmcs_l42_armed = 1;
         fprintf(stderr, "MMCS-L42KILL: impossible-user-forward spin kill "
