@@ -6357,7 +6357,11 @@ static void mmcs_l56_scan(void)
             || susp != 0                        /* not suspended */
             || tmo != 0xffffffff                /* INFINITE wait */
             || wobj < 0xD0000000 || wobj >= 0xDC000000
-            || wret < 0xC0000000 || wret >= 0xC1000000
+            /* the kernel-continuation witness: the sticky orphan's
+             * [th+0x150] carries the KERNEL window (live: 90845b78
+             * — the teardown-path continuation; NOT the create
+             * walker's c00 filesys window) */
+            || wret < 0x90800000 || wret >= 0x90A00000
             || tva == pcur) {                   /* never the current */
             continue;
         }
