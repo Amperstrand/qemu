@@ -6463,7 +6463,15 @@ static void mmcs_l56_scan(void)
                                   &(uint32_t){ 0 }, 4);
         sig56 |= 1;
         cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &sig56, 1);
-        /* the walker's thread writes (wCount halfword++) */
+        /* the walker's thread writes (wCount halfword++; the t34/t74
+         * clears). NOTE: the walker's st16|=3 write is DELIBERATELY
+         * NOT done host-side — the v9 stub's own state guard requires
+         * (st16&3)==2 (BLOCKED) at entry, and its MakeRun performs
+         * the stock state change (state16:=(s&~3)|1) itself; the
+         * walker's |3 intermediate only feeds MakeRunIfNeeded's
+         * condition check, which the stub's direct MakeRun replaces
+         * (live-caught: the premature |3 failed the stub guard and
+         * the wake silently early-exited, marker cell unread) */
         uint32_t pa_w = tva - 0x80000000 + 0x42;
         uint16_t wc = 0;
         cpu_physical_memory_read(pa_w, &wc, 2);
@@ -6473,8 +6481,6 @@ static void mmcs_l56_scan(void)
                                   &(uint32_t){ 0 }, 4);
         cpu_physical_memory_write(tva - 0x80000000 + 0x74,
                                   &(uint32_t){ 0 }, 4);
-        st16 |= 3;
-        cpu_physical_memory_write(tva - 0x80000000 + 0xc, &st16, 4);
         /* (3) THE RESULT PLANTS — the L54 recipe on the entry */
         cpu_physical_memory_write(tva - 0x80000000 + 0x1f8,
                                   &entry56, 4);
