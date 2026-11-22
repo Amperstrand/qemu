@@ -2649,6 +2649,7 @@ static uint32_t mmcs_l55_stable;
  * MMCS_TICK. */
 static void mmcs_l56_scan(void);
 static int mmcs_l56_armed;
+static int mmcs_l57_armed;    /* MMCS_L57EV: the v10 requeue stub */
 static uint32_t mmcs_l56_cadence_ms;
 static uint32_t mmcs_l56_max_deliv;
 static uint32_t mmcs_l56_total;
@@ -5681,6 +5682,55 @@ static uint8_t mmcs_l54_stub[] = {
 #define MMCS_L54_STUB_VA   0xBF00E600
 #define MMCS_L54_SLOT_PA   0x0867A064   /* evt 0x320, idx 7 */
 
+/* MMCS fork (L57/S206): the v10 wake stub — v9 + THE INTERRUPTED-
+ * CURRENT REQUEUE. The S206 decode: the vendor switcher 0x90822b68
+ * saves the outgoing thread ([old+0x94..0xA8] regs + SR at +0xA4 :=
+ * 0x102, [old+0x60]:=0) and switches to pick, but NEVER requeues the
+ * old current — in stock the scheduler's preempt path re-inserts the
+ * current into the ready list BEFORE picking; the v9 stub bypassed
+ * that (harmless in the L54/L55 dead-idle self-switch worlds; in the
+ * L56 two-live-thread world it ORPHANED the launcher: switched out
+ * mid-KCall-submit, st16 RUNNING-class, off the pick path forever).
+ * THE FIX: after MakeRun(target), old := [0x88679894]; if old !=
+ * target -> MakeRun(old) (the vendor's own 0x90825ee4: the +0xE
+ * suspended guard, st16:=(s&~3)|1, the [th+0x41]-priority enqueue
+ * into the DAT_90826048 buckets, the resched flag). The old==target
+ * guard is the double-list-insert corruption protector (the L54/L55
+ * worlds switch the walker to itself). LAYOUT: a 20-byte insertion at
+ * +0x3c (instruction and pool shift equally — every v9 pc-relative
+ * displacement stays valid; the pool stays 4-aligned); pool +20:
+ * .Lm +0x98, .Lcand +0x9c, .Lmk +0xa0, .Lf +0xa4, .Lf2 +0xa8,
+ * .Lpick +0xac, .Lpcur +0xb0, .Lsw +0xb4. 184 bytes, capstone-
+ * verified against QEMU's own decode table (target/sh4/translate.c:
+ * cmp/eq Rm,Rn = 0x3000 — the 0x3004 nibble is div1, the first
+ * draft's trap). Env MMCS_L57EV (default OFF) — rides the L56
+ * delivery (requires MMCS_L56EV). */
+static uint8_t mmcs_l57_stub[] = {
+    0x22, 0x4f, 0xe6, 0x2f, 0x25, 0xd4, 0x43, 0x50,
+    0x03, 0xc9, 0x02, 0x88, 0x01, 0x89, 0x3e, 0xa0,
+    0x09, 0x00, 0x09, 0x00, 0x09, 0x00, 0x09, 0x00,
+    0x09, 0x00, 0x43, 0x62, 0x64, 0x72, 0x30, 0x72,
+    0x26, 0x68, 0x26, 0x69, 0x26, 0x6a, 0x26, 0x6b,
+    0x26, 0x6c, 0x26, 0x6d, 0x1a, 0xd2, 0x01, 0xe1,
+    0x12, 0x22, 0x09, 0x00, 0x1a, 0xd3, 0x0b, 0x43,
+    0x09, 0x00, 0x09, 0x00, 0x1c, 0xd4, 0x42, 0x64,
+    0x16, 0xd5, 0x50, 0x34, 0x04, 0x89, 0x09, 0x00,
+    0x15, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x09, 0x00,
+    0x11, 0xd2, 0x02, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x12, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x11, 0xd2, 0x01, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x0b, 0xd2, 0x03, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x0e, 0xd2, 0x42, 0x22, 0x0e, 0xd2, 0x20, 0x5e,
+    0x07, 0xd2, 0x04, 0xe1, 0x12, 0x22, 0x09, 0x00,
+    0x0c, 0xd3, 0x0b, 0x43, 0x09, 0x00, 0x09, 0x00,
+    0x03, 0xd2, 0x05, 0xe1, 0x12, 0x22, 0xf6, 0x6e,
+    0x26, 0x4f, 0x00, 0xe0, 0x0b, 0x00, 0x09, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xe4, 0x5e, 0x82, 0x90, 0x84, 0x98, 0x67, 0x88,
+    0x88, 0x98, 0x67, 0x88, 0xa4, 0xef, 0x67, 0x88,
+    0x94, 0x98, 0x67, 0x88, 0x68, 0x2b, 0x82, 0x90,
+};
+
 static void mmcs_l54_scan(void)
 {
     if (!mmcs_l54_armed || mmcs_l54_total >= mmcs_l54_max_deliv) {
@@ -6520,13 +6570,24 @@ static void mmcs_l56_scan(void)
                 }
             }
         }
-        /* (4) THE V9 WAKE — the shared stub, re-targeted */
-        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
-                                  sizeof mmcs_l54_stub);
-        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
-        cpu_physical_memory_write(0x1F00E600 + 0x84,
-                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
-                                  4);
+        /* (4) THE WAKE — the v10 requeue stub when MMCS_L57EV is set
+         * (the S206 fix: MakeRun(old) when old != target), else the
+         * shared v9. The v10 pool sits +20: .Lm +0x98, .Lcand +0x9c. */
+        if (mmcs_l57_armed) {
+            cpu_physical_memory_write(0x1F00E600, mmcs_l57_stub,
+                                      sizeof mmcs_l57_stub);
+            cpu_physical_memory_write(0x1F00E600 + 0x9c, &tva, 4);
+            cpu_physical_memory_write(0x1F00E600 + 0x98,
+                                      &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                      4);
+        } else {
+            cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                      sizeof mmcs_l54_stub);
+            cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+            cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                      &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                      4);
+        }
         cpu_physical_memory_write(0x1F00E6F0,
                                   &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
                                   4);
@@ -7445,6 +7506,14 @@ static void mmcs_l16_boot_parse(void)
                     "S205 post-return sibling)\n",
                     mmcs_l56_cadence_ms, mmcs_l56_max_deliv,
                     MMCS_L54_STUB_VA);
+            if (getenv("MMCS_L57EV")) {
+                mmcs_l57_armed = 1;
+                fprintf(stderr, "MMCS-L57: interrupted-current requeue "
+                        "armed (the L56 delivery plants the v10 stub: "
+                        "after MakeRun(target), old := [0x88679894]; "
+                        "old != target -> MakeRun(old) — the stock "
+                        "preempt's missing requeue, S206)\n");
+            }
         }
     }
     if (getenv("MMCS_L42KILL")) {
