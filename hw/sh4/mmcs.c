@@ -2586,6 +2586,7 @@ static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
+static uint64_t mmcs_tick_l59;
 static uint64_t mmcs_tick_l56;
 /* L55: the WAIT-ALL chained dual-entry multi-satisfy (S203; the scan
  * body + the delivery state live down at the L54 cluster — forward
@@ -2687,6 +2688,31 @@ static int mmcs_l58_retired(uint32_t obj)
     }
     return 0;
 }
+
+/* MMCS fork (L59/S210): MMCS_L59EV — THE COMPLETION-FORWARD PULSE
+ * (the owner-directed forward move; the L40-seed pattern on the
+ * proven machinery). THE S209 MEASUREMENT (the cascade watch): the
+ * launcher live-cycles the kernel re-park loop on the RETIRED
+ * (consumable) create event — 551,815 satisfy-copies, ZERO external
+ * SETs: the completion producers are absent (the Jeep-lane
+ * absent-counterparty class — parked as Open, not chased). THE MOVE:
+ * a plain ONE-WORD SET ([obj+0x8D] := 1) per cadence — the cycling
+ * eval consumes it within one pass (the satisfy [8D]:=[8E]=0), the
+ * loop body runs, the counter +1; FIVE pulses walk the counter 1->6
+ * and the launch loop EXITS into new territory. NO stub, no slot, no
+ * wake (the thread is live in the kernel loop; the v9 guard would
+ * reject low2!=2 anyway). GATES: the L58 resolver (pcur's
+ * wait-array object) + the CONSUMABLE class {8D==0, 8E==0,
+ * +0x90==0} + the standing completed head [pTh+0x1F8]!=0 (the
+ * completion-loop waiter) + one pulse per cadence + CAP 6 (the
+ * synthetic completions bounded; no exit by 6 = the decode is wrong,
+ * not the pulse count). Env MMCS_L59EV (default OFF; MMCS_L59EV_MS
+ * cadence default 2000 = one completion per 2s; cap 6). */
+static void mmcs_l59_scan(void);
+static int mmcs_l59_armed;
+static int mmcs_l60_armed;    /* MMCS_L60EV: the SignalStarted synthesis */
+static uint32_t mmcs_l59_cadence_ms;
+static uint32_t mmcs_l59_pulses;
 static uint32_t mmcs_l56_cadence_ms;
 static uint32_t mmcs_l56_max_deliv;
 static uint32_t mmcs_l56_total;
@@ -3104,6 +3130,11 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l58_armed && ++mmcs_tick_l58 >= mmcs_l58_cadence_ms) {
             mmcs_tick_l58 = 0;
             mmcs_l58_scan();
+        }
+        /* L59: the completion-forward pulse (S210 — going forwards) */
+        if (mmcs_l59_armed && ++mmcs_tick_l59 >= mmcs_l59_cadence_ms) {
+            mmcs_tick_l59 = 0;
+            mmcs_l59_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -6735,6 +6766,171 @@ static void mmcs_l58_scan(void)
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, pcur, f1f8);
 }
 
+static void mmcs_l59_scan(void)
+{
+    if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
+        return;
+    }
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    if (pcur < 0x90680000 || pcur >= 0x90780000) {
+        return;                       /* not an arena thread */
+    }
+    uint32_t f1f8 = 0, wobj = 0;
+    cpu_physical_memory_read(pcur - 0x80000000 + 0x1F8, &f1f8, 4);
+    cpu_physical_memory_read(pcur - 0x80000000 + 0x14C, &wobj, 4);
+    if (!f1f8 || wobj < 0xD0000000 || wobj >= 0xDC000000) {
+        return;
+    }
+    uint32_t obj = 0;
+    for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+        uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+        uint32_t w1 = 0;
+        if (!pa1) {
+            continue;
+        }
+        cpu_physical_memory_read(pa1, &w1, 4);
+        if (w1 != pcur) {
+            continue;
+        }
+        uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+        if (pa2) {
+            cpu_physical_memory_read(pa2, &obj, 4);
+        }
+        break;
+    }
+    if (obj < 0x90680000 || obj >= 0x90780000) {
+        return;
+    }
+    /* THE CONSUMABLE CLASS: {8D==0, 8E==0, +0x90==0} — the retired
+     * event (post-L58); the sticky classes belong to L56/L58 */
+    uint8_t sig59 = 1, sticky = 1, z90 = 1;
+    cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sig59, 1);
+    cpu_physical_memory_read(obj - 0x80000000 + 0x8e, &sticky, 1);
+    cpu_physical_memory_read(obj - 0x80000000 + 0x90, &z90, 1);
+    if ((sig59 & 1) || sticky != 0 || z90 != 0) {
+        return;
+    }
+    /* MMCS fork (L60/S210): THE SIGNALSTARTED SERVER-SIDE SYNTHESIS —
+     * the s209 static lane's decode: the stock advance needs BOTH the
+     * dependency's started bit (table[ord].+4 := 1; table =
+     * [c00d1250], stride 0x4c0) AND the event SET (EventModify). The
+     * L59 pulse alone satisfies the wait but the entry INDEX does not
+     * advance (the walker re-checks the bit). The c00 module region
+     * maps PA = VA - 0xB0000000 (live-proven: c00d5250 -> 106d5250). */
+    if (mmcs_l60_armed) {
+        uint32_t tbase = 0;
+        uint32_t pa_cell = mmcs_l32_stack_pa(0xC00D1250);
+        if (pa_cell) {
+            cpu_physical_memory_read(pa_cell, &tbase, 4);
+        }
+        static int nl60diag;
+        if (nl60diag < 6) {
+            nl60diag++;
+            fprintf(stderr, "MMCS-L60: diag: [c00d1250] pa %08x -> "
+                    "tbase %08x\n", pa_cell, tbase);
+        }
+        if (tbase >= 0x00010000u && tbase < 0xE0000000u
+            && !(tbase & 3)) {
+            /* v2: the walk checks DEPENDENCIES' started bits
+             * (entry[j].+4 where j = the scan index of the dep's
+             * ordinal — NOT the ordinal itself). Mark ALL entries'
+             * bits (k = 0..7, bounded; the LMEM_ZEROINIT buffer's
+             * empty slots stay harmless): the walk then launches
+             * every entry in order (the REAL CreateProcessW calls)
+             * and exits to PSLNotify + EventModify(SystemStarted) —
+             * the milestone. */
+            for (uint32_t k = 0; k < 8; k++) {
+                /* v3: read/write through the LIVE TLB (the current
+                 * context IS filesys — the heap's owner): the pgown
+                 * table misses the later heap pages (d0251000+);
+                 * cpu_memory_rw_debug translates via the running
+                 * context's page tables — the same path the gdbstub
+                 * kernel-context reads proved. */
+                uint32_t bit = 0;
+                int rdbit = mmcs_cpu
+                    ? cpu_memory_rw_debug(CPU(mmcs_cpu),
+                                          tbase + 0x254 * k + 4,
+                                          (void *)&bit, 4, 0) : -1;
+                uint32_t ord = 0;
+                int rdord = mmcs_cpu
+                    ? cpu_memory_rw_debug(CPU(mmcs_cpu),
+                                          tbase + 0x250 * k,
+                                          (void *)&ord, 4, 0) : -1;
+                static int nl60dump;
+                if (nl60dump < 16) {
+                    nl60dump++;
+                    if (k == 0) {
+                        uint16_t key = 0;
+                        cpu_physical_memory_read(0x1069525C, &key, 2);
+                        fprintf(stderr, "MMCS-L60: live scan key = %04x "
+                                "(the CURRENT dep ordinal)\n", key);
+                        /* the 0x4c0-stride entry ordinals */
+                        for (uint32_t e = 0; e < 6; e++) {
+                            uint32_t o4 = 0, b4 = 0;
+                            int r1 = cpu_memory_rw_debug(
+                                CPU(mmcs_cpu), tbase + 0x4c0 * e,
+                                (void *)&o4, 4, 0);
+                            int r2b = cpu_memory_rw_debug(
+                                CPU(mmcs_cpu), tbase + 0x4c0 * e + 4,
+                                (void *)&b4, 4, 0);
+                            fprintf(stderr, "MMCS-L60: e4[%u] "
+                                    "ord=%08x(%d) bit=%08x(%d)\n",
+                                    e, o4, r1, b4, r2b);
+                        }
+                    }
+                    fprintf(stderr, "MMCS-L60: dump: entry[%u] ord=%08x "
+                            "(rd %d) bit=%08x (rd %d)\n",
+                            k, ord, rdord, bit, rdbit);
+                    if (k == 0) {
+                        /* the layout scan: the first 24 nonzero words
+                         * in the table block (find the real stride) */
+                        int shown = 0;
+                        for (uint32_t off = 0x40;
+                             off < 0x2400 && shown < 24; off += 4) {
+                            uint32_t w = 0;
+                            if (cpu_memory_rw_debug(
+                                    CPU(mmcs_cpu), tbase + off,
+                                    (void *)&w, 4, 0) == 0 && w) {
+                                fprintf(stderr, "MMCS-L60: layout: "
+                                        "+%04x = %08x\n", off, w);
+                                shown++;
+                            }
+                        }
+                    }
+                }
+                if (rdbit) {
+                    continue;
+                }
+                if (bit == 0) {
+                    uint32_t one = 1;
+                    if (!cpu_memory_rw_debug(
+                            CPU(mmcs_cpu), tbase + 0x254 * k + 4,
+                            (void *)&one, 4, 1)) {
+                        fprintf(stderr, "MMCS-L60: t=%" PRId64 "ms "
+                                "SignalStarted synthesis: table[%u]+4 "
+                                ":= 1 (tbase %08x — the started bits "
+                                "marked; the walk advances and LAUNCHES "
+                                "each entry)\n",
+                                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                                k, tbase);
+                    }
+                }
+            }
+        }
+    }
+    /* THE PULSE (one word; the cycling eval consumes it) */
+    uint8_t one = 1;
+    cpu_physical_memory_write(obj - 0x80000000 + 0x8d, &one, 1);
+    mmcs_l59_pulses++;
+    fprintf(stderr, "MMCS-L59: t=%" PRId64 "ms completion-forward "
+            "pulse %u/6: obj %08x [8D]:=1 (th %08x — the cycling eval "
+            "consumes the SET: one pulse = one completion; the "
+            "counter walks to limit and the launch loop exits)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l59_pulses,
+            obj, pcur);
+}
+
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
  * daemon (the generic requeue fix at the vendor switcher boundary,
  * decoded 2026-11-20).
@@ -7642,6 +7838,27 @@ static void mmcs_l16_boot_parse(void)
                 "the L55 plant interlocked — S207; independent "
                 "of MMCS_L56EV)\n",
                 mmcs_l58_cadence_ms);
+    }
+    if (getenv("MMCS_L59EV")) {
+        mmcs_l59_cadence_ms =
+            atoi(getenv("MMCS_L59EV_MS") ? : "2000");
+        if (!mmcs_l59_cadence_ms) {
+            mmcs_l59_cadence_ms = 2000;
+        }
+        mmcs_l59_armed = 1;
+        fprintf(stderr, "MMCS-L59: completion-forward pulse armed "
+                "(cadence %ums, cap 6 — one synthetic completion per "
+                "cadence on the retired consumable create event; the "
+                "counter walks to limit and the launch loop exits — "
+                "S210, going forwards)\n",
+                mmcs_l59_cadence_ms);
+        if (getenv("MMCS_L60EV")) {
+            mmcs_l60_armed = 1;
+            fprintf(stderr, "MMCS-L60: SignalStarted synthesis armed "
+                    "(table[10]+4 := 1 before each pulse — the s209 "
+                    "decode: the stock advance needs the started bit "
+                    "AND the event SET)\n");
+        }
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
