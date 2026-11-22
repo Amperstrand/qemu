@@ -2509,6 +2509,15 @@ static uint32_t mmcs_l52_max_deliv = 4;
 static uint32_t mmcs_l52_total;
 static uint32_t mmcs_l52_key;        /* stability key {thread,pc} */
 static uint32_t mmcs_l52_stable;     /* consecutive matching scans */
+/* L53 (S201): the completion-helper spin — the cleanup-chain
+ * self-loop restore (see mmcs_l53_scan) */
+static void mmcs_l53_scan(void);
+static int mmcs_l53_armed;
+static uint32_t mmcs_l53_cadence_ms = 2000;
+static uint32_t mmcs_l53_max_deliv = 4;
+static uint32_t mmcs_l53_total;
+static uint32_t mmcs_l53_key;        /* stability key {thread,entry} */
+static uint32_t mmcs_l53_stable;     /* consecutive matching scans */
 /* L37: the KCall-exit lost-preempt CLASS daemon (full block + decode
  * below) — the generic superset of the per-site requeue daemons */
 static void mmcs_l37_scan(void);
@@ -2546,6 +2555,7 @@ static uint32_t mmcs_l50_lines;
 static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
 static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
 static uint64_t mmcs_tick_l52;
+static uint64_t mmcs_tick_l53;
 static int mmcs_tick_live;    /* first mmcs_tick_deliver ran (post_load
                                 * re-arms the chain only when set) */
 static int mmcs_snap_restored; /* post_load marker: the stock tmu012 device
@@ -2925,6 +2935,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l52_armed && ++mmcs_tick_l52 >= mmcs_l52_cadence_ms) {
             mmcs_tick_l52 = 0;
             mmcs_l52_scan();
+        }
+        /* L53: the completion-helper spin chain-end restore (same
+         * class; a pure one-word bookkeeping write — no stub, no
+         * slot) */
+        if (mmcs_l53_armed && ++mmcs_tick_l53 >= mmcs_l53_cadence_ms) {
+            mmcs_tick_l53 = 0;
+            mmcs_l53_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -4602,16 +4619,18 @@ static void mmcs_l50_dbg(void)
             continue;
         }
         uint8_t bF = (st16 >> 24) & 0xff;   /* +0xF waiting flag */
-        uint32_t f1f8 = 0, t1fc = 0, t200 = 0;
+        uint32_t f1f8 = 0, t1fc = 0, t200 = 0, t34 = 0;
         memcpy(&f1f8, arena + o + 0x1f8, 4);
         memcpy(&t1fc, arena + o + 0x1fc, 4);
         memcpy(&t200, arena + o + 0x200, 4);
+        memcpy(&t34, arena + o + 0x34, 4);
         fprintf(stderr,
                 "MMCS-L50: t=%" PRId64 "ms th %08x%s st16=%08x bF=%02x "
-                "pc=%08x sp=%08x wobj=%08x f1f8=%08x t1fc=%08x t200=%08x",
+                "pc=%08x sp=%08x wobj=%08x f1f8=%08x t1fc=%08x t200=%08x "
+                "t34=%08x",
                 qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
                 tva == pcur ? " *CUR*" : "", st16, bF, ctxpc, ctxsp, wobj,
-                f1f8, t1fc, t200);
+                f1f8, t1fc, t200, t34);
         /* the waited object chain (sig / flags word / waiter-list) */
         if (wobj >= 0xD0000000 && wobj < 0xDC000000) {
             uint32_t obj = 0, wi_found = 0;
@@ -5153,6 +5172,202 @@ static void mmcs_l52_scan(void)
     /* no frozen shape this scan — reset the stability tracker */
     mmcs_l52_key = 0;
     mmcs_l52_stable = 0;
+}
+
+/* MMCS fork (L53): MMCS_L53EV — THE COMPLETION-HELPER SPIN (S201,
+ * decoded 2026-11-22; the L52 hand-off made the walker LIVE but it
+ * spins in the park fn's exit cleanup — the spin is print-silent,
+ * serial 720, era park).
+ *
+ * THE SPIN (Verified disasm + Observed tape): the park fn 0x90837bd0's
+ * exit runs the CLEANUP-DISPATCH LOOP 0x90837d3a-44 — `jsr the
+ * wait-completion dispatcher 0x90837ab0(entry)` then `r8 := [r8+16]`,
+ * repeating while the link != 0 — terminating ONLY on a zero chain
+ * link. The +16 field is DUAL-USE: the block-chain during the wait
+ * (the init fn 0x90837b30: [b+16] = b+36, last = 0) and the FREE-LIST
+ * link after the eval 0x90828244's common tail 0x9082846e-88 pops the
+ * completed head [pTh+0x1F8] and pushes the entry onto the free list
+ * ([entry+16] := [pTh+52]; [pTh+52] := entry). The L47-era repair
+ * cycles re-completed the SAME entry (the L50b counter walk 2->5) —
+ * each re-completion re-pushed block0, and the push found the free
+ * head ALREADY == block0: [block0+16] == block0 (Observed:
+ * [d00bf660] == d00bf650, constant across the whole live tape) — THE
+ * SELF-LOOP. The cleanup loop then dispatches block0 forever: the
+ * dispatcher's TYPE-4 path KCalls helper B 0x90827964, which reads
+ * [entry+12] == 0 (already unlinked) and early-returns without a
+ * write — 100% live, never terminating. THE WALKER'S REGISTER
+ * SNAPSHOTS (the L52b probe): pc 0x908230e6/0x908230f6 at the KCall
+ * wrapper, pr = 0x90837ae8 (the dispatcher epilogue), r4 = d00bf650,
+ * r3 = 0x90827964 — and the anchor pair on the walker's kstack:
+ * [d00bf620] = 0x90837d40 (the dispatcher's pushed pr = the cleanup
+ * jsr's return) with [d00bf624] = d00bf650 (the pushed r8 = the
+ * entry).
+ *
+ * THE FIX — THE CHAIN-END RESTORE: write [entry+16] := 0 — the exact
+ * value the stock single-completion world leaves (the free-push onto
+ * a list not already holding the entry; the stock wake chain's own
+ * bookkeeping — the dead-loader world's double-push is OUR repair-era
+ * artifact). The same repair family as the L50b wait-result-cache
+ * write: ONE WORD, guest-side bookkeeping restored, no stub, no slot,
+ * no manufactured feeder. After the write the loop's next
+ * `mov.l @(16,r8),r8` reads 0 -> the walk ends -> 0x90837d46 (r9 ==
+ * sp+40, the <=4-handles init identity) -> the plain exit 0x90837d72
+ * -> THE PARK FN RETURNS r0 = r10 (the eval's last result — the
+ * cached [pTh+0x1FC] = 0x1000) -> the fold/postwait chain ->
+ * CreateProcessW RETURNS to c00ce888 -> the launch loop iterates.
+ *
+ * RACE SAFETY (Verified): with [entry+12] == 0 helper B only reads
+ * +12 and returns (no writes); the dispatcher writes only its own
+ * pushed frame; the loop re-reads +16 every iteration; the tick int
+ * entry pushes below sp (the entry lives above it). The free list
+ * [pTh+52] stays = block0, now a VALID 1-deep list (block0 -> 0).
+ *
+ * The daemon scan (host-side, the L52 discipline): arena thread +
+ * tva == pCurTh (the live-spin shape) + (st16&3)==0 + bF==0 + ctxpc
+ * in the spin cycle set {0x908230e6, 0x908230f6, 0x90837ae8} (the
+ * KCall-wrapper/epilogue resched saves) + the is_cpw create-body
+ * witness + THE SPIN SIGNATURE: the anchor pair {0x90837d40, E} in
+ * the kstack window [ctxsp-0x40, ctxsp+0x180) with E a stack address
+ * on this frame and [E+16] == E (the self-loop) and [E+12] == 0
+ * (drained — helper B already no-ops) + 2-cadence stability keyed
+ * {thread,entry}. Repeating, delivery-capped (default 4),
+ * SELF-TERMINATING (the signature needs the self-loop; after the
+ * write it reads 0). Env MMCS_L53EV (default OFF; MMCS_L53EV_MS
+ * cadence default 2000; MMCS_L53EV_MAX cap default 4). Needs
+ * MMCS_TICK. */
+static void mmcs_l53_scan(void)
+{
+    if (!mmcs_l53_armed || mmcs_l53_total >= mmcs_l53_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    for (uint32_t o = 0; o + 0x210 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, ctxsp;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&ctxsp, arena + o + 0xb0, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || tva != pcur                     /* the live-spin shape */
+            || (st16 & 3) != 0                 /* RUNNING bookkeeping */
+            || (st16 >> 24) != 0               /* bF cleared */
+            || (ctxpc != 0x908230e6 && ctxpc != 0x908230f6
+                && ctxpc != 0x90837ae8)) {     /* the spin cycle set */
+            continue;
+        }
+        /* the create-body kstack witness (is_cpw — the L46 window) */
+        uint32_t ssp = ctxsp;
+        int is_cpw = 0;
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp; sa < ssp + 0x80; sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 >= 0x9082ce00 && w3 < 0x9082ed00) {
+                    is_cpw = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_cpw) {
+            continue;
+        }
+        /* THE SPIN SIGNATURE: the cleanup-loop anchor pair
+         * {0x90837d40, E} in the kstack window with [E+16] == E
+         * (the self-loop) and [E+12] == 0 (drained) */
+        uint32_t entry = 0;
+        if (ssp >= 0xD0000000 && ssp < 0xDC000000) {
+            for (uint32_t sa = ssp - 0x40; sa + 4 < ssp + 0x180;
+                 sa += 4) {
+                uint32_t pa3 = mmcs_l32_stack_pa(sa);
+                uint32_t w3 = 0;
+                if (!pa3) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa3, &w3, 4);
+                if (w3 != 0x90837d40) {
+                    continue;           /* not the cleanup-jsr anchor */
+                }
+                uint32_t pa4 = mmcs_l32_stack_pa(sa + 4);
+                uint32_t cand = 0;
+                if (!pa4) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa4, &cand, 4);
+                if (cand < 0xD0000000 || cand >= 0xDC000000
+                    || cand < ssp - 0x40 || cand >= ssp + 0x400) {
+                    continue;           /* not a block on this frame */
+                }
+                uint32_t pa16 = mmcs_l32_stack_pa(cand + 0x10);
+                uint32_t w16 = 0;
+                if (!pa16) {
+                    continue;
+                }
+                cpu_physical_memory_read(pa16, &w16, 4);
+                if (w16 != cand) {
+                    continue;           /* link not the self-loop */
+                }
+                uint32_t pa12 = mmcs_l32_stack_pa(cand + 0xc);
+                uint32_t w12 = 0;
+                if (pa12) {
+                    cpu_physical_memory_read(pa12, &w12, 4);
+                }
+                if (w12 != 0) {
+                    continue;           /* still linked — not drained */
+                }
+                entry = cand;
+                break;
+            }
+        }
+        if (!entry) {
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,entry} (the L46/L52
+         * discipline — the signature must persist across scans) */
+        uint32_t key = tva ^ entry;
+        if (mmcs_l53_key != key) {
+            mmcs_l53_key = key;
+            mmcs_l53_stable = 1;
+            fprintf(stderr, "MMCS-L53: t=%" PRId64 "ms spin shape seen: "
+                    "th %08x *CUR* pc=%08x entry %08x [E+16]=%08x "
+                    "(stability %u/2)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, ctxpc,
+                    entry, entry, mmcs_l53_stable);
+            return;
+        }
+        if (++mmcs_l53_stable < 2) {
+            return;
+        }
+        /* DELIVER — the chain-end restore: [entry+16] := 0 */
+        uint32_t pa_w = mmcs_l32_stack_pa(entry + 0x10);
+        if (!pa_w) {
+            fprintf(stderr, "MMCS-L53: entry %08x +0x10 unmapped - "
+                    "skip\n", entry);
+            return;
+        }
+        cpu_physical_memory_write(pa_w, &(uint32_t){ 0 }, 4);
+        mmcs_l53_total++;
+        fprintf(stderr, "MMCS-L53: t=%" PRId64 "ms chain-end restore "
+                "%u/%u: walker %08x entry %08x [E+16] := 0 (the cleanup "
+                "walk ends -> the park fn returns r10=0x1000)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l53_total,
+                mmcs_l53_max_deliv, tva, entry);
+        return;                     /* one delivery per cadence */
+    }
+    /* no spin shape this scan — reset the stability tracker */
+    mmcs_l53_key = 0;
+    mmcs_l53_stable = 0;
 }
 
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
@@ -5932,6 +6147,24 @@ static void mmcs_l16_boot_parse(void)
                     mmcs_l52_cadence_ms, mmcs_l52_max_deliv,
                     MMCS_L52_STUB_VA);
         }
+    }
+    /* L53: the completion-helper spin chain-end restore — a pure
+     * one-word write, no stub, no slot, no L16EV interaction */
+    if (getenv("MMCS_L53EV")) {
+        mmcs_l53_cadence_ms =
+            atoi(getenv("MMCS_L53EV_MS") ? : "2000");
+        if (!mmcs_l53_cadence_ms) {
+            mmcs_l53_cadence_ms = 2000;
+        }
+        mmcs_l53_max_deliv = atoi(getenv("MMCS_L53EV_MAX") ? : "4");
+        if (!mmcs_l53_max_deliv) {
+            mmcs_l53_max_deliv = 4;
+        }
+        mmcs_l53_armed = 1;
+        fprintf(stderr, "MMCS-L53: completion-helper spin chain-end "
+                "restore armed (cadence %ums, cap %u; the cleanup-loop "
+                "self-loop [E+16]:=0 class — no stub, no slot)\n",
+                mmcs_l53_cadence_ms, mmcs_l53_max_deliv);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
