@@ -2585,6 +2585,7 @@ static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
+static uint64_t mmcs_tick_l58;
 static uint64_t mmcs_tick_l56;
 /* L55: the WAIT-ALL chained dual-entry multi-satisfy (S203; the scan
  * body + the delivery state live down at the L54 cluster — forward
@@ -2650,6 +2651,42 @@ static uint32_t mmcs_l55_stable;
 static void mmcs_l56_scan(void);
 static int mmcs_l56_armed;
 static int mmcs_l57_armed;    /* MMCS_L57EV: the v10 requeue stub */
+
+/* MMCS fork (L58/S207): MMCS_L58EV — THE RESIDUAL-STICKY CLEANUP
+ * (the falsifier write promoted to maintenance; the L53 one-word
+ * class — no stub, no slot). THE S207 DECODE (live-proven): the
+ * create event's [+0x8E]=1 marks the STICKY class (EventModify's
+ * deferred-routing bit — every satisfy re-arms the sig from it);
+ * [+0x8E]=0 is the NORMAL consumable class. The L55-era manual-reset
+ * plant broke the wait's re-submit cycle so the walker could EXIT —
+ * but the plant PERSISTS in the object long after the wait returned:
+ * the residual that turned the completion loop into a spin and
+ * starved every other thread (the falsifier: clear 8E -> the
+ * launcher PARKS, bF 01->02 at the face, the sig consumed, the
+ * satisfy stream stops). THE SCAN: pcur's wait-array-resolved object
+ * with the standing shape {8D&1, 8E==1, +0x90==0} AND the
+ * post-return witness [pTh+0x1F8]!=0 (the standing completed head —
+ * the L55 plant is only retired AFTER the wait returned) -> clear
+ * [+0x8E] := 0, ONE-SHOT per object (the done-set). INTERLOCK: the
+ * L55 delivery skips retired objects (otherwise its cadence re-plants
+ * the bit — the falsifier's first lesson: the standing combo's own
+ * machinery was faithfully undoing the clears). Env MMCS_L58EV
+ * (default OFF; MMCS_L58EV_MS cadence default 2000; cap 8 objects). */
+static void mmcs_l58_scan(void);
+static int mmcs_l58_armed;
+static uint32_t mmcs_l58_cadence_ms;
+static uint32_t mmcs_l58_total;
+static uint32_t mmcs_l58_done[8];
+
+static int mmcs_l58_retired(uint32_t obj)
+{
+    for (unsigned i = 0; i < 8; i++) {
+        if (mmcs_l58_done[i] == obj) {
+            return 1;
+        }
+    }
+    return 0;
+}
 static uint32_t mmcs_l56_cadence_ms;
 static uint32_t mmcs_l56_max_deliv;
 static uint32_t mmcs_l56_total;
@@ -3060,6 +3097,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l56_armed && ++mmcs_tick_l56 >= mmcs_l56_cadence_ms) {
             mmcs_tick_l56 = 0;
             mmcs_l56_scan();
+        }
+        /* L58: the residual-sticky cleanup (the S207 fix — the
+         * falsifier write promoted to maintenance; one word, no
+         * stub, no slot) */
+        if (mmcs_l58_armed && ++mmcs_tick_l58 >= mmcs_l58_cadence_ms) {
+            mmcs_tick_l58 = 0;
+            mmcs_l58_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -6272,7 +6316,14 @@ static void mmcs_l55_scan(void)
              * consumes the bit, the driver-level re-check reads it
              * CLEAR, the wait re-submits forever). The stock
              * manual-reset event keeps BOTH set: 0x8D for the wake,
-             * 0x8E as the post-consume sig the re-check reads. */
+             * 0x8E as the post-consume sig the re-check reads.
+             * MMCS fork (L58 interlock): a RETIRED object (the S207
+             * residual-sticky cleanup's done-set) is never re-planted
+             * — the falsifier's first lesson: this cadence otherwise
+             * faithfully undoes the cleanup. */
+            if (mmcs_l58_retired(objs[i])) {
+                continue;
+            }
             uint8_t sig = 0;
             cpu_physical_memory_read(objs[i] - 0x80000000 + 0x8d,
                                      &sig, 1);
@@ -6622,6 +6673,66 @@ static void mmcs_l56_scan(void)
     /* no sticky-orphan park this scan — reset the stability tracker */
     mmcs_l56_key = 0;
     mmcs_l56_stable = 0;
+}
+
+static void mmcs_l58_scan(void)
+{
+    if (!mmcs_l58_armed || mmcs_l58_total >= 8) {
+        return;
+    }
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    if (pcur < 0x90680000 || pcur >= 0x90780000) {
+        return;                       /* not an arena thread */
+    }
+    uint32_t f1f8 = 0, wobj = 0;
+    cpu_physical_memory_read(pcur - 0x80000000 + 0x1F8, &f1f8, 4);
+    cpu_physical_memory_read(pcur - 0x80000000 + 0x14C, &wobj, 4);
+    if (!f1f8 || wobj < 0xD0000000 || wobj >= 0xDC000000) {
+        return;    /* no standing completed head / no wait array */
+    }
+    /* resolve the waited object through pcur's own wait-array entry
+     * (the L32EV/L47 resolver, as in l56_scan) */
+    uint32_t obj = 0;
+    for (uint32_t wi = 0; wi <= 0x80; wi += 4) {
+        uint32_t pa1 = mmcs_l32_stack_pa(wobj + wi + 0x14);
+        uint32_t w1 = 0;
+        if (!pa1) {
+            continue;
+        }
+        cpu_physical_memory_read(pa1, &w1, 4);
+        if (w1 != pcur) {
+            continue;
+        }
+        uint32_t pa2 = mmcs_l32_stack_pa(wobj + wi + 0xC);
+        if (pa2) {
+            cpu_physical_memory_read(pa2, &obj, 4);
+        }
+        break;
+    }
+    if (obj < 0x90680000 || obj >= 0x90780000) {
+        return;                       /* not an arena kernel object */
+    }
+    /* the sticky-standing residue: {8D&1, 8E==1, +0x90==0} */
+    uint8_t sig58 = 0, sticky = 0, z90 = 1;
+    cpu_physical_memory_read(obj - 0x80000000 + 0x8d, &sig58, 1);
+    cpu_physical_memory_read(obj - 0x80000000 + 0x8e, &sticky, 1);
+    cpu_physical_memory_read(obj - 0x80000000 + 0x90, &z90, 1);
+    if (!(sig58 & 1) || sticky != 1 || z90 != 0) {
+        return;
+    }
+    if (mmcs_l58_retired(obj)) {
+        return;                       /* one-shot per object */
+    }
+    /* THE CLEAR (one word, the L53 class — no stub, no slot) */
+    uint8_t zero = 0;
+    cpu_physical_memory_write(obj - 0x80000000 + 0x8e, &zero, 1);
+    mmcs_l58_done[mmcs_l58_total++] = obj;
+    fprintf(stderr, "MMCS-L58: t=%" PRId64 "ms residual-sticky cleanup: "
+            "obj %08x [8E]:=0 (th %08x f1f8 %08x — the post-return "
+            "residue retired; the stock consumable class resumes; "
+            "the launcher parks at its next wait)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, pcur, f1f8);
 }
 
 /* MMCS fork (L37): MMCS_L37EV — the KCall-exit lost-preempt CLASS
@@ -7515,6 +7626,22 @@ static void mmcs_l16_boot_parse(void)
                         "preempt's missing requeue, S206)\n");
             }
         }
+    }
+    if (getenv("MMCS_L58EV")) {
+        mmcs_l58_cadence_ms =
+            atoi(getenv("MMCS_L58EV_MS") ? : "2000");
+        if (!mmcs_l58_cadence_ms) {
+            mmcs_l58_cadence_ms = 2000;
+        }
+        mmcs_l58_armed = 1;
+        fprintf(stderr, "MMCS-L58: residual-sticky cleanup "
+                "armed (cadence %ums, cap 8 objects; the "
+                "post-return {8D&1,8E=1,+0x90=0} residue on "
+                "pcur's waited object with the standing "
+                "completed head -> [8E]:=0 once per object; "
+                "the L55 plant interlocked — S207; independent "
+                "of MMCS_L56EV)\n",
+                mmcs_l58_cadence_ms);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
