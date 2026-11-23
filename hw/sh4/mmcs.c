@@ -7242,8 +7242,14 @@ static void mmcs_l62_scan(void)
             || t1fc != 0x1000) {        /* the pair must be vendor-shaped */
             continue;
         }
-        /* resolve the completed entry's object: {obj @+0xC} */
-        uint32_t pa_e = mmcs_l32_stack_pa(f1f8 + 0xc);
+        /* resolve the completed entry's object — THE ENTRY LAYOUT
+         * (the eval fn_90828244 decode, 0x908282b6/0x90828398):
+         * r8 = [th+0x1F8] (the head), obj = [r8+0x14] (mov.l
+         * @(20,r8),r4 on every type arm), type byte = [r8+0x18].
+         * (The L26/L32 resolver's {obj@+0xC, pTh@+0x14} reads are
+         * relative to head+8 — the first A-branch draft read +0xC
+         * off the head and silently missed the crit.) */
+        uint32_t pa_e = mmcs_l32_stack_pa(f1f8 + 0x14);
         if (!pa_e) {
             if (mmcs_l62_diag) {
                 fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms "
@@ -7274,14 +7280,12 @@ static void mmcs_l62_scan(void)
             /* the owned flavor = FLAVOR B's world; the healthy
              * gwes-code owner ctx = a live owner class; the non-CRIT
              * object = the L55/L59 event lanes */
-            if (mmcs_l62_diag) {
-                fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms "
-                        "standing waiter %08x entry %08x obj %08x "
-                        "{cinfo %08x self %08x state %08x octx %08x} "
-                        "- not the free-crit aftermath\n",
-                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
-                        f1f8, obj, ocinfo, oself, ostate, octx);
-            }
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms standing "
+                    "waiter %08x entry %08x obj %08x {cinfo %08x "
+                    "self %08x state %08x octx %08x} - not the free-"
+                    "crit aftermath\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                    f1f8, obj, ocinfo, oself, ostate, octx);
             continue;
         }
         /* 2-cadence stability keyed {waiter,obj} */
