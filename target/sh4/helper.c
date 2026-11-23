@@ -192,6 +192,12 @@ static uint32_t mmcs_utlb_va2pa(CPUSH4State *env, uint32_t va)
  * page-ownership registration on the same latch. */
 bool mmcs_ilkfix_user_seen;
 
+/* MMCS fork (L66/S218): the low-arena stocker — hw/sh4/mmcs.c owns
+ * the stock _InterlockedAPIs block + the per-granule zero/poison
+ * policy; called at machine init, snapshot post-restore, and from
+ * the lazy ILKFIX seed path when MMCS_L66STK is set. */
+void mmcs_l66_stock_arena(const char *when);
+
 /* MMCS fork (L8): is this VA a plausible CODE address for this unit?
  * Windows: KData/LOWSLOT 0x4000-0x8000, coredll user window
  * 0x40000000-0x40100000, PSL servant module windows 0xC0000000-0xC8000000
@@ -1319,9 +1325,20 @@ void superh_cpu_do_interrupt(CPUState *cs)
             || cs->exception_index == 0x0e0)
         && (env->pc & ~7u) >= 0x5B80 && (env->pc & ~7u) <= 0x5BF8) {
         bool kern = (env->sr & (1u << SR_MD)) != 0;
+        bool kern_arms = getenv("MMCS_KILK") || getenv("MMCS_L66STK");
+        if (getenv("MMCS_L66DBG")) {
+            static int nl66dbg;
+            if (nl66dbg++ < 32) {
+                fprintf(stderr, "MMCS-L66DBG emu-gate: pc=%08x kern=%d "
+                        "user_seen=%d kilk=%d lkstk=%d sr=%08x\n",
+                        env->pc, kern, (int)mmcs_ilkfix_user_seen,
+                        getenv("MMCS_KILK") != NULL,
+                        getenv("MMCS_L66STK") != NULL, env->sr);
+            }
+        }
         if (!kern) {
             mmcs_ilkfix_user_seen = true;
-        } else if (!(mmcs_ilkfix_user_seen && getenv("MMCS_KILK"))) {
+        } else if (!(mmcs_ilkfix_user_seen && kern_arms)) {
             /* fall through to normal kernel exception handling */
             goto ilk_no_emu;
         }
@@ -2898,7 +2915,7 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
      */
     if (ret != MMU_OK && ((uint32_t)address & 0xFFFFF000u) == 0x5000
         && ((mmu_idx == MMU_USER_IDX)
-            || (getenv("MMCS_KILK")
+            || ((getenv("MMCS_KILK") || getenv("MMCS_L66STK"))
                 && mmcs_ilkfix_user_seen
                 && access_type == MMU_INST_FETCH
                 && (uint32_t)address >= 0x5B80
@@ -2926,6 +2943,12 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         };
         static bool seeded;
         if (!seeded) {
+            if (getenv("MMCS_L66STK")) {
+                /* L66/S218: seed the CORRECT stock block (all eight
+                 * granules, poison-repair policy) — see
+                 * hw/sh4/mmcs.c mmcs_l66_stock_arena. */
+                mmcs_l66_stock_arena("lazy-fault");
+            } else {
             /* Read-before-write: only seed blocks that are still all
              * zero. The vendor kernel keeps live runtime values in some
              * of these slots (observed +0x3bc/+0x3c8/+0x3cc/+0x3d0 at
@@ -2951,6 +2974,7 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                             "(live vendor data) - emulation only\n",
                             sb[i].off);
                 }
+            }
             }
             seeded = true;
             fprintf(stderr, "MMCS: ILKFIX seeded interlocked blocks "

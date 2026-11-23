@@ -9316,6 +9316,99 @@ static int mmcs_machine_pre_save(void *opaque)
     return 0;
 }
 
+/* MMCS fork (L66/S218): THE LOW-ARENA STOCKER — the complete stock
+ * _InterlockedAPIs block (shexcept.src listing verbatim, assembled
+ * with sh4-linux-gnu-as; mdsh3.c MDInitialize copies these 0x80 bytes
+ * to KData+FIRST_INTERLOCK (nkshx.h: 0x380) = VA 0x5B80..0x5C00 on
+ * the KData user page, phys 0x0C020B80..0x0C020BFF).
+ *
+ * L66 decode (2026-11-23): the S122 ILKFIX lazy seeds are BYTE-
+ * POISONED — every rts halfword was transcribed 00 0b (0x0b00,
+ * illegal) instead of 0b 00, and CAS's bf as 8b 00 (0x008b) instead
+ * of 00 8b. The L65 continuation-death fault pcs {0x5bd4,0x5be8,
+ * 0x5bf8} are exactly the flipped bf/rts offsets: the arena was
+ * POISON-stocked, not zero-stocked. This stocker writes the correct
+ * block under MMCS_L66STK (env-gated, default off), per 16-byte
+ * granule: all-zero granules stocked; granules byte-equal to a known
+ * poisoned S122 seed REPAIRED; anything else (live vendor runtime
+ * data) left alone and reported (the S122 read-before-write law).
+ * Called at machine init AND after snapshot restore (the incoming
+ * RAM load must not wipe it — the S214DBG trapa re-apply precedent).
+ * With the block stocked, kernel/user interlocked calls execute real
+ * stock code and never fault; the do_interrupt emulation stays as
+ * the fallback for busy granules. */
+static const uint8_t mmcs_l66_block[0x80] = {
+    /* +0x00 ILMaskByte */
+    0x40,0x60,0x59,0x20,0x6b,0x20,0x00,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x10 ILPopList (empty path) */
+    0x42,0x60,0x09,0x00,0x08,0x20,0x05,0x8b,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x20 bra ILPopList (interrupt-restart) / +0x24 popx tail */
+    0xf6,0xaf,0x09,0x00,0x02,0x61,0x12,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x30 ILPushList */
+    0x42,0x60,0x09,0x00,0x02,0x25,0x52,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x40 ILExchange */
+    0x42,0x60,0x09,0x00,0x09,0x00,0x52,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x50 ILCmpExchange */
+    0x42,0x60,0x00,0x36,0x00,0x8b,0x52,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x60 ILIncrement */
+    0x42,0x60,0x09,0x00,0x01,0x70,0x02,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+    /* +0x70 ILXAdd */
+    0x42,0x60,0x53,0x61,0x0c,0x31,0x12,0x24,0x0b,0x00,0x09,0x00,0x09,0x00,0x09,0x00,
+};
+
+/* The S122 poisoned seed granules (target/sh4/helper.c tlb_fill) for
+ * the repair match — each differs from the correct block ONLY at the
+ * byte-swapped rts (and CAS's bf) halfwords. */
+static const uint8_t mmcs_l66_poison[5][16] = {
+    {0x40,0x60,0x59,0x20,0x6b,0x20,0x00,0x24,0x00,0x0b,0x09,0x00,0x09,0x00,0x09,0x00},
+    {0x42,0x60,0x09,0x00,0x08,0x20,0x05,0x8b,0x00,0x0b,0x09,0x00,0x09,0x00,0x09,0x00},
+    {0x42,0x60,0x00,0x36,0x8b,0x00,0x52,0x24,0x00,0x0b,0x09,0x00,0x09,0x00,0x09,0x00},
+    {0x42,0x60,0x09,0x00,0x01,0x70,0x02,0x24,0x00,0x0b,0x09,0x00,0x09,0x00,0x09,0x00},
+    {0x42,0x60,0x53,0x61,0x0c,0x31,0x12,0x24,0x00,0x0b,0x09,0x00,0x09,0x00,0x09,0x00},
+};
+
+void mmcs_l66_stock_arena(const char *when);
+
+void mmcs_l66_stock_arena(const char *when)
+{
+    int stocked = 0, repaired = 0, busy = 0;
+    for (int off = 0; off < 0x80; off += 16) {
+        uint8_t cur[16];
+        cpu_physical_memory_read(0x0C020B80 + off, cur, 16);
+        bool zero = true, poison = false;
+        for (int j = 0; j < 16; j++) {
+            if (cur[j]) { zero = false; break; }
+        }
+        if (!zero) {
+            for (int k = 0; k < 5; k++) {
+                if (memcmp(cur, mmcs_l66_poison[k], 16) == 0) {
+                    poison = true;
+                    break;
+                }
+            }
+        }
+        if (zero || poison) {
+            cpu_physical_memory_write(0x0C020B80 + off,
+                                      mmcs_l66_block + off, 16);
+            if (poison) {
+                repaired++;
+            } else {
+                stocked++;
+            }
+        } else {
+            busy++;
+            fprintf(stderr, "MMCS-L66: granule VA 0x%04x busy (live vendor "
+                    "data, left alone):", 0x5B80 + off);
+            for (int j = 0; j < 16; j++) {
+                fprintf(stderr, " %02x", cur[j]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    fprintf(stderr, "MMCS-L66: arena stocked %s (stocked %d, poison-repaired "
+            "%d, busy-left %d)\n", when, stocked, repaired, busy);
+}
+
 static int mmcs_machine_post_load(void *opaque, int version_id)
 {
     struct MmcsSnap *s = opaque;
@@ -9408,6 +9501,13 @@ static int mmcs_machine_post_load(void *opaque, int version_id)
         cpu_physical_memory_write(MMCS_FLASH_BASE + off, &trapa72, 2);
         fprintf(stderr, "MMCS-SNAP: S214 death-site trapa re-applied "
                 "post-restore\n");
+    }
+    /* L66/S218: re-apply the low-arena stock AFTER the restore — the
+     * incoming migration RAM load carries whatever the save run left
+     * (poisoned S122 seeds / zeros / vendor data); no TBs exist yet
+     * post-migration, so the stocked block re-translates clean. */
+    if (getenv("MMCS_L66STK")) {
+        mmcs_l66_stock_arena("post-restore");
     }
     fprintf(stderr, "MMCS-SNAP: machine state restored (srvpg=%d "
             "pgown ins/pin=%u/%u, l16[0] pending=%d daemon=%d, "
@@ -10634,6 +10734,13 @@ static void mmcs_init(MachineState *machine)
              * exception-boundary emulation for slots holding live vendor
              * data. */
             cpu->env.mmcs_ilkfix_active = 1;
+        }
+        if (getenv("MMCS_L66STK")) {
+            /* L66/S218: THE LOW-ARENA STOCKER — stock the complete
+             * stock _InterlockedAPIs block (see mmcs_l66_stock_arena
+             * above) eagerly at boot; the lazy ILKFIX seed stays as
+             * the re-arm path if a guest zero-sweep clears it later. */
+            mmcs_l66_stock_arena("machine-init");
         }
         if (getenv("MMCS_RINGFIX")) {
             /* Arm the RINGFIX uHAL-ring write-drop synthesis (helper.c:
