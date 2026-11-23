@@ -7006,7 +7006,90 @@ static void mmcs_l62_scan(void)
                     owner_tcb, owner_dead);
         }
         if (!owner_dead) {
-            continue;   /* a live owner: the stock leave owns the wake */
+            /* FLAVOR B1 — THE TRANSFER-LANDED PARK: the m3-close's
+             * transfer half ALREADY ran ([lpcs+4] == the waiter's
+             * own handle — the enter-loop decode 0x90840856: the
+             * resumed waiter's own face tail compares [lpcs+4] vs
+             * [KData+8] and EXITS AS THE OWNER when they match; the
+             * owned-tail jsr fixes the recursion cells through
+             * vendor code). Only the WAKE half is owed: WAKE-ONLY,
+             * ZERO host writes. */
+            if (owner_h != heir_h || (owner_h & 0xff000000) != 0) {
+                continue;   /* a live owner: never manufacture */
+            }
+            /* 2-cadence stability keyed {waiter,crit} */
+            uint32_t key = px_th ^ (ova * 5);
+            if (mmcs_l62_key != key) {
+                mmcs_l62_key = key;
+                mmcs_l62_stable = 1;
+                fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms transfer-"
+                        "landed crit waiter seen: crit %08x waiter "
+                        "%08x heir_h %08x already at [lpcs+4] (the "
+                        "m3 transfer landed; only the wake died) "
+                        "(stability %u/2; pick %08x pcur %08x)\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                        px_th, heir_h, mmcs_l62_stable, pick, pcur);
+                return;
+            }
+            if (++mmcs_l62_stable < 2) {
+                return;
+            }
+            if (mmcs_l16_ents[7].pending) {
+                fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms evt-0x320 "
+                        "wake mid-flight - retry next cadence\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+                return;
+            }
+            uint32_t slot_cur = 0;
+            cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+            if (slot_cur != MMCS_L54_STUB_VA
+                && slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L62: slot evt 0x320 busy (%08x)"
+                        " - retry next cadence\n", slot_cur);
+                return;
+            }
+            if (mmcs_l62_diag) {
+                fprintf(stderr, "MMCS-L62(diag): shape STABLE — would "
+                        "WAKE-ONLY the transfer-landed waiter %08x "
+                        "(zero writes; the face tail exits as the "
+                        "owner); diag mode, no delivery\n", px_th);
+                return;
+            }
+            uint32_t tva = px_th;
+            cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                      sizeof mmcs_l54_stub);
+            cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+            cpu_physical_memory_write(
+                0x1F00E600 + 0x84,
+                &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+            cpu_physical_memory_write(
+                0x1F00E6F0,
+                &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+            if (slot_cur != MMCS_L54_STUB_VA) {
+                cpu_physical_memory_write(
+                    MMCS_L54_SLOT_PA,
+                    &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+            }
+            struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+            e->evt_va = tva;
+            e->stub_va = MMCS_L54_STUB_VA;
+            e->evt_code = 0x320;
+            e->slot_pa = MMCS_L54_SLOT_PA;
+            e->daemon = 1;
+            e->pending = 1;
+            mmcs_l62_total++;
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms transfer-landed "
+                    "crit wake-only %u/%u: crit %08x waiter %08x "
+                    "heir_h %08x ([lpcs+4] already the heir — the m3 "
+                    "transfer landed, the wake died with the owner; "
+                    "ZERO writes: the resumed face tail reads "
+                    "[lpcs+4]==[KData+8] and exits the enter loop as "
+                    "the owner through vendor code; markers at "
+                    "%08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                    mmcs_l62_total, mmcs_l62_max_deliv, ova, tva,
+                    heir_h, MMCS_L54_STUB_VA + 0xf0);
+            return;                 /* one delivery per cadence */
         }
         /* 2-cadence stability keyed {waiter,crit} */
         uint32_t key = px_th ^ (ova * 3);
