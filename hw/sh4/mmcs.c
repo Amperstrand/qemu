@@ -2589,6 +2589,7 @@ static uint64_t mmcs_tick_l58;
 static uint64_t mmcs_tick_l59;
 static uint64_t mmcs_tick_l56;
 static uint64_t mmcs_tick_l62;
+static uint64_t mmcs_tick_l64;
 /* L55: the WAIT-ALL chained dual-entry multi-satisfy (S203; the scan
  * body + the delivery state live down at the L54 cluster — forward
  * declarations for the tick chain) */
@@ -2766,6 +2767,34 @@ static int mmcs_l58_retired(uint32_t obj)
 static void mmcs_l59_scan(void);
 static int mmcs_l59_armed;
 static int mmcs_l60_armed;    /* MMCS_L60EV: the SignalStarted synthesis */
+/* MMCS fork (L64/S214): MMCS_L64EV — THE PACIFIC-EVENT AFTERMATH
+ * WAKE-ONLY (the L63-named generalized aftermath lane; R24 rows in
+ * the l48_fixtures). The WEDGED flavor's second park (live L63
+ * PART 4, t=39204): after B1 cleared the crit park the launcher
+ * parks BLOCKED at the GENERIC face 0x90837cf6 with the standing
+ * vendor completion pair ([th+0x1F8]!=0, [th+0x1FC]==0x1000, tmo
+ * -1) whose resolved object (the entry-layout law: obj =
+ * [head+0x14]) is the "Pacific" EVENT 906ca6d8-class (CINFO
+ * 90822040 @ obj+0xa4, self @+0xa8) — the death-close's completion
+ * half stands, the wake half died with the owner. THE FIX = the v9
+ * WAKE-ONLY, NO plants (the resumed eval consumes the head and the
+ * wait returns 0x1000 through 100% vendor code). GATES (the L63
+ * contract): 8E==0 (the L56 sticky class excluded — the double-wake
+ * hazard), the arena+cinfo+self witness (the R13-ghost family never
+ * resolves), the dead-idle world (L52b), the 2-cadence stability
+ * keyed {waiter,obj}, the shared evt-0x320 channel guards, hard cap
+ * (default 2), the tick-order contract (runs AFTER L56 and L62 in
+ * the chain). Env MMCS_L64EV (default OFF; MMCS_L64EV_MS cadence
+ * default 2000; MMCS_L64EV_MAX cap default 2; MMCS_L64EV_DIAG=1
+ * diagnose-only). Needs MMCS_TICK. */
+static void mmcs_l64_scan(void);
+static int mmcs_l64_armed;
+static int mmcs_l64_diag;
+static uint32_t mmcs_l64_cadence_ms;
+static uint32_t mmcs_l64_max_deliv = 2;
+static uint32_t mmcs_l64_total;
+static uint32_t mmcs_l64_key;
+static uint32_t mmcs_l64_stable;
 static uint32_t mmcs_l59_cadence_ms;
 static uint32_t mmcs_l59_pulses;
 static uint32_t mmcs_l56_cadence_ms;
@@ -3196,6 +3225,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l62_armed && ++mmcs_tick_l62 >= mmcs_l62_cadence_ms) {
             mmcs_tick_l62 = 0;
             mmcs_l62_scan();
+        }
+        /* L64: the Pacific-event aftermath wake (S214 — the
+         * generalized standing-completed lane, EVNT objects; runs
+         * AFTER L56/L62 per the tick-order contract) */
+        if (mmcs_l64_armed && ++mmcs_tick_l64 >= mmcs_l64_cadence_ms) {
+            mmcs_tick_l64 = 0;
+            mmcs_l64_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -7367,6 +7403,187 @@ static void mmcs_l62_scan(void)
     mmcs_l62_stable = 0;
 }
 
+/* L64/S214: the Pacific-event aftermath wake — the generalized
+ * standing-completed lane (EVNT objects; R24). See the L64EV comment
+ * block above for the decode + the gate contract. */
+static void mmcs_l64_scan(void)
+{
+    if (!mmcs_l64_armed || mmcs_l64_total >= mmcs_l64_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    if (prun != 0 || (pick != 0 && pick != pcur)) {
+        if (mmcs_l64_diag) {
+            fprintf(stderr, "MMCS-L64(diag): t=%" PRId64 "ms world "
+                    "gate: prun %08x pick %08x pcur %08x\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), prun, pick,
+                    pcur);
+        }
+        return;
+    }
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, st16, ctxpc, f1f8, t1fc, t200;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&f1f8, arena + o + 0x1f8, 4);
+        memcpy(&t1fc, arena + o + 0x1fc, 4);
+        memcpy(&t200, arena + o + 0x200, 4);
+        uint8_t susp = arena[o + 0xe];
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6      /* the generic wait face */
+            || susp != 0
+            || t200 != 0xffffffff
+            || tva == pcur              /* the L54 class owns tva==pcur */
+            || f1f8 == 0
+            || t1fc != 0x1000) {
+            continue;
+        }
+        /* the entry-layout law (the eval fn_90828244 decode): obj =
+         * [head+0x14] */
+        uint32_t pa_e = mmcs_l32_stack_pa(f1f8 + 0x14);
+        if (!pa_e) {
+            if (mmcs_l64_diag) {
+                fprintf(stderr, "MMCS-L64(diag): t=%" PRId64 "ms "
+                        "standing waiter %08x entry %08x+0x14 "
+                        "PA-UNRESOLVED\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                        f1f8);
+            }
+            continue;
+        }
+        uint32_t obj = 0;
+        cpu_physical_memory_read(pa_e, &obj, 4);
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* the R13-ghost family never
+                                     * resolves into the arena */
+        }
+        uint32_t ob = obj - 0x90680000;
+        if (ob + 0xac > sizeof arena) {
+            continue;
+        }
+        uint32_t ocinfo, oself, sig8d, sig8e;
+        memcpy(&ocinfo, arena + ob + 0xa4, 4);
+        memcpy(&oself, arena + ob + 0xa8, 4);
+        uint8_t s8d = arena[ob + 0x8d];
+        uint8_t s8e = arena[ob + 0x8e];
+        sig8d = s8d;
+        sig8e = s8e;
+        (void)sig8d;
+        if (ocinfo == 0x908220a0) {
+            continue;               /* the CRIT aftermath = R23a
+                                     * flavor A's own lane */
+        }
+        if (ocinfo != 0x90822040 || oself != obj
+            || (sig8d == 0 && sig8e == 1)) {
+            /* near-miss lines are UN-GATED (the L63 lesson: armed
+             * runs must show their skips). The excluded class =
+             * the L56 residue {8D==0, 8E==1}: the live sig ABSENT,
+             * only the sticky bit stands — L56EV's pulse lane owns
+             * it. The LIVE-SIG shape {8D==1, 8E==1} (the manual-
+             * reset SET state — the live Pacific cells, t=36200
+             * of the armed run) PASSES: a waiter on a SET
+             * manual-reset event returns immediately in stock. */
+            fprintf(stderr, "MMCS-L64: t=%" PRId64 "ms standing "
+                    "waiter %08x entry %08x obj %08x {cinfo %08x "
+                    "self %08x 8D %02x 8E %02x} - not the clean "
+                    "Pacific-EVNT aftermath (see the gate)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                    f1f8, obj, ocinfo, oself, sig8d, sig8e);
+            continue;
+        }
+        /* 2-cadence stability keyed {waiter,obj} */
+        uint32_t key = tva ^ (obj * 7);
+        if (mmcs_l64_key != key) {
+            mmcs_l64_key = key;
+            mmcs_l64_stable = 1;
+            fprintf(stderr, "MMCS-L64: t=%" PRId64 "ms Pacific-event "
+                    "aftermath waiter seen: th %08x entry %08x obj "
+                    "%08x {cinfo %08x 8D %02x 8E %02x} f1f8 %08x t1fc "
+                    "%08x (stability %u/2; pick %08x pcur %08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, f1f8,
+                    obj, ocinfo, sig8d, sig8e, f1f8, t1fc,
+                    mmcs_l64_stable, pick, pcur);
+            return;
+        }
+        if (++mmcs_l64_stable < 2) {
+            return;
+        }
+        /* channel guards (the shared evt-0x320 discipline) */
+        if (mmcs_l16_ents[7].pending) {
+            fprintf(stderr, "MMCS-L64: t=%" PRId64 "ms evt-0x320 wake "
+                    "mid-flight - retry next cadence\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+            return;
+        }
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA && slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L64: t=%" PRId64 "ms slot evt 0x320 "
+                    "busy (%08x) - retry next cadence\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), slot_cur);
+            return;
+        }
+        if (mmcs_l64_diag) {
+            fprintf(stderr, "MMCS-L64(diag): shape STABLE — would "
+                    "WAKE-ONLY the Pacific-event waiter %08x (obj "
+                    "%08x; no plants); diag mode, no delivery\n",
+                    tva, obj);
+            return;
+        }
+        /* DELIVER — the v9 WAKE-ONLY (no plants: the vendor's own
+         * completion stands; the resumed eval consumes it) */
+        uint32_t tva2 = tva;
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva2, 4);
+        cpu_physical_memory_write(
+            0x1F00E600 + 0x84,
+            &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(
+            0x1F00E6F0,
+            &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            cpu_physical_memory_write(
+                MMCS_L54_SLOT_PA,
+                &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva2;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l64_total++;
+        fprintf(stderr, "MMCS-L64: t=%" PRId64 "ms Pacific-event "
+                "aftermath wake-only %u/%u: th %08x entry %08x obj "
+                "%08x (the vendor completion pair stands {f1f8 %08x, "
+                "t1fc %08x}; 8D=%02x 8E=%02x — the L56 residue class "
+                "is {8D==0, 8E==1}; NO "
+                "plants — the resumed eval consumes the head and the "
+                "wait returns 0x1000 through vendor code; markers at "
+                "%08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l64_total,
+                mmcs_l64_max_deliv, tva2, f1f8, obj, f1f8, t1fc,
+                arena[ob + 0x8d], arena[ob + 0x8e],
+                MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no Pacific park this scan — reset the stability tracker */
+    mmcs_l64_key = 0;
+    mmcs_l64_stable = 0;
+}
+
 static void mmcs_l59_scan(void)
 {
     if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
@@ -8483,6 +8700,29 @@ static void mmcs_l16_boot_parse(void)
                 mmcs_l62_cadence_ms, mmcs_l62_max_deliv,
                 mmcs_l62_diag ? ", DIAGNOSE-ONLY" : "");
     }
+    if (getenv("MMCS_L64EV")) {
+        mmcs_l64_cadence_ms =
+            atoi(getenv("MMCS_L64EV_MS") ? : "2000");
+        if (!mmcs_l64_cadence_ms) {
+            mmcs_l64_cadence_ms = 2000;
+        }
+        mmcs_l64_max_deliv =
+            atoi(getenv("MMCS_L64EV_MAX") ? : "2");
+        if (!mmcs_l64_max_deliv) {
+            mmcs_l64_max_deliv = 2;
+        }
+        mmcs_l64_diag = getenv("MMCS_L64EV_DIAG") != NULL;
+        mmcs_l64_armed = 1;
+        fprintf(stderr, "MMCS-L64: Pacific-event aftermath wake armed "
+                "(cadence %ums, cap %u%s — the R24 generalized "
+                "standing-completed lane: the BLOCKED generic-face "
+                "waiter with the vendor completion pair {f1f8, "
+                "t1fc=1000} whose object is an EVNT {CINFO 90822040, "
+                "8E clear}; the v9 WAKE-ONLY, no plants; runs AFTER "
+                "L56/L62 per the tick-order contract)\n",
+                mmcs_l64_cadence_ms, mmcs_l64_max_deliv,
+                mmcs_l64_diag ? ", DIAGNOSE-ONLY" : "");
+    }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
         if (!mmcs_l42_cadence_ms) {            mmcs_l42_cadence_ms = 500;
@@ -9157,6 +9397,17 @@ static int mmcs_machine_post_load(void *opaque, int version_id)
         mmcs_2dg_present_console(mmcs_2dg.surf_a
                                  ? (mmcs_2dg.surf_a & 0x1FFFFFFF)
                                  : (mmcs_2dg.tex & 0x1FFFFFFF));
+    }
+    /* L64: re-apply the S214 death-site trapa AFTER the restore — the
+     * incoming migration RAM load overwrites the flash image (the patch
+     * applied at machine-init is gone), and no TBs exist yet post-
+     * migration, so the patched site re-translates clean. */
+    if (getenv("MMCS_S214DBG")) {
+        uint16_t trapa72 = 0xC372;
+        hwaddr off = (0x90a82000 - 0x90800000) + (0xc02cdbee - 0xc02c1000);
+        cpu_physical_memory_write(MMCS_FLASH_BASE + off, &trapa72, 2);
+        fprintf(stderr, "MMCS-SNAP: S214 death-site trapa re-applied "
+                "post-restore\n");
     }
     fprintf(stderr, "MMCS-SNAP: machine state restored (srvpg=%d "
             "pgown ins/pin=%u/%u, l16[0] pending=%d daemon=%d, "
@@ -10360,6 +10611,22 @@ static void mmcs_init(MachineState *machine)
             hwaddr off = (0x90942000 - 0x90800000) + (0xC00C9FF4 - 0xC00B1000);
             cpu_physical_memory_write(MMCS_FLASH_BASE + off, &trapa71, 2);
             fprintf(stderr, "MMCS: REGFIX trapa hook @0xC00C9FF4\n");
+        }
+        if (getenv("MMCS_S214DBG")) {
+            /* L64: THE RunApps DEATH SITE catch (diagnostic, default
+             * off) — fsdmgr.dll's FSD-interface forwarder thunk at
+             * runtime c02cdbc0 (ROM 90a8ebc2); its jsr @r3 at runtime
+             * c02cdbee (ROM 90a8ebee) becomes trapa #0x72. helper.c
+             * prints the live register file + the descriptor dump and
+             * reconstructs the stock jsr exactly (pr := site+4,
+             * pc := r3) — passive tape, the world runs on. */
+            uint16_t trapa72 = 0xC372;
+            /* fsdmgr .text ROM dataptr = 0x90a82000, VA base 0xc02c1000 */
+            hwaddr off = (0x90a82000 - 0x90800000)
+                       + (0xc02cdbee - 0xc02c1000);
+            cpu_physical_memory_write(MMCS_FLASH_BASE + off, &trapa72, 2);
+            fprintf(stderr, "MMCS: S214 death-site trapa hook "
+                    "@ROM 0x90a8ebee\n");
         }
         if (getenv("MMCS_ILKFIX")) {
             /* Arm the ILKFIX interlocked-op emulation (see helper.c
