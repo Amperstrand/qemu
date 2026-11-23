@@ -2588,6 +2588,7 @@ static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
 static uint64_t mmcs_tick_l59;
 static uint64_t mmcs_tick_l56;
+static uint64_t mmcs_tick_l62;
 /* L55: the WAIT-ALL chained dual-entry multi-satisfy (S203; the scan
  * body + the delivery state live down at the L54 cluster — forward
  * declarations for the tick chain) */
@@ -2678,6 +2679,60 @@ static int mmcs_l58_armed;
 static uint32_t mmcs_l58_cadence_ms;
 static uint32_t mmcs_l58_total;
 static uint32_t mmcs_l58_done[8];
+
+/* MMCS fork (L62/S213): MMCS_L62EV — THE DEAD-OWNER CRIT RELEASE
+ * (the stock m3-close shape: transfer the ownership to the waiting
+ * heir + wake; the L62 recipe delivered).
+ *
+ * THE S213 DECODE (this session, Verified disasm + the live probes):
+ * the loader crit 906fe3f0 = a kernel CRIT object (CINFO 0x908220a0
+ * "CRIT", type 0x0c; the trailer {+0x94 state word, +0x98 lpcs ptr,
+ * +0xa4 CINFO, +0xa8 self}). Its user-side CRITICAL_SECTION (lpcs)
+ * sits at [crit+0x98] = d0040020 — ON THE DEAD OWNER'S KSTACK. The
+ * enter path (fn_90840754): builds the proxy on the waiter's stack
+ * (bType 12, tmo [th+0x200]:=-1), links it into the crit's priority
+ * buckets, and BLOCKS at the park face 0x90840814; the retry tail
+ * re-reads [lpcs+4] (the owner handle) vs [KData+8] (hCurThread) and
+ * only exits the loop AS THE OWNER. The stock release = the CRIT
+ * method[3] 0x908408bc: fn_90828a08 + the fn_90828a68 pop loop
+ * (writes [lpcs+0]:=1, [lpcs+4]:=[heir th+0x3C], [lpcs+0xC]:=0,
+ * byte[crit+0x94]:=0 free, the bucket/pProxList clears, wCount++,
+ * [th+0x1F4]:=proxy) + MakeRunIfNeeded — the WAKE half. THE DISEASE
+ * (live, t=110s stable): the owner (the RunApps thread 906dcacc,
+ * handle 0x00570002 in [lpcs+4]) died into the kill grave holding
+ * the crit (state 0x8000fb01, the launcher 906ca240's proxy linked
+ * at bucket+0x08/pProxList+0x84) — the close NEVER ran: the waiter
+ * sits BLOCKED at 0x90840814 forever, [lpcs+4] frozen at the dead
+ * handle.
+ *
+ * THE FIX — the stock-shaped release, host-written exactly where the
+ * vendor writes it, then the WAKE through the proven v9 channel
+ * (MakeRun + the resched protocol + pick + the vendor switcher —
+ * the L54 recipe): the resumed waiter's own retry tail reads
+ * [lpcs+4] == its handle ([KData+8] as pcur) and exits the loop as
+ * the owner through 100% vendor code.
+ *
+ * Filter (R23, the l48_fixtures l63 rows, CRIT-CENTRIC): an arena
+ * object with the CRIT trailer {+0xa4 == 0x908220a0, +0xa8 == self},
+ * the OWNED state ((state&0xffff0000)==0x80000000 && low16 != 0),
+ * a queued proxy ([crit+0x84] != 0, P3-resolved, pTh [proxy+0x1C]
+ * == the waiter tva), the waiter BLOCKED (st16&3)==2 at the enter
+ * face 0x90840814 with susp 0 and tmo -1, and THE DEAD-OWNER PROOF:
+ * the owner handle [lpcs+4] resolves an arena thread carrying a
+ * GRAVE state16 ({0x58,0x18} or the DEAD bit 8 or the kill-grave ctx
+ * 0x9083c102). Dead-idle world gate (L52b), 2-cadence stability
+ * keyed {thread,crit}, hard cap (default 2), slot-guarded evt 0x320
+ * (ents[7]). Env MMCS_L62EV (default OFF; MMCS_L62EV_MS cadence
+ * default 2000; MMCS_L62EV_MAX cap default 2; MMCS_L62EV_DIAG=1
+ * diagnose-only). Needs MMCS_TICK. */
+static void mmcs_l62_scan(void);
+static int mmcs_l62_armed;
+static int mmcs_l62_diag;
+static uint32_t mmcs_l62_cadence_ms;
+static uint32_t mmcs_l62_max_deliv = 2;
+static uint32_t mmcs_l62_total;
+static uint32_t mmcs_l62_key;       /* stability key {thread,obj} */
+static uint32_t mmcs_l62_stable;
 
 static int mmcs_l58_retired(uint32_t obj)
 {
@@ -3135,6 +3190,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l59_armed && ++mmcs_tick_l59 >= mmcs_l59_cadence_ms) {
             mmcs_tick_l59 = 0;
             mmcs_l59_scan();
+        }
+        /* L62: the dead-owner crit release (S213 — wake-only the
+         * standing-completed BLOCKED crit waiter) */
+        if (mmcs_l62_armed && ++mmcs_tick_l62 >= mmcs_l62_cadence_ms) {
+            mmcs_tick_l62 = 0;
+            mmcs_l62_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -6766,6 +6827,309 @@ static void mmcs_l58_scan(void)
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, pcur, f1f8);
 }
 
+static void mmcs_l62_scan(void)
+{
+    if (!mmcs_l62_armed || mmcs_l62_total >= mmcs_l62_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    /* THE DEAD-IDLE WORLD GATE (the L52b refinement, verbatim) */
+    if (prun != 0 || (pick != 0 && pick != pcur)) {
+        if (mmcs_l62_diag) {
+            fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms world "
+                    "gate: prun %08x pick %08x pcur %08x\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), prun, pick,
+                    pcur);
+        }
+        return;
+    }
+    /* THE CINFO-ANCHORED SCAN: the CRIT trailer wobbles across heap
+     * generations (the proxy list head read +0x84 in the L62-walk
+     * instance, +0x88 in the current one — live-caught), so anchor
+     * on the CINFO cell itself: [cinfo+4] = pvObj = the crit base
+     * (the self-witness), state = [cinfo-0x10], lpcs = [cinfo-0xc];
+     * the queued proxy is found through the PRIORITY BUCKETS
+     * (crit+0x00..+0x7F — the vendor fn_90828a68's own resolution
+     * walk), never through a hardcoded list-head offset. */
+    for (uint32_t o = 0x10; o + 8 <= sizeof arena; o += 4) {
+        uint32_t cinfo;
+        memcpy(&cinfo, arena + o, 4);
+        if (cinfo != 0x908220a0) {
+            continue;
+        }
+        uint32_t ova;
+        memcpy(&ova, arena + o + 4, 4);
+        if (ova < 0x90680000 || ova >= 0x90780000 || (ova & 3)) {
+            continue;               /* pvObj self-witness failed */
+        }
+        uint32_t oo = ova - 0x90680000;
+        if (oo + 0x90 > sizeof arena) {
+            continue;
+        }
+        uint32_t ostate, lpcs;
+        memcpy(&ostate, arena + o - 0x10, 4);
+        memcpy(&lpcs, arena + o - 0xc, 4);
+        /* the OWNED state: base 0x80000000 with the low bits set —
+         * a FREE crit (low16==0) owes nobody anything */
+        if ((ostate & 0xffff0000u) != 0x80000000u
+            || (ostate & 0xffff) == 0
+            || lpcs < 0xD0000000 || lpcs >= 0xDC000000) {
+            if (mmcs_l62_diag) {
+                fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms crit "
+                        "%08x not-owned/free {state %08x lpcs %08x} "
+                        "- skip\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                        ostate, lpcs);
+            }
+            continue;
+        }
+        /* the queued proxy: the priority-bucket walk */
+        uint32_t proxlist = 0, pa_px = 0, px_th = 0;
+        for (uint32_t k = 0; k < 32; k++) {
+            uint32_t bk;
+            memcpy(&bk, arena + oo + 4 * k, 4);
+            if (bk < 0xD0000000 || bk >= 0xDC000000) {
+                continue;
+            }
+            uint32_t pa = mmcs_l32_stack_pa(bk);
+            if (!pa) {
+                if (mmcs_l62_diag) {
+                    fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms "
+                            "crit %08x bucket[%u] %08x PA-UNRESOLVED\n",
+                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                            k, bk);
+                }
+                continue;
+            }
+            uint32_t th = 0;
+            cpu_physical_memory_read(pa + 0x1c, &th, 4);
+            if (th < 0x90680000 || th >= 0x90780000) {
+                if (mmcs_l62_diag) {
+                    fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms "
+                            "crit %08x bucket[%u] %08x pTh %08x "
+                            "NOT-TCB\n",
+                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                            k, bk, th);
+                }
+                continue;
+            }
+            proxlist = bk;
+            pa_px = pa;
+            px_th = th;
+            break;                  /* the first resolvable bucket */
+        }
+        if (!proxlist) {
+            if (mmcs_l62_diag) {
+                fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms crit "
+                        "%08x owned but NO resolvable queued proxy "
+                        "{state %08x lpcs %08x}\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                        ostate, lpcs);
+            }
+            continue;               /* no resolvable queued proxy */
+        }
+        uint32_t to = px_th - 0x90680000;
+        if (to + 0x220 > sizeof arena) {
+            continue;
+        }
+        uint32_t st16, ctxpc, kbase, ksz, tmo, heir_h;
+        memcpy(&st16, arena + to + 0xc, 4);
+        memcpy(&ctxpc, arena + to + 0xb4, 4);
+        memcpy(&kbase, arena + to + 0x20, 4);
+        memcpy(&ksz, arena + to + 0x24, 4);
+        memcpy(&tmo, arena + to + 0x200, 4);
+        memcpy(&heir_h, arena + to + 0x3c, 4);
+        uint8_t susp = arena[to + 0xe];
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || ctxpc != 0x90840814     /* the CRIT-enter park face */
+            || (st16 & 3) != 2
+            || susp != 0
+            || tmo != 0xffffffff
+            || (heir_h & 0xff000000) != 0) {   /* a 00xxxxxx handle */
+            if (mmcs_l62_diag) {
+                fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms crit "
+                        "%08x waiter %08x SHAPE-MISS {st16 %08x ctx "
+                        "%08x kbase %08x ksz %08x susp %u tmo %08x "
+                        "heir %08x}\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                        px_th, st16, ctxpc, kbase, ksz, susp, tmo,
+                        heir_h);
+            }
+            continue;
+        }
+        /* THE DEAD-OWNER PROOF: the lpcs owner handle resolves an
+         * arena thread in a GRAVE state */
+        uint32_t pa_own = mmcs_l32_stack_pa(lpcs + 4);
+        if (!pa_own) {
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms crit %08x "
+                    "waiter %08x at the enter face — lpcs %08x+4 "
+                    "PA-UNRESOLVED\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova,
+                    px_th, lpcs);
+            continue;
+        }
+        uint32_t owner_h = 0;
+        cpu_physical_memory_read(pa_own, &owner_h, 4);
+        int owner_dead = 0;
+        uint32_t owner_tcb = 0;
+        if ((owner_h & 0xff000000) == 0 && owner_h != heir_h) {
+            for (uint32_t oi = 0; oi + 0xb8 <= sizeof arena; oi += 4) {
+                uint32_t h;
+                memcpy(&h, arena + oi + 0x3c, 4);
+                if (h != owner_h) {
+                    continue;
+                }
+                uint32_t ost, opcc;
+                memcpy(&ost, arena + oi + 0xc, 4);
+                memcpy(&opcc, arena + oi + 0xb4, 4);
+                if (ost == 0x58 || ost == 0x18 || (ost & 8)
+                    || opcc == 0x9083c102) {
+                    owner_dead = 1;
+                    owner_tcb = 0x90680000 + oi;
+                }
+                break;
+            }
+        }
+        if (mmcs_l62_diag) {
+            fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms crit %08x "
+                    "{state %08x lpcs %08x proxlist %08x} waiter %08x "
+                    "st16=%08x heir_h %08x owner_h %08x (tcb %08x) "
+                    "dead=%d\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova, ostate,
+                    lpcs, proxlist, px_th, st16, heir_h, owner_h,
+                    owner_tcb, owner_dead);
+        }
+        if (!owner_dead) {
+            continue;   /* a live owner: the stock leave owns the wake */
+        }
+        /* 2-cadence stability keyed {waiter,crit} */
+        uint32_t key = px_th ^ (ova * 3);
+        if (mmcs_l62_key != key) {
+            mmcs_l62_key = key;
+            mmcs_l62_stable = 1;
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms dead-owner crit "
+                    "seen: crit %08x waiter %08x owner_h %08x (tcb "
+                    "%08x) lpcs %08x state %08x (stability %u/2; pick "
+                    "%08x pcur %08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ova, px_th,
+                    owner_h, owner_tcb, lpcs, ostate, mmcs_l62_stable,
+                    pick, pcur);
+            return;
+        }
+        if (++mmcs_l62_stable < 2) {
+            return;
+        }
+        /* CHANNEL GUARDS FIRST (the R23 'channel busy -> WAIT'
+         * ordering — the m3-close writes are NOT idempotent, they
+         * must never be abandoned half-done: a wake mid-flight or a
+         * foreign slot holder means retry NEXT cadence with the
+         * world untouched) */
+        if (mmcs_l16_ents[7].pending) {
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms evt-0x320 wake "
+                    "mid-flight - retry next cadence\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+            return;
+        }
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA && slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L62: slot evt 0x320 busy (%08x) - "
+                    "retry next cadence\n", slot_cur);
+            return;
+        }
+        if (mmcs_l62_diag) {
+            fprintf(stderr, "MMCS-L62(diag): shape STABLE — would "
+                    "release crit %08x to heir %08x; diag mode, no "
+                    "delivery\n", ova, px_th);
+            return;
+        }
+        /* DELIVER — the stock m3-close writes, exactly where the
+         * vendor writes them (fn_90828a68 + fn_90828a08), then the
+         * v9 WAKE (the state flip via the stub's own MakeRun) */
+        uint32_t pa_l0 = mmcs_l32_stack_pa(lpcs);
+        uint32_t pa_lC = mmcs_l32_stack_pa(lpcs + 0xc);
+        if (pa_l0) {
+            cpu_physical_memory_write(pa_l0, &(uint32_t){ 1 }, 4);
+        }
+        cpu_physical_memory_write(pa_own, &heir_h, 4);
+        if (pa_lC) {
+            cpu_physical_memory_write(pa_lC, &(uint32_t){ 0 }, 4);
+        }
+        /* the state clear, CINFO-anchored (the wobble-proof cell):
+         * the state cell's arena offset = (o - 0x10) */
+        cpu_physical_memory_write(0x10680000 + (o - 0x10),
+                                  &(uint32_t){ 0x80000000 }, 4);
+        /* every queued-reference cell that carries the proxy
+         * (buckets + the wobbly list head(s)) — surgical, only
+         * cells that EQUAL the proxy */
+        for (uint32_t k = 0; k < 0x24; k++) {
+            uint32_t bk;
+            memcpy(&bk, arena + oo + 4 * k, 4);
+            if (bk == proxlist) {
+                cpu_physical_memory_write(ova - 0x80000000 + 4 * k,
+                                          &(uint32_t){ 0 }, 4);
+            }
+        }
+        cpu_physical_memory_write(pa_px + 0xc, &(uint32_t){ 0 }, 4);
+        uint16_t wc;
+        memcpy(&wc, arena + to + 0x42, 2);
+        wc++;
+        cpu_physical_memory_write(px_th - 0x80000000 + 0x42, &wc, 2);
+        cpu_physical_memory_write(px_th - 0x80000000 + 0x1f4,
+                                  &proxlist, 4);
+        /* THE V9 WAKE (the L54 recipe verbatim). NOTE: the v9 (not
+         * the v10 requeue) is CORRECT here — the outgoing current
+         * at the settled park is the devmgr's PARKED 500ms sleeper
+         * (BLOCKED-class, stock-parked: its wake comes from the
+         * SleepList timeout, never the run queue), not the S206
+         * RUNNING-class interrupted submitter MakeRun(old) exists
+         * for */
+        uint32_t tva = px_th;
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(
+            0x1F00E600 + 0x84,
+            &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(
+            0x1F00E6F0,
+            &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            cpu_physical_memory_write(
+                MMCS_L54_SLOT_PA,
+                &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l62_total++;
+        fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms dead-owner crit "
+                "release %u/%u: crit %08x waiter %08x heir_h %08x "
+                "(owner_h %08x tcb %08x was the grave; the stock "
+                "m3-close writes: lpcs{%08x:=1, +4:=%08x, +c:=0} + "
+                "state 80000000 + buckets/proxlist cleared + wCount++ "
+                "+ the v9 wake; the heir's own retry tail exits the "
+                "loop as the owner; markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l62_total,
+                mmcs_l62_max_deliv, ova, tva, heir_h, owner_h,
+                owner_tcb, lpcs, heir_h, MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no dead-owner crit this scan — reset the stability tracker */
+    mmcs_l62_key = 0;
+    mmcs_l62_stable = 0;
+}
+
 static void mmcs_l59_scan(void)
 {
     if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
@@ -7859,6 +8223,28 @@ static void mmcs_l16_boot_parse(void)
                     "decode: the stock advance needs the started bit "
                     "AND the event SET)\n");
         }
+    }
+    if (getenv("MMCS_L62EV")) {
+        mmcs_l62_cadence_ms =
+            atoi(getenv("MMCS_L62EV_MS") ? : "2000");
+        if (!mmcs_l62_cadence_ms) {
+            mmcs_l62_cadence_ms = 2000;
+        }
+        mmcs_l62_max_deliv =
+            atoi(getenv("MMCS_L62EV_MAX") ? : "2");
+        if (!mmcs_l62_max_deliv) {
+            mmcs_l62_max_deliv = 2;
+        }
+        mmcs_l62_diag = getenv("MMCS_L62EV_DIAG") != NULL;
+        mmcs_l62_armed = 1;
+        fprintf(stderr, "MMCS-L62: dead-owner crit release armed "
+                "(cadence %ums, cap %u%s — the R23 m3-close shape: "
+                "the OWNED crit {CINFO 908220a0, state 0x8000xxxx, "
+                "lpcs on the D0 grave} + the queued BLOCKED heir at "
+                "the enter face 90840814 -> the stock release writes "
+                "+ the v9 wake; S213)\n",
+                mmcs_l62_cadence_ms, mmcs_l62_max_deliv,
+                mmcs_l62_diag ? ", DIAGNOSE-ONLY" : "");
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
