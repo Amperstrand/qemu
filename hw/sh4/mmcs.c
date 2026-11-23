@@ -9693,6 +9693,15 @@ static void mmcs_init(MachineState *machine)
      * Default off; the default boot never creates the SCIF. */
     mmcs_input_init();
 
+    /* MMCS_SDHI: the drafted SDHI0/1 empty-slot model. The creation gate
+     * lives at TOP LEVEL (hoisted from the MMCS_LINUX block 2026-11-23,
+     * the device-qtest lane): default OFF => zero behavior change in
+     * every world; MMCS_SDHI=1 now arms the model outside the Linux
+     * loader so the qtest contract (tests/qtest/mmcs-sdhi-test.c) runs. */
+    if (mmcs_env_on("MMCS_SDHI")) {
+        mmcs_sdhi_init();
+    }
+
     /* MLD acceptance-test mode (env MMCS_MLD=1): skip the OS boot entirely —
      * map the loader RAM image, our payload, and the test stub at phys 0.
      * MMCS_PAYLOAD = container file (mapped at phys 0x0A000000),
@@ -9996,9 +10005,7 @@ static void mmcs_init(MachineState *machine)
          * 0xffe4c000 + evt2irq(0xAE0) — the tmio/renesas_sdhi driver
          * probing our empty-slot model is the designed-semantics
          * oracle (clean enumeration, no card). */
-        if (mmcs_env_on("MMCS_SDHI")) {
-            mmcs_sdhi_init();
-        }
+        /* (gate hoisted to top-level init, 2026-11-23) */
 
         /* load the kernel: ELF (paddr from program headers) or flat bin */
         kf = fopen(kern, "rb");
