@@ -7125,6 +7125,156 @@ static void mmcs_l62_scan(void)
                 owner_tcb, lpcs, heir_h, MMCS_L54_STUB_VA + 0xf0);
         return;                     /* one delivery per cadence */
     }
+    /* FLAVOR A — THE STANDING-COMPLETED GENERIC PARK (the death-close
+     * aftermath, the f3b6d51 decode): the waiter BLOCKED at the
+     * generic face 0x90837cf6 whose completed-list head [th+0x1F8]
+     * STANDS (the stock death-close wrote it + the result cache
+     * [th+0x1FC]:=0x1000) but the WAKE half died with the owner —
+     * nobody ever reschedules the thread to run its own eval. The
+     * resolved object (the completed entry's +0xC) = a CRIT in the
+     * FREE state (0x80000000) with the D0-grave owner ctx. THE FIX =
+     * the v9 WAKE-ONLY, NO plants: the resumed thread's own eval
+     * consumes the head and the wait returns 0x1000 through 100%
+     * vendor code (the L54/L55 class discipline; the waiter then
+     * walks to the crit-enter face where FLAVOR B takes over). */
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, st16, ctxpc, f1f8, t1fc, t200;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&f1f8, arena + o + 0x1f8, 4);
+        memcpy(&t1fc, arena + o + 0x1fc, 4);
+        memcpy(&t200, arena + o + 0x200, 4);
+        uint8_t susp = arena[o + 0xe];
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || (st16 & 3) != 2
+            || ctxpc != 0x90837cf6      /* the generic wait face */
+            || susp != 0
+            || t200 != 0xffffffff
+            || tva == pcur              /* the L54 class owns tva==pcur */
+            || f1f8 == 0                /* no standing head = not the aftermath */
+            || t1fc != 0x1000) {        /* the pair must be vendor-shaped */
+            continue;
+        }
+        /* resolve the completed entry's object: {obj @+0xC} */
+        uint32_t pa_e = mmcs_l32_stack_pa(f1f8 + 0xc);
+        if (!pa_e) {
+            if (mmcs_l62_diag) {
+                fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms "
+                        "standing waiter %08x entry %08x+0xc "
+                        "PA-UNRESOLVED\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                        f1f8);
+            }
+            continue;
+        }
+        uint32_t obj = 0;
+        cpu_physical_memory_read(pa_e, &obj, 4);
+        if (obj < 0x90680000 || obj >= 0x90780000) {
+            continue;               /* not an arena object */
+        }
+        uint32_t ob = obj - 0x90680000;
+        if (ob + 0xac > sizeof arena) {
+            continue;
+        }
+        uint32_t ocinfo, oself, ostate, octx;
+        memcpy(&ocinfo, arena + ob + 0xa4, 4);
+        memcpy(&oself, arena + ob + 0xa8, 4);
+        memcpy(&ostate, arena + ob + 0x94, 4);
+        memcpy(&octx, arena + ob + 0x98, 4);
+        if (ocinfo != 0x908220a0 || oself != obj
+            || ostate != 0x80000000
+            || octx < 0xD0000000 || octx >= 0xDC000000) {
+            /* the owned flavor = FLAVOR B's world; the healthy
+             * gwes-code owner ctx = a live owner class; the non-CRIT
+             * object = the L55/L59 event lanes */
+            if (mmcs_l62_diag) {
+                fprintf(stderr, "MMCS-L62(diag): t=%" PRId64 "ms "
+                        "standing waiter %08x entry %08x obj %08x "
+                        "{cinfo %08x self %08x state %08x octx %08x} "
+                        "- not the free-crit aftermath\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                        f1f8, obj, ocinfo, oself, ostate, octx);
+            }
+            continue;
+        }
+        /* 2-cadence stability keyed {waiter,obj} */
+        uint32_t key = tva ^ (obj * 3);
+        if (mmcs_l62_key != key) {
+            mmcs_l62_key = key;
+            mmcs_l62_stable = 1;
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms standing-"
+                    "completed crit waiter seen: th %08x entry %08x "
+                    "obj %08x (free, octx %08x the grave; f1f8 %08x "
+                    "t1fc %08x) (stability %u/2; pick %08x pcur "
+                    "%08x)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, f1f8,
+                    obj, octx, f1f8, t1fc, mmcs_l62_stable, pick,
+                    pcur);
+            return;
+        }
+        if (++mmcs_l62_stable < 2) {
+            return;
+        }
+        /* channel guards (the shared evt-0x320 discipline) */
+        if (mmcs_l16_ents[7].pending) {
+            fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms evt-0x320 wake "
+                    "mid-flight - retry next cadence\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+            return;
+        }
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA && slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L62: slot evt 0x320 busy (%08x) - "
+                    "retry next cadence\n", slot_cur);
+            return;
+        }
+        if (mmcs_l62_diag) {
+            fprintf(stderr, "MMCS-L62(diag): shape STABLE — would "
+                    "WAKE-ONLY the standing waiter %08x (no plants); "
+                    "diag mode, no delivery\n", tva);
+            return;
+        }
+        /* DELIVER — the v9 WAKE-ONLY (no plants: the vendor's own
+         * completion stands; the resumed eval consumes it) */
+        uint32_t tva2 = tva;
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva2, 4);
+        cpu_physical_memory_write(
+            0x1F00E600 + 0x84,
+            &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(
+            0x1F00E6F0,
+            &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            cpu_physical_memory_write(
+                MMCS_L54_SLOT_PA,
+                &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva2;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l62_total++;
+        fprintf(stderr, "MMCS-L62: t=%" PRId64 "ms standing-completed "
+                "crit wake-only %u/%u: th %08x entry %08x obj %08x "
+                "(the vendor's completion pair stands {f1f8 %08x, "
+                "t1fc %08x}; NO plants — the resumed eval consumes "
+                "the head and the wait returns 0x1000 through vendor "
+                "code; markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l62_total,
+                mmcs_l62_max_deliv, tva2, f1f8, obj, f1f8, t1fc,
+                MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
     /* no dead-owner crit this scan — reset the stability tracker */
     mmcs_l62_key = 0;
     mmcs_l62_stable = 0;
