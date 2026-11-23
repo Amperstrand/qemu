@@ -423,6 +423,112 @@ void superh_cpu_do_interrupt(CPUState *cs)
      * (P2 0xBF00FF00) STAYS — it is the stub-page provider for
      * the HDEVT/L16EV/L26EV/L32EV daemons (mmcs.c). The L11
      * decode lives in git history.) */
+    /* MMCS fork (L64): MMCS_S214DBG — THE RunApps DEATH SITE CATCH
+     * (diagnostic, default off). The death under decode: the startup
+     * thread dies at fsdmgr's FSD-interface forwarder thunk (runtime
+     * c02cdbc0 = ROM 90a8ebc2): `mov.l @(12,r2),r4; add #72,r2;
+     * mov.l @r2,r3; jsr @r3` — the [desc+0x48] method cell (FSD table
+     * slot 18; the thunk forwards 4 reg + 5 stack args = the 9-arg
+     * FsIoControlW shape) resolved to garbage. mmcs.c patches that jsr
+     * (ROM 90a8ebee) into `trapa #0x72`; arm 1 here prints the live
+     * register file + the full descriptor dump (desc = r2-0x48: the
+     * FSD function table + the [desc+0xC] context arg the FSD receives)
+     * + the method target's own first words (mapped? which module?),
+     * then RECONSTRUCTS the stock jsr exactly (pr := 0xc02cdbf2 =
+     * site+4, pc := r3) so the world runs on unperturbed — every pass
+     * through the thunk is taped, the death pass included. Arm 2 tapes
+     * the death-moment fault family: any kernel-mode fetch/prot-class
+     * exception whose pc is not plausible code (the garbage-jump
+     * class). Arm 3 tapes every kernel-mode exception taken by the
+     * watched thread (MMCS_S214_TH, default 906dcacc = the RunApps
+     * corpse) — catches a crash INSIDE a plausible-looking method. */
+    if (do_exp && (env->sr & (1u << SR_MD)) && getenv("MMCS_S214DBG")) {
+        static int ns214call, ns214flt, ns214th;
+        if (cs->exception_index == 0x160 && env->tra == (0x72u << 2)
+            && ns214call < 400) {
+            uint32_t pth = 0;
+            uint32_t r2 = env->gregs[2], r3 = env->gregs[3];
+            uint32_t desc = r2 - 0x48;
+            uint32_t pa, w;
+            int i;
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            fprintf(stderr, "MMCS-S214 call %d: pth=%08x desc=%08x "
+                    "r3(method)=%08x pr=%08x r4=%08x r5=%08x r6=%08x "
+                    "r7=%08x\n", ns214call++, pth, desc, r3, env->pr,
+                    env->gregs[4], env->gregs[5], env->gregs[6],
+                    env->gregs[7]);
+            pa = mmcs_utlb_va2pa(env, desc);
+            if (!pa) {
+                pa = mmcs_stack_va2pa(desc);
+            }
+            if (pa) {
+                fprintf(stderr, "MMCS-S214 desc@pa=%08x:", pa);
+                for (i = 0; i <= 0x50; i += 4) {
+                    cpu_physical_memory_read(pa + i, &w, 4);
+                    fprintf(stderr, " +%02x=%08x", i, w);
+                }
+                fprintf(stderr, "\n");
+            } else {
+                fprintf(stderr, "MMCS-S214 desc %08x UNRESOLVED\n", desc);
+            }
+            pa = mmcs_utlb_va2pa(env, r3);
+            if (!pa) {
+                pa = mmcs_stack_va2pa(r3);
+            }
+            if (pa) {
+                fprintf(stderr, "MMCS-S214 method@pa=%08x:", pa);
+                for (i = 0; i < 8; i += 4) {
+                    cpu_physical_memory_read(pa + i, &w, 4);
+                    fprintf(stderr, " +%x=%08x", i, w);
+                }
+                fprintf(stderr, "\n");
+            } else {
+                fprintf(stderr, "MMCS-S214 method %08x UNMAPPED\n", r3);
+            }
+            /* the stock jsr, reconstructed: pr = site+4, pc = r3 */
+            env->pr = 0xc02cdbf2;
+            env->pc = r3;
+            cs->exception_index = -1;
+            return;
+        }
+        if ((cs->exception_index == 0x040 || cs->exception_index == 0x060
+             || cs->exception_index == 0x0a0 || cs->exception_index == 0x0c0
+             || cs->exception_index == 0x0e0)
+            && !mmcs_plausible_code(env->pc) && ns214flt < 64) {
+            uint32_t pth = 0;
+            int i;
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            fprintf(stderr, "MMCS-S214 FAULT evt=%03x pc=%08x tea=%08x "
+                    "ssr=%08x spc=%08x pr=%08x pth=%08x regs:",
+                    cs->exception_index, env->pc, env->tea, env->ssr,
+                    env->spc, env->pr, pth);
+            for (i = 0; i < 16; i++) {
+                fprintf(stderr, " r%d=%08x", i, env->gregs[i]);
+            }
+            fprintf(stderr, "\n");
+            ns214flt++;
+        }
+        {
+            static uint32_t s214_th;
+            static int s214_th_parsed;
+            uint32_t pth = 0;
+            if (!s214_th_parsed) {
+                const char *t = getenv("MMCS_S214_TH");
+                s214_th = t ? strtoul(t, NULL, 16) : 0x906dcaccu;
+                s214_th_parsed = 1;
+            }
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            if (pth == s214_th && ns214th < 300
+                && cs->exception_index != 0x160) {
+                fprintf(stderr, "MMCS-S214 TH-EXC evt=%03x pc=%08x "
+                        "tea=%08x spc=%08x pr=%08x r2=%08x r3=%08x "
+                        "r15=%08x\n", cs->exception_index, env->pc,
+                        env->tea, env->spc, env->pr, env->gregs[2],
+                        env->gregs[3], env->gregs[15]);
+                ns214th++;
+            }
+        }
+    }
     /* MMCS fork (L44): MMCS_L44DBG — the memset-guard death-class
      * diagnostic (default off). Static decode (L44, entry-anchored
      * disasm): 0xc005fb6c is memset's OWN 4-byte fill store
