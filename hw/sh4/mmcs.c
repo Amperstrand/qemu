@@ -2506,6 +2506,10 @@ static void mmcs_l26_scan(void);
 static int mmcs_l26_armed;
 static int mmcs_l26m_armed;
 static uint32_t mmcs_l26_cadence_ms = 2000;
+/* L68/S219: the live KData user page (MMCS_L68KD; full block below) */
+int mmcs_l68_kd_on(void);
+uint32_t mmcs_l68_kdata_page_pa(void);
+void mmcs_l68_repin_kdata_page(void);
 static uint32_t mmcs_l32_stack_pa(uint32_t va);  /* L40: the L26M guard */
 static uint32_t mmcs_l26_max_deliv = 64;
 /* L36: the post-exit requeue daemon (full block + decode below) */
@@ -9372,9 +9376,16 @@ void mmcs_l66_stock_arena(const char *when);
 void mmcs_l66_stock_arena(const char *when)
 {
     int stocked = 0, repaired = 0, busy = 0;
+    /* L68/S219: under MMCS_L68KD the block's home is the LIVE KData
+     * page (KData+0x380), not the legacy scratch page 0x0C020000. */
+    uint32_t base = 0x0C020B80;
+    uint32_t l68pa = mmcs_l68_kd_on() ? mmcs_l68_kdata_page_pa() : 0;
+    if (l68pa) {
+        base = l68pa + 0xB80;
+    }
     for (int off = 0; off < 0x80; off += 16) {
         uint8_t cur[16];
-        cpu_physical_memory_read(0x0C020B80 + off, cur, 16);
+        cpu_physical_memory_read(base + off, cur, 16);
         bool zero = true, poison = false;
         for (int j = 0; j < 16; j++) {
             if (cur[j]) { zero = false; break; }
@@ -9388,7 +9399,7 @@ void mmcs_l66_stock_arena(const char *when)
             }
         }
         if (zero || poison) {
-            cpu_physical_memory_write(0x0C020B80 + off,
+            cpu_physical_memory_write(base + off,
                                       mmcs_l66_block + off, 16);
             if (poison) {
                 repaired++;
@@ -9405,8 +9416,94 @@ void mmcs_l66_stock_arena(const char *when)
             fprintf(stderr, "\n");
         }
     }
-    fprintf(stderr, "MMCS-L66: arena stocked %s (stocked %d, poison-repaired "
-            "%d, busy-left %d)\n", when, stocked, repaired, busy);
+    fprintf(stderr, "MMCS-L66: arena stocked %s (base %08x: stocked %d, "
+            "poison-repaired %d, busy-left %d)\n", when, base, stocked,
+            repaired, busy);
+}
+
+/* MMCS fork (L68/S219): MMCS_L68KD — THE LIVE KDATA USER PAGE (env-
+ * gated, default off).
+ *
+ * THE DECODE (2026-11-24, the l66-park-crit world): the KData user
+ * page (VA 0x5000-0x5FFF; lpvTls at 0x5800, the _InterlockedAPIs
+ * block at 0x5B80) IS THE LIVE KDATA PAGE. The vendor kernel maps it
+ * itself (the guest's own UTLB carries the shared entry VA 0x5000 ->
+ * phys 0x08679000, asid-independent, monitor `info tlb` verified) and
+ * KData = *[0x8867ed64] = 0x88679800 lives there with a LIVE
+ * lpvTls/hCurThread/pCurTh and the vendor's own complete stock
+ * _InterlockedAPIs block at KData+0x380 (byte-identical to the L66
+ * block; the stock mdsh3.c MDInitialize copy DID run). The S122
+ * ILKFIX hook, however, resolves every fault on that page to a DEAD
+ * zero scratch page (phys 0x0C020000 — S112/S117's "KData" guess:
+ * the nk.exe image's stale copy, 0 nonzero bytes at the park) and its
+ * kernel-mode fetch gate (KILK / the L66STK arming repair) installs
+ * that dead page for the kernel TCG index too — so kernel-side
+ * TlsGetValue reads lpvTls = 0 and every TLS deref faults at NULL.
+ * THE L66 PARK'S ENGINE: the device.dll thread 9068f0c0 died exactly
+ * there (TlsGetValue(1): r2=[0x5800]=0, r8=[r2+4] -> TEA 4, the
+ * S214DBG TH-EXC tape), the kernel exception path nested into the
+ * BL=1 ring loop at 0x908089fe and froze the CPU (0 guest bytes
+ * changed in a 60s plain run) — the heir wake on the old loader crit
+ * never got scheduled.
+ *
+ * THE FIX (stock-faithful, one page): under MMCS_L68KD the ILKFIX
+ * hook resolves VA page 0x5000 to the LIVE KData page (derived from
+ * the vendor's own KData pointer cell 0x8867ed64 at run time), seeds
+ * nothing (the vendor's block is the stock), and at snapshot post-
+ * load re-pins the PGOWN entry for the page (class 2, the shared key)
+ * to the live page so the pinned-backing override cannot keep serving
+ * the dead page. Default off: the legacy dead page + seeds stand. */
+int mmcs_l68_kd_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("MMCS_L68KD") != NULL;
+    }
+    return on;
+}
+
+/* The live KData page PA (the 4K page holding KData), 0 unresolved. */
+uint32_t mmcs_l68_kdata_page_pa(void)
+{
+    uint32_t kdptr = 0;
+    cpu_physical_memory_read(0x0867ED64, &kdptr, 4);
+    if ((kdptr & 0xF0000000u) != 0x80000000u || (kdptr & 0x7FFu)) {
+        return 0;
+    }
+    return (kdptr & 0x1FFFFFFFu) & ~0xFFFu;
+}
+
+void mmcs_l68_repin_kdata_page(void)
+{
+    uint32_t kdptr = 0, pa = mmcs_l68_kdata_page_pa();
+    struct mmcs_pgown_ent *e;
+    uint8_t cur[16];
+    cpu_physical_memory_read(0x0867ED64, &kdptr, 4);
+    if (!pa) {
+        fprintf(stderr, "MMCS-L68: KData pointer unresolved ([8867ed64] = "
+                "%08x) - KData user page NOT re-pinned\n", kdptr);
+        return;
+    }
+    e = mmcs_pgown_find(0x5000, MMCS_PGOWN_ASID_SHARED);
+    if (e) {
+        fprintf(stderr, "MMCS-L68: KData user page pin %08x (pinned %d) "
+                "-> the live KData page %08x ([8867ed64] = %08x)\n",
+                e->pa, e->pinned, pa, kdptr);
+    } else {
+        e = mmcs_pgown_insert(0x5000, MMCS_PGOWN_ASID_SHARED, pa);
+        fprintf(stderr, "MMCS-L68: KData user page pin created -> the live "
+                "KData page %08x ([8867ed64] = %08x)\n", pa, kdptr);
+    }
+    if (e) {
+        e->pa = pa;
+        e->pinned = 1;
+    }
+    cpu_physical_memory_read(pa + 0xB80, cur, 16);
+    fprintf(stderr, "MMCS-L68: live KData+0x380 granule:");
+    for (int j = 0; j < 16; j++) {
+        fprintf(stderr, " %02x", cur[j]);
+    }
+    fprintf(stderr, "\n");
 }
 
 static int mmcs_machine_post_load(void *opaque, int version_id)
@@ -9508,6 +9605,11 @@ static int mmcs_machine_post_load(void *opaque, int version_id)
      * post-migration, so the stocked block re-translates clean. */
     if (getenv("MMCS_L66STK")) {
         mmcs_l66_stock_arena("post-restore");
+    }
+    /* L68/S219: the KData user page re-pinned to the LIVE KData page
+     * (after the RAM load, so the vendor's KData pointer is valid). */
+    if (mmcs_l68_kd_on()) {
+        mmcs_l68_repin_kdata_page();
     }
     fprintf(stderr, "MMCS-SNAP: machine state restored (srvpg=%d "
             "pgown ins/pin=%u/%u, l16[0] pending=%d daemon=%d, "

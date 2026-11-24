@@ -192,6 +192,9 @@ static uint32_t mmcs_utlb_va2pa(CPUSH4State *env, uint32_t va)
  * page-ownership registration on the same latch. */
 bool mmcs_ilkfix_user_seen;
 
+/* MMCS fork (L68/S219): the live KData user page (MMCS_L68KD). */
+int mmcs_l68_kd_on(void);
+uint32_t mmcs_l68_kdata_page_pa(void);
 /* MMCS fork (L66/S218): the low-arena stocker — hw/sh4/mmcs.c owns
  * the stock _InterlockedAPIs block + the per-granule zero/poison
  * policy; called at machine init, snapshot post-restore, and from
@@ -2943,7 +2946,15 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         };
         static bool seeded;
         if (!seeded) {
-            if (getenv("MMCS_L66STK")) {
+            if (mmcs_l68_kd_on()) {
+                /* L68/S219: the backing is the LIVE KData page — the
+                 * vendor's own MDInitialize block at KData+0x380 is the
+                 * stock; nothing is seeded. */
+                fprintf(stderr, "MMCS-L68: KData user page -> the LIVE "
+                        "KData page %08x (no seed; the vendor's own "
+                        "_InterlockedAPIs block is the stock)\n",
+                        mmcs_l68_kdata_page_pa());
+            } else if (getenv("MMCS_L66STK")) {
                 /* L66/S218: seed the CORRECT stock block (all eight
                  * granules, poison-repair policy) — see
                  * hw/sh4/mmcs.c mmcs_l66_stock_arena. */
@@ -2984,6 +2995,10 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             mmcs_ilkfix_user_seen = true;
         }
         uint32_t kdpa = 0x0C020000;
+        uint32_t l68pa = mmcs_l68_kd_on() ? mmcs_l68_kdata_page_pa() : 0;
+        if (l68pa) {
+            kdpa = l68pa;             /* L68/S219: the live KData page */
+        }
         int kdprot = mmcs_pgown_fill(env, 0x5000, &kdpa,
                                      PAGE_READ | PAGE_WRITE | PAGE_EXEC, 0);
         tlb_set_page(cs, 0x5000, kdpa, kdprot, mmu_idx,
