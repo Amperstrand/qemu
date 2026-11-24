@@ -2593,6 +2593,8 @@ static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l72;
 static uint64_t mmcs_tick_l73;
 static uint64_t mmcs_tick_l74;
+static uint64_t mmcs_tick_l74cr;
+static uint64_t mmcs_tick_l74s4;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2818,6 +2820,7 @@ static uint32_t mmcs_l72_stable;     /* consecutive matching scans */
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
 static void mmcs_l74_scan(void);
+static void mmcs_l74cr_scan(void);
 static int mmcs_l73_armed;
 static uint32_t mmcs_l73_cadence_ms = 1000;
 static uint32_t mmcs_l73_max_deliv = 12;
@@ -2860,6 +2863,70 @@ static uint32_t mmcs_l74_max_deliv;  /* 0 = standing/uncapped */
 static uint32_t mmcs_l74_total;
 static uint32_t mmcs_l74_key;        /* stability key {thread,head,nxt} */
 static uint32_t mmcs_l74_stable;     /* consecutive matching scans */
+static int mmcs_l74cr_armed;
+static int mmcs_l74cr_diag;
+static uint32_t mmcs_l74cr_cadence_ms = 2000;
+static uint32_t mmcs_l74cr_max_deliv = 2;
+static uint32_t mmcs_l74cr_total;
+static uint32_t mmcs_l74cr_key;
+static uint32_t mmcs_l74cr_stable;
+static int mmcs_l74s4_armed;
+static uint32_t mmcs_l74s4_done;     /* one-shot: the slot stock-clear */
+
+/* MMCS fork (L74/S225): MMCS_L74S4 — THE SET-84 SLOT STOCK-CLEAR (the
+ * S225 recipe item (iii), the "PerformCallBack proper" caught-fault
+ * stock outcome). THE DECODE (Verified: ROM disasm of the dispatch
+ * FUN_90843214 = the kernel-side API-set call shim): r0 =
+ * fn_908291ec(84) (registered?); r12 = fn_9082bc84(proc) (the
+ * ACTIVATEPROC switch, tail call 0x90837244 — BOTH the launcher and
+ * the servant park inside it, pr 0x90843240); r2 = [0x8867eed0] THE
+ * SLOT CELL; tst r2,r2 -> r2==0 RETURNS 0 CLEANLY (*** the stock
+ * dead-server path — a server that died deregistered leaves the slot
+ * NULL and every call returns 0, NO FAULT ***); else jsr
+ * @[[[slot]+0xC]+0x234] — with the slot = 0xd0050260 (the byte-
+ * reversal of the original registration 0x600205d0, a ZEROED D0-window
+ * block) the [NULL+0x234] load faults c0000005 at 0x90843258 (18
+ * live-observed in the post-L74CR cascade). THE REPAIR: the stock
+ * semantics, one write — [0x8867eed0] := 0 when the slot points at
+ * the zeroed-block artifact (the exact byte-reversed value OR the
+ * self-witnessing shape: a kernel-window block whose first 0x20
+ * bytes read zero and [+0xC] == NULL). ONE-SHOT (the cell re-stocks
+ * only through RegisterAPISet). Env MMCS_L74S4 (default OFF). Needs
+ * MMCS_TICK (rides the L74CR cadence). */
+static void mmcs_l74s4_clear(void)
+{
+    if (mmcs_l74s4_done) {
+        return;
+    }
+    uint32_t slot = 0;
+    cpu_physical_memory_read(0x0867EED0, &slot, 4);
+    if (!slot) {
+        mmcs_l74s4_done = 1;         /* already stock-cleared */
+        return;
+    }
+    if (slot == 0xd0050260) {
+        /* the lineage-confirmed byte-reversal artifact */
+    } else if (slot >= 0xD0000000 && slot < 0xDC000000) {
+        /* the self-witnessing shape: a zeroed kernel-window block */
+        uint32_t pa = slot - 0xC0000000;
+        uint32_t w[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        cpu_physical_memory_read(pa, w, sizeof w);
+        for (int i = 0; i < 8; i++) {
+            if (w[i]) {
+                return;              /* not the zeroed artifact */
+            }
+        }
+    } else {
+        return;                      /* a live registration — hands off */
+    }
+    cpu_physical_memory_write(0x0867EED0, &(uint32_t){ 0 }, 4);
+    mmcs_l74s4_done = 1;
+    fprintf(stderr, "MMCS-L74S4: t=%" PRId64 "ms set-84 slot stock-cleared "
+            "([0x8867eed0] := 0, was %08x the zeroed byte-reversed block; "
+            "the dispatch's own null path returns 0 — the stock dead-server "
+            "outcome, no more 0x234 faults)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), slot);
+}
 static uint32_t mmcs_l59_cadence_ms;
 static uint32_t mmcs_l59_pulses;
 static uint32_t mmcs_l56_cadence_ms;
@@ -3318,6 +3385,20 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l74_armed && ++mmcs_tick_l74 >= mmcs_l74_cadence_ms) {
             mmcs_tick_l74 = 0;
             mmcs_l74_scan();
+        }
+        /* L74CR: the reentrant API-lock deadlock break (S225 item
+         * (ii); after the reap + the L62/L64 channel users per the
+         * tick-order contract) */
+        if (mmcs_l74cr_armed && ++mmcs_tick_l74cr >= mmcs_l74cr_cadence_ms) {
+            mmcs_tick_l74cr = 0;
+            mmcs_l74cr_scan();
+        }
+        /* L74S4: the set-84 slot stock-clear (S225 item (iii), the
+         * one-shot dead-server repair; rides the L74CR cadence when
+         * both are armed) */
+        if (mmcs_l74s4_armed && ++mmcs_tick_l74s4 >= 1000) {
+            mmcs_tick_l74s4 = 0;
+            mmcs_l74s4_clear();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -8124,6 +8205,196 @@ static void mmcs_l74_scan(void)
             " (sleeper cursor not th — list-only)");
 }
 
+/* MMCS fork (L74/S225): MMCS_L74CR — THE REENTRANT API-SET-LOCK
+ * DEADLOCK BREAK (the S225 recipe item (ii); decoded 2026-11-24 on
+ * the l74-reap world). THE DECODE (Observed: the l74_svframe +
+ * l74_owner probes; Verified: ROM disasm): the servant/devmgr thread
+ * (the event 0x90699d68's owner = the SETTER the launcher's polled
+ * wait needs) is BLOCKED at the crit-enter face ctxpc=0x90840814
+ * after KCall(fn_90828924) — the block core (state16 low2 := 2,
+ * dwKCRes := 1). THE LOCK: the crit record at 0x906ff598
+ * {+0/+4: lpcs-self 906ff4ec, +8: 0x8000fb01 OWNED with the PI bytes
+ * 0xfb, +0xC: 0x8867adf4 = &the KData owner-handle cell}; the owner
+ * handle [0x8867adf8] = 0x005c0002 = THE LAUNCHER'S OWN HANDLE (the
+ * ONLY arena TCB carrying it — alive, churning the poll). THE
+ * REENTRANCY WITNESS: BOTH threads carry the set-84 dispatch arg
+ * spill {[th+0x7C] = [slot84] = 0xd0050260, [th+0x80] = 0x234} and
+ * the same saved pr 0x90843240 — the servant's enter sits inside
+ * FUN_90843214's ACTIVATEPROC tail (fn_9082bc84 -> 0x90837244) just
+ * like the launcher's wait: the caller HOLDS the API-set lock across
+ * its PerformCallBack wait while the server-side handler needs the
+ * SAME lock to service the call. Stock never holds this lock across
+ * the PSL wait — the L63-era acquisition's release was destroyed by
+ * the kills' aftermath. THE FIX (the L63 B1 composite, manufactured):
+ * transfer the owner cell [waiter_r10 + 4] := the waiter's own
+ * handle [th+0x3C] (the enter-tail's own compare: [r10+4] vs
+ * [[0x8867ed64]+8] — the current-handle cell — EXITS AS THE OWNER
+ * when equal; the woken waiter's own tail then clears [pcur+0x14C]
+ * and walks the owned-tail through vendor code) + the v9 WAKE (the
+ * L54 stub, evt 0x320, shared-channel guarded). Guards: the waiter
+ * shape {arena TCB + ctxpc == 0x90840814 + (st16&3)==2 + the
+ * dispatch spill pair} + THE DEADLOCK WITNESS (the owner handle ==
+ * the pcur thread's OWN [pcur+0x3C] AND pcur carries the SAME
+ * dispatch spill — a live owner that is itself mid-dispatch on the
+ * same call: only this reentrant shape is ever released; a plain
+ * live owner is NEVER manufactured) + 2-cadence stability. Env
+ * MMCS_L74CR (default OFF; MMCS_L74CR_MS cadence default 2000;
+ * MMCS_L74CR_MAX cap default 2; MMCS_L74CR_DIAG = the verbose
+ * near-miss diag). Needs MMCS_TICK. */
+
+static void mmcs_l74cr_scan(void)
+{
+    if (!mmcs_l74cr_armed || mmcs_l74cr_total >= mmcs_l74cr_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    if (pcur < 0x90680000 || pcur >= 0x90780000) {
+        return;
+    }
+    uint32_t po = pcur - 0x90680000;
+    /* THE OWNER-SIDE WITNESS FIRST: pcur carries a dispatch spill (a
+     * D0-window method-table pointer + the 0x234 offset). NOTE the
+     * spill-vs-CELL comparison is deliberately avoided: the L74S4
+     * stock-clear may legitimately have cleared the slot cell before
+     * this scan's stability completes (the ab3 world-split lesson) —
+     * the reentrancy witness is the TWO THREADS' spills matching,
+     * whatever the cell reads. */
+    uint32_t p_sp7c = 0, p_sp80 = 0, p_h3c = 0;
+    cpu_physical_memory_read(0x10680000 + po + 0x7C, &p_sp7c, 4);
+    cpu_physical_memory_read(0x10680000 + po + 0x80, &p_sp80, 4);
+    cpu_physical_memory_read(0x10680000 + po + 0x3C, &p_h3c, 4);
+    if (p_sp7c < 0xD0000000 || p_sp7c >= 0xDC000000 || p_sp80 != 0x234
+        || (p_h3c & 0xff000000)) {
+        if (mmcs_l74cr_diag) {
+            fprintf(stderr, "MMCS-L74CR(diag): t=%" PRId64 "ms pcur %08x "
+                    "not mid-dispatch {sp7c %08x sp80 %08x h3c %08x} - skip\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), pcur, p_sp7c,
+                    p_sp80, p_h3c);
+        }
+        return;
+    }
+    /* scan for the waiter: the crit-enter park with the same spill */
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, st16, ctxpc, sp7c, sp80, h3c, r10;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&sp7c, arena + o + 0x7c, 4);
+        memcpy(&sp80, arena + o + 0x80, 4);
+        memcpy(&h3c, arena + o + 0x3c, 4);
+        memcpy(&r10, arena + o + 0x9c, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || ctxpc != 0x90840814     /* the crit-enter park face */
+            || (st16 & 3) != 2
+            || arena[o + 0xe] != 0     /* not suspended */
+            || sp7c != p_sp7c || sp80 != 0x234
+            || (h3c & 0xff000000) != 0
+            || tva == pcur) {
+            continue;
+        }
+        /* the owner cell = the waiter's own enter-tail compare cell */
+        if (r10 < 0x88600000 || r10 >= 0x88700000) {
+            if (mmcs_l74cr_diag) {
+                fprintf(stderr, "MMCS-L74CR(diag): t=%" PRId64 "ms waiter "
+                        "%08x r10 %08x not KData - skip\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, r10);
+            }
+            continue;
+        }
+        uint32_t owner_h = 0;
+        cpu_physical_memory_read(r10 - 0x80000000 + 4, &owner_h, 4);
+        if (owner_h != p_h3c) {
+            /* not the reentrant pair — a foreign/live owner: NEVER
+             * manufacture (the L62 law) */
+            if (mmcs_l74cr_diag) {
+                fprintf(stderr, "MMCS-L74CR(diag): t=%" PRId64 "ms waiter "
+                        "%08x owner_h %08x != pcur handle %08x - not the "
+                        "reentrant pair, skip\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, owner_h,
+                        p_h3c);
+            }
+            continue;
+        }
+        /* 2-cadence stability keyed {waiter, owner} */
+        uint32_t key = tva ^ (owner_h * 5);
+        if (mmcs_l74cr_key != key) {
+            mmcs_l74cr_key = key;
+            mmcs_l74cr_stable = 1;
+            fprintf(stderr, "MMCS-L74CR: t=%" PRId64 "ms reentrant API-lock "
+                    "deadlock seen: waiter %08x (crit face, spill {slot84, "
+                    "0x234}) vs owner pcur %08x h %08x - ALSO mid-dispatch "
+                    "(stability %u/2)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, pcur, p_h3c,
+                    mmcs_l74cr_stable);
+            return;
+        }
+        if (++mmcs_l74cr_stable < 2) {
+            return;
+        }
+        /* channel guards FIRST (the R23 ordering law) */
+        if (mmcs_l16_ents[7].pending) {
+            fprintf(stderr, "MMCS-L74CR: t=%" PRId64 "ms evt-0x320 wake "
+                    "mid-flight - retry next cadence\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+            return;
+        }
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA && slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L74CR: t=%" PRId64 "ms slot evt 0x320 "
+                    "busy (%08x) - retry next cadence\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), slot_cur);
+            return;
+        }
+        if (mmcs_l74cr_diag) {
+            fprintf(stderr, "MMCS-L74CR(diag): shape STABLE — would "
+                    "transfer [%08x] := %08x and v9-wake %08x; diag mode, "
+                    "no delivery\n", r10 + 4, h3c, tva);
+            return;
+        }
+        /* DELIVER: THE TRANSFER (one write — the deadlock break; the
+         * woken waiter's own enter tail reads [r10+4] == its current
+         * handle and exits the loop as the owner through vendor
+         * code) + THE V9 WAKE (the L54 recipe verbatim) */
+        cpu_physical_memory_write(r10 - 0x80000000 + 4, &h3c, 4);
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        cpu_physical_memory_write(0x1F00E6F0,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 }, 4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            cpu_physical_memory_write(MMCS_L54_SLOT_PA,
+                                      &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l74cr_total++;
+        fprintf(stderr, "MMCS-L74CR: t=%" PRId64 "ms reentrant API-lock "
+                "deadlock broken %u/%u: waiter %08x takes the lock "
+                "([%08x] := %08x, was the owner pcur %08x's %08x) + the "
+                "v9 wake; the servant services the call -> the event SET "
+                "path (markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l74cr_total,
+                mmcs_l74cr_max_deliv, tva, r10 + 4, h3c, pcur, owner_h,
+                MMCS_L54_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+}
+
+
 static void mmcs_l59_scan(void)
 {
     if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
@@ -9331,6 +9602,33 @@ static void mmcs_l16_boot_parse(void)
                 "- the fn2 lane refuted statically)\n",
                 mmcs_l74_cadence_ms, mmcs_l74_max_deliv,
                 mmcs_l74_max_deliv ? "capped" : "STANDING/uncapped");
+    }
+    /* L74CR: the reentrant API-set-lock deadlock break (S225 item (ii)) */
+    if (getenv("MMCS_L74CR")) {
+        mmcs_l74cr_cadence_ms = atoi(getenv("MMCS_L74CR_MS") ? : "2000");
+        if (!mmcs_l74cr_cadence_ms) {
+            mmcs_l74cr_cadence_ms = 2000;
+        }
+        mmcs_l74cr_max_deliv = atoi(getenv("MMCS_L74CR_MAX") ? : "2");
+        if (!mmcs_l74cr_max_deliv) {
+            mmcs_l74cr_max_deliv = 2;
+        }
+        mmcs_l74cr_diag = getenv("MMCS_L74CR_DIAG") != NULL;
+        mmcs_l74cr_armed = 1;
+        fprintf(stderr, "MMCS-L74CR: reentrant API-lock deadlock break "
+                "armed (cadence %ums, cap %u%s; the double-dispatch-spill "
+                "witness + the transfer [waiter r10+4] := waiter handle + "
+                "the v9 wake)\n",
+                mmcs_l74cr_cadence_ms, mmcs_l74cr_max_deliv,
+                mmcs_l74cr_diag ? "; DIAG" : "");
+    }
+    /* L74S4: the set-84 slot stock-clear (S225 item (iii)) */
+    if (getenv("MMCS_L74S4")) {
+        mmcs_l74s4_armed = 1;
+        fprintf(stderr, "MMCS-L74S4: set-84 slot stock-clear armed "
+                "(one-shot; [0x8867eed0] := 0 on the zeroed byte-reversed "
+                "block -> the dispatch's own null path returns 0, the "
+                "stock dead-server outcome)\n");
     }
     if (getenv("MMCS_L26EV")) {
         if (getenv("MMCS_L16EV")) {
