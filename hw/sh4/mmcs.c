@@ -2592,6 +2592,7 @@ static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l72;
 static uint64_t mmcs_tick_l73;
+static uint64_t mmcs_tick_l74;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2816,12 +2817,49 @@ static uint32_t mmcs_l72_stable;     /* consecutive matching scans */
 /* L73 (S224): the churn livelock release — the stale sleep-node
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
+static void mmcs_l74_scan(void);
 static int mmcs_l73_armed;
 static uint32_t mmcs_l73_cadence_ms = 1000;
 static uint32_t mmcs_l73_max_deliv = 12;
 static uint32_t mmcs_l73_total;
 static uint32_t mmcs_l73_key;        /* stability key {thread,head,nxt} */
 static uint32_t mmcs_l73_stable;     /* consecutive matching scans */
+
+/* MMCS fork (L74/S225): MMCS_L74EV — THE STANDING EXPIRY REAP (the
+ * S225 recipe item (i), the OR branch; decoded 2026-11-24). The L73
+ * honest limit closed statically + live: the vendor's sleep-list
+ * expiry walk (drain1 0x90826f4c) has exactly ONE caller — the
+ * switcher 0x90822b68 (jsr @r8 at 0x90822b92) — so no ISR/fn2 lane
+ * can reach it; the monopoly (a KCall'd walk that never terminates)
+ * starves the switcher, which starves the reap, which perpetuates
+ * the stale node the walk spins against. The fn2/TUNI2 lane is
+ * statically refuted (the evt-0x440 walker 0x90809d78 feeds only the
+ * [0x8860200c] change-detect whose firing = the fn1b 0x908419f0
+ * trapa#1 debug FATAL; the LIVE evt-0400 handler 0x90808980 drops
+ * the resched-consider return at rte — S181/S224's live binds both
+ * reaped nothing). THE PROMOTION: the L73EV unlink as the STANDING
+ * uncapped daemon at a fast cadence, with the gate widened to the
+ * one signature the L73 v4 samples missed: a RUNNING thread whose
+ * OWN node sits at the sleep-list head SELF-LINKED, at ANY tick
+ * flavor — the fresh submit's insert-before-stale-cursor re-links
+ * [th+0x144] := th with a FUTURE [th+0x1E8], so the whole ~2s walk
+ * spin holds the v4-skip shape (running + future tick). A running
+ * thread is never a stock sleep-list member (the park sets state16
+ * low2 := 2 before yielding); the 2-cadence stability (100ms apart)
+ * excludes the sub-millisecond mid-park insert transient. The
+ * expired-own-node flavor (nxt != th, wtick < now) rides along at
+ * the same stability; a non-self next is SPLICED (head := nxt) so a
+ * stale head never orphans a legit tail. Delivery = the L73 v2
+ * unlink verbatim: sleeper cursor/flag clear at [th+0xB0]+0x10
+ * (gated cursor == th) + the list surgery. Env MMCS_L74EV (default
+ * OFF; MMCS_L74EV_MS cadence default 100; MMCS_L74EV_MAX cap default
+ * 0 = STANDING/uncapped). Needs MMCS_TICK. */
+static int mmcs_l74_armed;
+static uint32_t mmcs_l74_cadence_ms = 100;
+static uint32_t mmcs_l74_max_deliv;  /* 0 = standing/uncapped */
+static uint32_t mmcs_l74_total;
+static uint32_t mmcs_l74_key;        /* stability key {thread,head,nxt} */
+static uint32_t mmcs_l74_stable;     /* consecutive matching scans */
 static uint32_t mmcs_l59_cadence_ms;
 static uint32_t mmcs_l59_pulses;
 static uint32_t mmcs_l56_cadence_ms;
@@ -3273,6 +3311,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l73_armed && ++mmcs_tick_l73 >= mmcs_l73_cadence_ms) {
             mmcs_tick_l73 = 0;
             mmcs_l73_scan();
+        }
+        /* L74: the standing expiry reap (S225 — the promoted L73EV
+         * unlink, uncapped; runs after the L73 family per the
+         * tick-order contract) */
+        if (mmcs_l74_armed && ++mmcs_tick_l74 >= mmcs_l74_cadence_ms) {
+            mmcs_tick_l74 = 0;
+            mmcs_l74_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -7968,6 +8013,117 @@ static void mmcs_l73_scan(void)
             " (sleeper cursor not th — list-only)");
 }
 
+static void mmcs_l74_scan(void)
+{
+    if (!mmcs_l74_armed) {
+        return;
+    }
+    if (mmcs_l74_max_deliv && mmcs_l74_total >= mmcs_l74_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    if (pcur < 0x90680000 || pcur >= 0x90780000) {
+        return;                       /* not an arena thread */
+    }
+    uint32_t tpa = pcur - 0x80000000;
+    uint32_t kbase = 0, ksz = 0, klow = 0;
+    cpu_physical_memory_read(tpa + 0x20, &kbase, 4);
+    cpu_physical_memory_read(tpa + 0x24, &ksz, 4);
+    cpu_physical_memory_read(tpa + 0x2c, &klow, 4);
+    if (kbase < 0xD0000000 || kbase >= 0xDC000000
+        || ksz != 0x10000
+        || klow < 0xD0000000 || klow >= 0xDC000000) {
+        return;                       /* not a TCB shape */
+    }
+    uint32_t head = 0, nxt = 0;
+    cpu_physical_memory_read(0x0867EF8C, &head, 4);
+    cpu_physical_memory_read(tpa + 0x144, &nxt, 4);
+    if (head != pcur) {
+        mmcs_l74_key = 0;
+        mmcs_l74_stable = 0;
+        return;
+    }
+    uint32_t st16 = 0;
+    cpu_physical_memory_read(tpa + 0xc, &st16, 4);
+    /* THE RUNNING+OWN-NODE SIGNATURE (the L74 widening): a current
+     * thread at the sleep-list head is impossible-stock at ANY tick
+     * flavor. Shape A = the self-link (nxt == th, the walk-spin
+     * engine, recreated every submit with a FUTURE [th+0x1E8] — the
+     * exact window the L73 v4 expired-tick guard skipped) — NOTE the
+     * st16 gate does NOT apply: the L72-resumed launcher carries a
+     * STALE BLOCKED mark (live-caught in the first A/B: st16
+     * 020000e2 while pCurTh executes the walk spin; the resume never
+     * re-marks the state) — pCurTh-at-the-head IS the running fact.
+     * Shape B = the expired own node (wtick < now) — the st16 gate
+     * HOLDS here: a properly parked BLOCKED thread with a passed
+     * deadline is the stock expiry case, not ours to unlink (orphan
+     * risk); only the RUNNING mark makes it impossible-stock. */
+    int self_link = (nxt == pcur);
+    if (!self_link) {
+        uint32_t wtick = 0, now = 0;
+        if ((st16 & 3) == 2) {
+            /* BLOCKED with a live node — a stock park */
+            mmcs_l74_key = 0;
+            mmcs_l74_stable = 0;
+            return;
+        }
+        cpu_physical_memory_read(tpa + 0x1E8, &wtick, 4);
+        cpu_physical_memory_read(0x0867AAD0, &now, 4);
+        if (wtick >= now) {
+            mmcs_l74_key = 0;
+            mmcs_l74_stable = 0;
+            return;
+        }
+    }
+    uint32_t key = pcur ^ head ^ nxt;
+    if (mmcs_l74_key != key) {
+        mmcs_l74_key = key;
+        mmcs_l74_stable = 1;
+        fprintf(stderr, "MMCS-L74: t=%" PRId64 "ms standing-reap shape "
+                "seen: th %08x *CUR* RUNNING head %08x nxt %08x%s "
+                "(stability %u/2)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), pcur, head, nxt,
+                self_link ? " [self-link]" : " [expired-own-node]",
+                mmcs_l74_stable);
+        return;
+    }
+    if (++mmcs_l74_stable < 2) {
+        return;
+    }
+    /* DELIVER — the L73 v2 unlink, with the head SPLICE: a non-self
+     * next keeps the tail ([0x8867ef8c] := nxt); the self-link/clean
+     * node clears the head outright. The in-flight sleeper's walk
+     * cursor ([th+0xB0]+0x10, gated == th — the v2 lesson: the stale
+     * cursor re-creates the self-link within ONE submit) is cleared
+     * first. */
+    uint32_t ctxsp = 0, cursor = 0;
+    cpu_physical_memory_read(tpa + 0xb0, &ctxsp, 4);
+    int cursor_cleared = 0;
+    if (ctxsp >= 0xD0000000 && ctxsp < 0xDC000000) {
+        uint32_t spa = ctxsp - 0xC0000000 + 0x10;
+        cpu_physical_memory_read(spa, &cursor, 4);
+        if (cursor == pcur) {
+            cpu_physical_memory_write(spa, &(uint32_t){ 0 }, 4);
+            cpu_physical_memory_write(spa + 6, &(uint16_t){ 0 }, 2);
+            cursor_cleared = 1;
+        }
+    }
+    uint32_t newhead = self_link ? 0 : nxt;
+    cpu_physical_memory_write(0x0867EF8C, &newhead, 4);
+    cpu_physical_memory_write(tpa + 0x144, &(uint32_t){ 0 }, 4);
+    mmcs_l74_total++;
+    fprintf(stderr, "MMCS-L74: t=%" PRId64 "ms standing reap %u%s: th %08x "
+            "*CUR* RUNNING%s ([0x8867ef8c] := %08x, [th+0x144] := 0%s; the "
+            "walk completes through vendor code)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l74_total,
+            mmcs_l74_max_deliv ? " (capped)" : " (standing)",
+            pcur, self_link ? " [self-link]" : " [expired-own-node]",
+            newhead,
+            cursor_cleared ? ", sleeper cursor+flag := 0" :
+            " (sleeper cursor not th — list-only)");
+}
+
 static void mmcs_l59_scan(void)
 {
     if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
@@ -9160,6 +9316,21 @@ static void mmcs_l16_boot_parse(void)
                 "%ums, cap %u; the pCurTh self-linked-on-sleep-list class; "
                 "host-side unlink [0x8867ef8c]/[th+0x144])\n",
                 mmcs_l73_cadence_ms, mmcs_l73_max_deliv);
+    }
+    /* L74: the standing expiry reap (the S225 item (i) OR branch) */
+    if (getenv("MMCS_L74EV")) {
+        mmcs_l74_cadence_ms = atoi(getenv("MMCS_L74EV_MS") ? : "100");
+        if (!mmcs_l74_cadence_ms) {
+            mmcs_l74_cadence_ms = 100;
+        }
+        mmcs_l74_max_deliv = atoi(getenv("MMCS_L74EV_MAX") ? : "0");
+        mmcs_l74_armed = 1;
+        fprintf(stderr, "MMCS-L74: standing expiry reap armed (cadence %ums, "
+                "cap %u = %s; the RUNNING+own-node-at-sleep-head signature "
+                "at any tick flavor; drain1's only caller is the switcher "
+                "- the fn2 lane refuted statically)\n",
+                mmcs_l74_cadence_ms, mmcs_l74_max_deliv,
+                mmcs_l74_max_deliv ? "capped" : "STANDING/uncapped");
     }
     if (getenv("MMCS_L26EV")) {
         if (getenv("MMCS_L16EV")) {
