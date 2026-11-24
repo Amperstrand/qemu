@@ -2596,6 +2596,7 @@ static uint64_t mmcs_tick_l74;
 static uint64_t mmcs_tick_l74cr;
 static uint64_t mmcs_tick_l74s4;
 static uint64_t mmcs_tick_l75ho;
+static uint64_t mmcs_tick_l76;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2827,6 +2828,20 @@ static uint32_t mmcs_l75ho_max_deliv = 4;
 static uint32_t mmcs_l75ho_total;
 static uint32_t mmcs_l75ho_key;      /* stability key {thread,ctxpc} */
 static uint32_t mmcs_l75ho_stable;   /* consecutive matching scans */
+/* L76 (S227): THE EQUAL-PRIORITY STARVATION RE-ARM — the cNest delivery
+ * (see mmcs_l76_scan): a RUNNABLE thread stands at the run-band head
+ * while the monopolist's KCall'd walk-spin keeps cNest [0x88679885]==0,
+ * so the outer KCall return's resched gate 0x9082304c never routes to
+ * the switcher; nothing else (MakeRun's outrank tail, the tick's
+ * rte-dropped resched-consider, the never-expiring quantum) ever sets
+ * it in this world */
+static void mmcs_l76_scan(void);
+static int mmcs_l76_armed;
+static uint32_t mmcs_l76_cadence_ms = 500;
+static uint32_t mmcs_l76_max_deliv = 4;
+static uint32_t mmcs_l76_total;
+static uint32_t mmcs_l76_key;        /* stability key {pCurTh,band-head} */
+static uint32_t mmcs_l76_stable;     /* consecutive matching scans */
 /* L73 (S224): the churn livelock release — the stale sleep-node
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
@@ -3417,6 +3432,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l74s4_armed && ++mmcs_tick_l74s4 >= 1000) {
             mmcs_tick_l74s4 = 0;
             mmcs_l74s4_clear();
+        }
+        /* L76: the equal-priority starvation re-arm (S227 — the cNest
+         * one-byte delivery; after the L74 reap family so the walk's
+         * self-link is already unlinked when the gate is checked) */
+        if (mmcs_l76_armed && ++mmcs_tick_l76 >= mmcs_l76_cadence_ms) {
+            mmcs_tick_l76 = 0;
+            mmcs_l76_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -8074,6 +8096,123 @@ static void mmcs_l75ho_scan(void)
     mmcs_l75ho_stable = 0;
 }
 
+/* MMCS fork (L76/S227): MMCS_L76EV — THE EQUAL-PRIORITY STARVATION
+ * RE-ARM (the cNest one-byte delivery; decoded 2026-11-24, the
+ * recycled-servant lane).
+ *
+ * THE DECODE (Observed: l76_census2 + probes 1-10 + the hotblocks
+ * aggregate on the l75-postkill restore; Verified: ROM disasm + the
+ * wince500 mirror): the post-kill world holds TWO threads — the
+ * launcher 0x906ca240 (inside the JIT-launch waiter UserDbgTrap/
+ * FUN_90839f90, polling SC_ProcGetCode(pi.hProcess) == STILL_ACTIVE
+ * with Sleep(250)) and the RECYCLED TCB 0x906a3c38 = the JIT
+ * DEBUGGER's primary thread (CreateProcess'd by the launcher's own
+ * second-chance set-84 0x234 exception; process Q 0x9068f958, hProc
+ * 0x00e70002, start [th+0x150] = ThreadStart 0x90835f14). The
+ * debugger thread stands RUNNABLE at prio 0xfb (the launcher's own —
+ * inherited, never boosted) at the band-31 head [0x8867F024] with
+ * well-formed FIFO links — and NEVER gets the CPU (356/356 samples =
+ * the launcher):
+ *
+ *  (α) the law: equal priority never preempts — MakeRun/CreateThread
+ *      write pick only on STRICT outrank (semantics-map §3; the
+ *      vendor's FUN_9082611c FIFO-tail insert for equals);
+ *  (β) the monopoly: the launcher's KCall'd sleep-insert walk spins
+ *      at ~1.6M it/s (the S224 signature; the L74EV reap unlinks the
+ *      re-created self-link ~5x/s but the loop re-submits within one
+ *      iteration);
+ *  (γ) the gate: the OUTER KCall return's resched check at
+ *      0x9082304c — cNest [0x88679885] == 1 -> [0x88679884] word :=
+ *      1 -> bra 0x90822b0a (the pre-switcher save) -> THE SWITCHER.
+ *      Live cNest == 0x00 always, so the bf is taken and the
+ *      switcher/drain2/MakeRun/ThreadStart/OEMIdle each executed ZERO
+ *      times in a 12 s hotblocks window. Nothing in this world sets
+ *      cNest: the tick's resched-consider is dropped at rte, MakeRun
+ *      never runs (no wakes), the quantum never expires, and a bare
+ *      [0x88679888] := 1 is consumed without a switch (probe9).
+ *
+ * THE DELIVERY (probe10, live-proven): ONE byte, cNest := 1. The very
+ * next outer KCall return takes the vendor's own gate -> the
+ * pre-switcher save -> the switcher -> the idle path -> drain2 (floor
+ * [0x8867a9fc] = 0xff >= band 0xfb -> pick := the queue head) -> THE
+ * STARVED THREAD RUNS. On HW this is the quantum-expiry resched the
+ * monopolist's never-completing KCall starves here.
+ *
+ * GATE (the starvation shape, 2-cadence stable): a RUNNABLE
+ * (st16 low2 == 1) thread at the run-band head [0x8867efa0] that is
+ * NOT pCurTh, does NOT outrank it (prio byte >= pCurTh's — if it
+ * outranked, stock's own outrank tail would have fired), pick == 0
+ * and cNest == 0. Both TCBs must live in the kernel-arena VA window
+ * (0x88600000..0x90800000, VA-0x80000000 == PA).
+ *
+ * Env MMCS_L76EV (default off); MMCS_L76EV_MS cadence default 500,
+ * MMCS_L76EV_MAX cap default 4. */
+static void mmcs_l76_scan(void)
+{
+    if (!mmcs_l76_armed || mmcs_l76_total >= mmcs_l76_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0, pick = 0, prun = 0, kd84 = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    cpu_physical_memory_read(0x08679884, &kd84, 4);
+    /* the starvation shape: a queued non-current candidate, no pick,
+     * and the KCall-return gate un-armed */
+    if (prun == 0 || prun == pcur || pick != 0
+        || ((kd84 >> 8) & 0xff) != 0
+        || prun < 0x88600000 || prun >= 0x90800000
+        || pcur < 0x88600000 || pcur >= 0x90800000) {
+        mmcs_l76_key = 0;
+        mmcs_l76_stable = 0;
+        return;
+    }
+    uint32_t pst = 0, pw = 0, cst = 0, cw = 0;
+    cpu_physical_memory_read(prun - 0x80000000 + 0x0C, &pst, 4);
+    cpu_physical_memory_read(prun - 0x80000000 + 0x40, &pw, 4);
+    cpu_physical_memory_read(pcur - 0x80000000 + 0x40, &cw, 4);
+    cpu_physical_memory_read(pcur - 0x80000000 + 0x0C, &cst, 4);
+    uint8_t cand_prio = (pw >> 8) & 0xff;    /* [th+0x41] */
+    uint8_t cur_prio = (cw >> 8) & 0xff;
+    /* RUNNABLE candidate that does NOT outrank the current (equal or
+     * lower priority; stock handles outrank itself) and a current
+     * thread still in the running/transition states (low2 != 2-only
+     * parked-blocked is fine — the stale-mark class runs BLOCKED) */
+    if ((pst & 3) != 1 || cand_prio < cur_prio || (cst & 3) == 3) {
+        mmcs_l76_key = 0;
+        mmcs_l76_stable = 0;
+        return;
+    }
+    uint32_t key = pcur ^ prun;
+    if (mmcs_l76_key != key) {
+        mmcs_l76_key = key;
+        mmcs_l76_stable = 1;
+        fprintf(stderr, "MMCS-L76: starvation shape seen: pCurTh %08x "
+                "(prio %02x, st16 %08x) monopolizes while band head %08x "
+                "(prio %02x, st16 %08x) RUNNABLE, pick 0, cNest 0 "
+                "(stability %u/2)\n",
+                pcur, cur_prio, cst, prun, cand_prio, pst,
+                mmcs_l76_stable);
+        return;
+    }
+    if (++mmcs_l76_stable < 2) {
+        return;
+    }
+    /* DELIVER — one byte: cNest := 1; the vendor's own KCall-return
+     * gate (0x9082304c) then routes to the pre-switcher save, the
+     * switcher, the idle-path drain and pick := the band head */
+    uint8_t one = 1;
+    cpu_physical_memory_write(0x08679885, &one, 1);
+    mmcs_l76_total++;
+    fprintf(stderr, "MMCS-L76: equal-priority starvation re-arm %u/%u: "
+            "cNest [0x88679885] := 1 (pCurTh %08x prio %02x vs band head "
+            "%08x prio %02x) — the vendor KCall-return gate reschedules\n",
+            mmcs_l76_total, mmcs_l76_max_deliv, pcur, cur_prio,
+            prun, cand_prio);
+    mmcs_l76_key = 0;
+    mmcs_l76_stable = 0;
+}
+
 /* MMCS fork (L73/S224): MMCS_L73EV — THE CHURN LIVELOCK RELEASE (the
  * stale sleep-node self-link unlink; decoded 2026-11-24, the S224
  * wait-retry-churn lane).
@@ -9697,6 +9836,23 @@ static void mmcs_l16_boot_parse(void)
                 "zombie, then the standing MMCS_L72EV daemon delivers — needs "
                 "MMCS_L72EV budget)\n",
                 mmcs_l75ho_cadence_ms, mmcs_l75ho_max_deliv);
+    }
+    if (getenv("MMCS_L76EV") && !getenv("MMCS_L16EV")) {
+        mmcs_l76_cadence_ms = atoi(getenv("MMCS_L76EV_MS") ? : "500");
+        if (!mmcs_l76_cadence_ms) {
+            mmcs_l76_cadence_ms = 500;
+        }
+        mmcs_l76_max_deliv = atoi(getenv("MMCS_L76EV_MAX") ? : "4");
+        if (!mmcs_l76_max_deliv) {
+            mmcs_l76_max_deliv = 4;
+        }
+        mmcs_l76_armed = 1;
+        fprintf(stderr, "MMCS-L76: equal-priority starvation re-arm armed "
+                "(cadence %ums, cap %u; the ONE-BYTE cNest [0x88679885] := 1 "
+                "when a RUNNABLE equal/lower-prio band head starves behind a "
+                "monopolist with pick==0 — the vendor KCall-return gate does "
+                "the rest)\n",
+                mmcs_l76_cadence_ms, mmcs_l76_max_deliv);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
