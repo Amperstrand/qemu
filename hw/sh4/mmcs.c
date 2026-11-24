@@ -2597,6 +2597,7 @@ static uint64_t mmcs_tick_l74cr;
 static uint64_t mmcs_tick_l74s4;
 static uint64_t mmcs_tick_l75ho;
 static uint64_t mmcs_tick_l76;
+static uint64_t mmcs_tick_l77;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2842,6 +2843,19 @@ static uint32_t mmcs_l76_max_deliv = 4;
 static uint32_t mmcs_l76_total;
 static uint32_t mmcs_l76_key;        /* stability key {pCurTh,band-head} */
 static uint32_t mmcs_l76_stable;     /* consecutive matching scans */
+/* L77 (S228): THE KILL-PATH API-LOCK CLEANUP RELEASE — the dying
+ * thread's [th+0x164] lock-ownership clear (see mmcs_l77_scan): the
+ * launcher's unhandled second-chance exception parks its own death in
+ * the kill continuation's API-lock cleanup loop (fn_9083adfc), whose
+ * transfer condition (owner cell == hCurTh|1) no future acquirer can
+ * ever satisfy in the post-server-death world */
+static void mmcs_l77_scan(void);
+static int mmcs_l77_armed;
+static uint32_t mmcs_l77_cadence_ms = 500;
+static uint32_t mmcs_l77_max_deliv = 4;
+static uint32_t mmcs_l77_total;
+static uint32_t mmcs_l77_key;        /* stability key {pCurTh,crit} */
+static uint32_t mmcs_l77_stable;     /* consecutive matching scans */
 /* L73 (S224): the churn livelock release — the stale sleep-node
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
@@ -3439,6 +3453,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l76_armed && ++mmcs_tick_l76 >= mmcs_l76_cadence_ms) {
             mmcs_tick_l76 = 0;
             mmcs_l76_scan();
+        }
+        /* L77: the kill-path API-lock cleanup release (S228 — the
+         * dying thread's [th+0x164] ownership clear; after L76 so the
+         * world settles its re-arm before the death completes) */
+        if (mmcs_l77_armed && ++mmcs_tick_l77 >= mmcs_l77_cadence_ms) {
+            mmcs_tick_l77 = 0;
+            mmcs_l77_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -8213,6 +8234,132 @@ static void mmcs_l76_scan(void)
     mmcs_l76_stable = 0;
 }
 
+/* MMCS fork (L77/S228): MMCS_L77EV — THE KILL-PATH API-LOCK CLEANUP
+ * RELEASE (the dying thread's lock-ownership clear; decoded
+ * 2026-11-24, the userdbgtrap-churn lane).
+ *
+ * THE DECODE (Observed: l77_census/probes 1-9 + the high-cadence RSP
+ * sampling on the l76-rearm restore; Verified: ROM disasm + the
+ * wince500 mirror): the L76 world's "UserDbgTrap churn" is NOT in
+ * UserDbgTrap — the launcher 0x906ca240 is on ITS OWN DEATH PATH. Its
+ * unhandled second-chance set-84 exception (code 0xC0000005 parked at
+ * TCB+0x38) ran the vendor chain (exception dispatcher -> UserDbgTrap
+ * FUN_90839f90 -> the JIT-debugger CreateProcess + poll), the poll is
+ * PAST, and the kill continuation FUN_9083be50 called its API-LOCK
+ * CLEANUP fn_9083adfc (xref: the ONLY caller), whose loop
+ * KCall(fn_90826f20 = "[pCurTh+0x164] ? that-crit : mark+0") waits for
+ * the ownership transfer that fn_90828a08 performs only when the
+ * owner cell pair [crit+0x98]+{0,+4} (= 0x8867adf4/0x8867adf4+4, the
+ * KData API-lock owner cells) names the CURRENT thread
+ * ([KData+8]|1, stocked by the switcher at 0x90822bc4 on every real
+ * switch). Live: the cells read {1, 1} (the loop's own mark) vs
+ * hCurTh|1 = 0x5c0003 — the E-branch transfer can never fire because
+ * NO thread will ever acquire the dead API set's lock again, and the
+ * stale waiter mark halfword[crit+0x96] == 0x8000 (the L74-era
+ * deadlock residue) keeps the loop on the E branch instead of the
+ * no-waiter D branch. The loop spins at KCall rate forever: A PARK
+ * INSIDE THE VENDOR'S OWN DEATH MACHINERY.
+ *
+ * THE DELIVERY (probe8, live-proven): ONE word, [pCurTh+0x164] := 0.
+ * The very next poll takes fn_90826f20's own zero path (it sets the
+ * released-mark halfword[pCurTh+12] |= 0x10 itself and returns 0), the
+ * loop exits through the vendor tail (F = 0x9082bbb4, G = 0x9082bc84),
+ * the kill continuation proceeds and the death LANDS (ctxpc reaches
+ * the kill-epilogue grave 0x9083c102, st16 0x020000d8) — the world
+ * settles into the healthy tick-driven dead-idle (OEMIdle drain
+ * cycling, no cascade, no exception storm). On HW the transfer chain
+ * completes because live threads re-acquire the API lock constantly;
+ * the stock-shape clear is what the vendor machinery reaches through
+ * that chain.
+ *
+ * GATE (2-cadence stable): pCurTh = a kernel-arena TCB carrying a
+ * DEATH CODE ([th+0x38] & 0xF0000000 == 0xC0000000, the NTSTATUS
+ * fatal class) + the DYING mark (st16 [th+0xC] bit 0x08 — the L75
+ * DYING vocabulary) + a standing lock ownership [th+0x164] = an arena
+ * crit whose halfword[+0x96] == 0x8000 (the E-branch mark) and whose
+ * owner pair [+0x98] lands in KData with the transfer condition
+ * standing FALSE ([owner+4] != [th+0x3C]|1 — if it named the current
+ * thread, the vendor's own transfer branch would fire; never
+ * compete with it).
+ *
+ * Env MMCS_L77EV (default off); MMCS_L77EV_MS cadence default 500,
+ * MMCS_L77EV_MAX cap default 4. */
+static void mmcs_l77_scan(void)
+{
+    if (!mmcs_l77_armed || mmcs_l77_total >= mmcs_l77_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    if (pcur < 0x88600000 || pcur >= 0x90800000) {
+        mmcs_l77_key = 0;
+        mmcs_l77_stable = 0;
+        return;
+    }
+    uint32_t pa = pcur - 0x80000000;
+    uint32_t crit = 0, st16 = 0, code = 0, hth = 0;
+    cpu_physical_memory_read(pa + 0x164, &crit, 4);
+    cpu_physical_memory_read(pa + 0x0C, &st16, 4);
+    cpu_physical_memory_read(pa + 0x38, &code, 4);
+    cpu_physical_memory_read(pa + 0x3C, &hth, 4);
+    /* the dying-with-an-exception witness: the death code + the
+     * DYING bit (the L75 0x02000008 vocabulary; the cleanup-world
+     * launcher reads 0x020000c8) */
+    if (crit < 0x88600000 || crit >= 0x90800000
+        || ((code & 0xF0000000) != 0xC0000000)
+        || !(st16 & 0x08)) {
+        mmcs_l77_key = 0;
+        mmcs_l77_stable = 0;
+        return;
+    }
+    uint16_t hw96 = 0;
+    uint32_t pown = 0, own2 = 0;
+    cpu_physical_memory_read(crit - 0x80000000 + 0x96, &hw96, 2);
+    cpu_physical_memory_read(crit - 0x80000000 + 0x98, &pown, 4);
+    if (hw96 != 0x8000 || pown < 0x88600000 || pown >= 0x90800000) {
+        mmcs_l77_key = 0;
+        mmcs_l77_stable = 0;
+        return;
+    }
+    cpu_physical_memory_read(pown - 0x80000000 + 4, &own2, 4);
+    /* the transfer condition standing false: if the owner cell already
+     * named hCurTh|1 the vendor's own transfer branch (fn_90828a08
+     * 0x90828a28) would fire — do not compete with the vendor path */
+    if (own2 == ((hth | 1) & 0xFFFFFFFF)) {
+        mmcs_l77_key = 0;
+        mmcs_l77_stable = 0;
+        return;
+    }
+    uint32_t key = pcur ^ crit;
+    if (mmcs_l77_key != key) {
+        mmcs_l77_key = key;
+        mmcs_l77_stable = 1;
+        fprintf(stderr, "MMCS-L77: kill-path cleanup shape seen: pCurTh "
+                "%08x (st16 %08x, code %08x) holds crit %08x "
+                "{hw96 %04x, owner %08x/%08x vs hTh %08x} "
+                "(stability %u/2)\n",
+                pcur, st16, code, crit, hw96, pown, own2, hth,
+                mmcs_l77_stable);
+        return;
+    }
+    if (++mmcs_l77_stable < 2) {
+        return;
+    }
+    /* DELIVER — one word: [pCurTh+0x164] := 0; the vendor's own next
+     * poll (KCall fn_90826f20) takes its zero path (the released-mark
+     * halfword |= 0x10 is ITS write), the cleanup loop exits through
+     * the vendor tail and the death completes */
+    uint32_t zero = 0;
+    cpu_physical_memory_write(pa + 0x164, &zero, 4);
+    mmcs_l77_total++;
+    fprintf(stderr, "MMCS-L77: kill-path cleanup release %u/%u: "
+            "[pCurTh+0x164] := 0 (pCurTh %08x crit %08x code %08x; the "
+            "vendor zero-path exit -> the death lands)\n",
+            mmcs_l77_total, mmcs_l77_max_deliv, pcur, crit, code);
+    mmcs_l77_key = 0;
+    mmcs_l77_stable = 0;
+}
+
 /* MMCS fork (L73/S224): MMCS_L73EV — THE CHURN LIVELOCK RELEASE (the
  * stale sleep-node self-link unlink; decoded 2026-11-24, the S224
  * wait-retry-churn lane).
@@ -9853,6 +10000,23 @@ static void mmcs_l16_boot_parse(void)
                 "monopolist with pick==0 — the vendor KCall-return gate does "
                 "the rest)\n",
                 mmcs_l76_cadence_ms, mmcs_l76_max_deliv);
+    }
+    if (getenv("MMCS_L77EV") && !getenv("MMCS_L16EV")) {
+        mmcs_l77_cadence_ms = atoi(getenv("MMCS_L77EV_MS") ? : "500");
+        if (!mmcs_l77_cadence_ms) {
+            mmcs_l77_cadence_ms = 500;
+        }
+        mmcs_l77_max_deliv = atoi(getenv("MMCS_L77EV_MAX") ? : "4");
+        if (!mmcs_l77_max_deliv) {
+            mmcs_l77_max_deliv = 4;
+        }
+        mmcs_l77_armed = 1;
+        fprintf(stderr, "MMCS-L77: kill-path API-lock cleanup release armed "
+                "(cadence %ums, cap %u; the ONE-WORD [pCurTh+0x164] := 0 "
+                "when a DYING current thread (code 0xC000xxxx, st16 bit 8) "
+                "holds a crit whose transfer condition stands false — the "
+                "vendor zero-path exit completes the death)\n",
+                mmcs_l77_cadence_ms, mmcs_l77_max_deliv);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
