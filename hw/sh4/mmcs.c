@@ -2590,6 +2590,7 @@ static uint64_t mmcs_tick_l19, mmcs_tick_l26, mmcs_tick_l32, mmcs_tick_l36;
 static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
 static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
+static uint64_t mmcs_tick_l72;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2802,6 +2803,15 @@ static uint32_t mmcs_l64_max_deliv = 2;
 static uint32_t mmcs_l64_total;
 static uint32_t mmcs_l64_key;
 static uint32_t mmcs_l64_stable;
+/* L72 (S223): the post-park completion hand-off — the consumed-
+ * completion stale-pCurTh wake (see mmcs_l72_scan) */
+static void mmcs_l72_scan(void);
+static int mmcs_l72_armed;
+static uint32_t mmcs_l72_cadence_ms = 2000;
+static uint32_t mmcs_l72_max_deliv = 2;
+static uint32_t mmcs_l72_total;
+static uint32_t mmcs_l72_key;        /* stability key {thread,ctxpc} */
+static uint32_t mmcs_l72_stable;     /* consecutive matching scans */
 static uint32_t mmcs_l59_cadence_ms;
 static uint32_t mmcs_l59_pulses;
 static uint32_t mmcs_l56_cadence_ms;
@@ -3239,6 +3249,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l64_armed && ++mmcs_tick_l64 >= mmcs_l64_cadence_ms) {
             mmcs_tick_l64 = 0;
             mmcs_l64_scan();
+        }
+        /* L72: the post-park completion hand-off (S223 — the
+         * consumed-completion stale-pCurTh wake; runs after the
+         * L64 family per the tick-order contract) */
+        if (mmcs_l72_armed && ++mmcs_tick_l72 >= mmcs_l72_cadence_ms) {
+            mmcs_tick_l72 = 0;
+            mmcs_l72_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -7591,6 +7608,209 @@ static void mmcs_l64_scan(void)
     mmcs_l64_stable = 0;
 }
 
+/* MMCS fork (L72/S223): MMCS_L72EV — THE POST-PARK COMPLETION
+ * HAND-OFF (the OEMIdle-park world, decoded 2026-11-24; the L71/S222
+ * "the masked sleep never wakes" reading corrected live: the park IS
+ * the vendor's OWN live tick-driven idle drain — pc oscillates
+ * 0x90822b96 (the switcher drain) <-> 0x908089fe (OEMIdle's
+ * post-sleep reload), the L13 tick + the in_sleep BL-bypass deliver
+ * the wake every pass, the idle counter [0x8867aad8] advances 0x2b62
+ * per pass, the KCall defer cells read CLEAN {cNest=0, dwKCRes=0}
+ * (the switcher's drain consumes the L52 protocol stores as designed
+ * — the leak question answered; cNest==1 is the vendor's own standing
+ * idle-drain marker, re-armed at 0x90822c5c after every idle call).
+ * THE STALL (Observed, the l72 census): pick [0x8867efa4] == 0 and
+ * pRunnable [0x8867efa0] == 0 FOREVER — the empty-runnable-set idle:
+ * the world's threads are BLOCKED and the launcher (pCurTh STALE ==
+ * 906ca240) sits with the CONSUMED completion {f1f8==0, t1fc==
+ * 0x1000} at the wait-eval tail ctxpc=0x908378d8 (the tst r0,r0;
+ * bf re-wait / r0==0 -> the flag poll -> rts -> pr=90843240 the
+ * set-84 dispatch family) — the completion's MakeRun was lost in the
+ * kills' aftermath. The L64 lane covers the PENDING-entry shape
+ * (f1f8!=0, tva!=pcur); the L54 lane the LINKED wait with plants;
+ * NOTHING covers the CONSUMED stale-pCurTh shape — the wake channel
+ * is starved by exactly this park.
+ *
+ * THE FIX — the MINIMAL hand-off (v2): the resume path needs only
+ * pick == pCurTh (the switcher 0x90822bb2 `cmp/eq r0,r14 -> bt
+ * 0x90822bcc`) — NO scheduling state is touched:
+ *   in-stub guard: (st16&3)==2 BLOCKED && [th+0x1F8]==0 (consumed)
+ *     && [th+0x1FC]==0x1000 (the cached completion)
+ *   the poison-neutralizer preload r8-r13 := [th+0x94..0xA8]
+ *     (the switcher's entry save lands on the walker's OWN ctx,
+ *     r14 == pCurTh == walker, stale)
+ *   pick [0x8867efa4] := th ; r14 := [0x88679894] (== th) ;
+ *   r0 := 0 (the wait-satisfied eval-tail value at the tst r0,r0
+ *   resume point) ; jsr the vendor switcher 0x90822b68 -> the drain
+ *   finds the cells CLEAN (no 0x90826f4c completion-drain call, no
+ *   drain2 recompute) -> pick == r14 -> the 0x90822bcc resume path:
+ *   r8/r9 from [th+0x94/0x98], r11-r15 from [th+0xA0..0xB0],
+ *   spc=[th+0xB4], sp=[th+0xB0], ssr=[th+0xB8] -> rte -> the
+ *   launcher's continuation (the flag poll -> rts to the 90843240
+ *   set-84 call chain -> the park fn -> CreateProcessW RETURNS to
+ *   c00ce888 -> the launch loop iterates).
+ *   (v1 lesson, live-caught: MakeRun + the [0x88679884]:=1 protocol
+ *   store made the switcher's cNest==1 drain — 0x90826f4c, its own
+ *   MakeRun on the pick — re-insert the already-banded thread; the
+ *   sorted-insert walk at 0x90825f7e-92 never exits on an
+ *   equal-priority self-link — the walk spin, 100s+ observed. v2
+ *   resumes the thread AS the current thread, exactly the stock
+ *   lost-preempt outcome.)
+ * Markers at stub+0xF0 (1 guard passed, 4 pre-switcher, 5 the
+ * no-switch tell).
+ *
+ * Host filter: the L52 discipline — arena TCB + tva == pCurTh (THE
+ * discriminator) + (st16&3)==2 + the consumed-completion pair
+ * {f1f8==0, t1fc==0x1000} + ctxpc in the wait-eval tail window
+ * [0x90837800, 0x9083800) + the dead-idle world gate (pick==0 ||
+ * pick==tva; pRunnable==0) + 2-cadence stability keyed
+ * {thread,ctxpc}. Repeating, delivery-capped (default 2),
+ * SELF-TERMINATING (the shape dies when the wait resumes).
+ *
+ * Stub at KILLSTK 0xBF00E400 (SHARED with L52 — the shapes are
+ * exclusive: L52 wants the FROZEN epilogue (st16&3)==0 at
+ * 0x90837ae8, L72 the BLOCKED consumed-completion eval tail; both
+ * write their own copy at delivery), dispatch slot evt 0x2E0
+ * (PA 0x0867A05C, ents[5]). Env MMCS_L72EV (default OFF;
+ * MMCS_L72EV_MS cadence default 2000; MMCS_L72EV_MAX cap default 2).
+ * Needs MMCS_KILLSTK + MMCS_TICK. */
+static uint8_t mmcs_l72_stub[] = {
+    0x86, 0x2f, 0x96, 0x2f, 0xa6, 0x2f, 0xb6, 0x2f,
+    0xc6, 0x2f, 0xd6, 0x2f, 0x22, 0x4f, 0x10, 0xd4,
+    0x43, 0x50, 0x02, 0xc8, 0x38, 0x89, 0x01, 0xc8,
+    0x36, 0x8b, 0x7e, 0xe0, 0x08, 0x40, 0x4e, 0x02,
+    0x28, 0x22, 0x31, 0x8b, 0x10, 0xe1, 0x18, 0x41,
+    0x04, 0x70, 0x4e, 0x02, 0x10, 0x32, 0x2b, 0x8b,
+    0x25, 0xe0, 0x08, 0x40, 0x4e, 0x08, 0x04, 0x70,
+    0x4e, 0x09, 0x04, 0x70, 0x4e, 0x0a, 0x04, 0x70,
+    0x4e, 0x0b, 0x04, 0x70, 0x4e, 0x0c, 0x04, 0x70,
+    0x4e, 0x0d, 0x03, 0xa0, 0x09, 0x00, 0x09, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0xe2, 0x0d, 0xd1,
+    0x22, 0x21, 0x0e, 0xd4, 0x0e, 0xd2, 0x42, 0x22,
+    0x0e, 0xd2, 0x22, 0x6e, 0x00, 0xe0, 0x04, 0xe2,
+    0x0d, 0xd1, 0x22, 0x21, 0x0d, 0xd2, 0x0b, 0x42,
+    0x09, 0x00, 0x05, 0xe2, 0x0c, 0xd1, 0x22, 0x21,
+    0x26, 0x4f, 0xf6, 0x6d, 0xf6, 0x6c, 0xf6, 0x6b,
+    0xf6, 0x6a, 0xf6, 0x69, 0x0b, 0x00, 0xf6, 0x68,
+    0xf6, 0xaf, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xe4, 0x5e, 0x82, 0x90, 0x00, 0x00, 0x00, 0x00,
+    0xa4, 0xef, 0x67, 0x88, 0x94, 0x98, 0x67, 0x88,
+    0x00, 0x00, 0x00, 0x00, 0x68, 0x2b, 0x82, 0x90,
+    0x00, 0x00, 0x00, 0x00,
+};
+#define MMCS_L72_STUB_VA   0xBF00E400
+#define MMCS_L72_SLOT_PA   0x0867A05C   /* evt 0x2E0, idx 5 (L52-shared) */
+
+static void mmcs_l72_scan(void)
+{
+    if (!mmcs_l72_armed || mmcs_l72_total >= mmcs_l72_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, ctxsp, f1f8, t1fc;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&ctxsp, arena + o + 0xb0, 4);
+        memcpy(&f1f8, arena + o + 0x1f8, 4);
+        memcpy(&t1fc, arena + o + 0x1fc, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || tva != pcur                     /* THE discriminator */
+            || (st16 & 3) != 2                 /* BLOCKED */
+            || f1f8 != 0                       /* entry consumed */
+            || t1fc != 0x1000                  /* cached completion */
+            || ctxpc < 0x90837800              /* the wait-eval tail */
+            || ctxpc >= 0x90838000             /* window */
+            /* the dead-idle world gate: pick==0 (nothing queued) OR
+             * pick==tva (the drain2 keep-current bookkeeping) —
+             * someone ELSE's pick = vendor world mid-flight, skip */
+            || (pick != 0 && pick != tva)
+            || prun != 0) {
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,ctxpc} (the L46/L52
+         * discipline — the shape must persist across scans) */
+        uint32_t key = tva ^ ctxpc;
+        if (mmcs_l72_key != key) {
+            mmcs_l72_key = key;
+            mmcs_l72_stable = 1;
+            fprintf(stderr, "MMCS-L72: t=%" PRId64 "ms post-park shape "
+                    "seen: th %08x *CUR* BLOCKED st16=%08x ctxpc=%08x "
+                    "sp=%08x f1f8=%08x t1fc=%08x (stability %u/2)\n",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, st16,
+                    ctxpc, ctxsp, f1f8, t1fc, mmcs_l72_stable);
+            return;
+        }
+        if (++mmcs_l72_stable < 2) {
+            return;
+        }
+        /* DELIVER — first THE LEAK REPAIR (the S223 recipe item (i),
+         * live-caught: the L52 hand-off's protocol stores
+         * {[0x88679884]:=1, [0x88679888]:=1} STAND LEAKED after the
+         * walker's continuation re-parks — every later switcher
+         * entry then calls the cNest==1 completion drain 0x90826f4c,
+         * whose own MakeRun on the pick re-inserts the still-banded
+         * thread; the sorted-insert walk at 0x90825f7e-92 never
+         * exits on the equal-priority self-link (the walk spin,
+         * 100s+ observed). The park-shape gates make a legit
+         * in-flight KCall impossible here (pick==0 && pRunnable==0
+         * && the pCurTh-consumed-completion shape) — clear both
+         * cells to the stock idle state). Then install, THEN patch
+         * the pools (the L36 order). */
+        cpu_physical_memory_write(0x08679884, &(uint32_t){ 0 }, 4);
+        cpu_physical_memory_write(0x08679888, &(uint32_t){ 0 }, 4);
+        cpu_physical_memory_write(0x1F00E400, mmcs_l72_stub,
+                                  sizeof mmcs_l72_stub);
+        cpu_physical_memory_write(0x1F00E400 + 0x50, &tva, 4);
+        cpu_physical_memory_write(0x1F00E400 + 0x94, &tva, 4);
+        uint32_t maddr = MMCS_L72_STUB_VA + 0xf0;
+        cpu_physical_memory_write(0x1F00E400 + 0x8c, &maddr, 4);
+        cpu_physical_memory_write(0x1F00E400 + 0xa0, &maddr, 4);
+        cpu_physical_memory_write(0x1F00E400 + 0xa8, &maddr, 4);
+        cpu_physical_memory_write(0x1F00E4F0, &maddr, 4);
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L72_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L72_STUB_VA) {
+            if (slot_cur != 0x90822e40) {
+                fprintf(stderr, "MMCS-L72: slot evt 0x2e0 busy (%08x) - "
+                        "scan skipped\n", slot_cur);
+                return;
+            }
+            cpu_physical_memory_write(MMCS_L72_SLOT_PA,
+                                      &(uint32_t){ MMCS_L72_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[5];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L72_STUB_VA;
+        e->evt_code = 0x2E0;
+        e->slot_pa = MMCS_L72_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l72_total++;
+        fprintf(stderr, "MMCS-L72: t=%" PRId64 "ms post-park completion "
+                "hand-off %u/%u: th %08x *CUR* BLOCKED ctxpc=%08x "
+                "(the leak repair cNest/dwKCRes := 0 + pick + r0:=0 + "
+                "the switcher resume; markers at %08x)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l72_total,
+                mmcs_l72_max_deliv, tva, ctxpc, MMCS_L72_STUB_VA + 0xf0);
+        return;                     /* one delivery per cadence */
+    }
+    /* no post-park shape this scan — reset the stability tracker */
+    mmcs_l72_key = 0;
+    mmcs_l72_stable = 0;
+}
+
 static void mmcs_l59_scan(void)
 {
     if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
@@ -8729,6 +8949,34 @@ static void mmcs_l16_boot_parse(void)
                 "L56/L62 per the tick-order contract)\n",
                 mmcs_l64_cadence_ms, mmcs_l64_max_deliv,
                 mmcs_l64_diag ? ", DIAGNOSE-ONLY" : "");
+    }
+    /* L72: the post-park completion hand-off — shares slot idx 5
+     * (evt 0x2E0) + the stub base with MMCS_L52EV (the shapes are
+     * exclusive: L52 the FROZEN epilogue, L72 the BLOCKED
+     * consumed-completion eval tail); both collide with
+     * MMCS_L16EV list entries >= 5 */
+    if (getenv("MMCS_L72EV")) {
+        if (getenv("MMCS_L16EV")) {
+            fprintf(stderr, "MMCS-L72: shares slot idx 5 (evt 0x2e0) "
+                    "with MMCS_L16EV — drop L16EV; not arming L72\n");
+        } else {
+            mmcs_l72_cadence_ms =
+                atoi(getenv("MMCS_L72EV_MS") ? : "2000");
+            if (!mmcs_l72_cadence_ms) {
+                mmcs_l72_cadence_ms = 2000;
+            }
+            mmcs_l72_max_deliv = atoi(getenv("MMCS_L72EV_MAX") ? : "2");
+            if (!mmcs_l72_max_deliv) {
+                mmcs_l72_max_deliv = 2;
+            }
+            mmcs_l72_armed = 1;
+            fprintf(stderr, "MMCS-L72: post-park completion hand-off "
+                    "armed (cadence %ums, cap %u; stub %08x slot evt "
+                    "0x2e0 wired on first delivery; the pCurTh-BLOCKED "
+                    "consumed-completion eval-tail class)\n",
+                    mmcs_l72_cadence_ms, mmcs_l72_max_deliv,
+                    MMCS_L72_STUB_VA);
+        }
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
