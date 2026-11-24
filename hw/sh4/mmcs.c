@@ -2591,6 +2591,7 @@ static uint64_t mmcs_tick_l37, mmcs_tick_l46, mmcs_tick_l47, mmcs_tick_l50;
 static uint64_t mmcs_tick_l52;
 static uint64_t mmcs_tick_l53;
 static uint64_t mmcs_tick_l72;
+static uint64_t mmcs_tick_l73;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2812,6 +2813,15 @@ static uint32_t mmcs_l72_max_deliv = 2;
 static uint32_t mmcs_l72_total;
 static uint32_t mmcs_l72_key;        /* stability key {thread,ctxpc} */
 static uint32_t mmcs_l72_stable;     /* consecutive matching scans */
+/* L73 (S224): the churn livelock release — the stale sleep-node
+ * self-link unlink (see mmcs_l73_scan) */
+static void mmcs_l73_scan(void);
+static int mmcs_l73_armed;
+static uint32_t mmcs_l73_cadence_ms = 1000;
+static uint32_t mmcs_l73_max_deliv = 12;
+static uint32_t mmcs_l73_total;
+static uint32_t mmcs_l73_key;        /* stability key {thread,head,nxt} */
+static uint32_t mmcs_l73_stable;     /* consecutive matching scans */
 static uint32_t mmcs_l59_cadence_ms;
 static uint32_t mmcs_l59_pulses;
 static uint32_t mmcs_l56_cadence_ms;
@@ -3256,6 +3266,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l72_armed && ++mmcs_tick_l72 >= mmcs_l72_cadence_ms) {
             mmcs_tick_l72 = 0;
             mmcs_l72_scan();
+        }
+        /* L73: the churn livelock release (S224 — the stale sleep-node
+         * self-link unlink; runs after the L72 hand-off per the
+         * tick-order contract: the artifact survives the resume) */
+        if (mmcs_l73_armed && ++mmcs_tick_l73 >= mmcs_l73_cadence_ms) {
+            mmcs_tick_l73 = 0;
+            mmcs_l73_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -7811,6 +7828,146 @@ static void mmcs_l72_scan(void)
     mmcs_l72_stable = 0;
 }
 
+/* MMCS fork (L73/S224): MMCS_L73EV — THE CHURN LIVELOCK RELEASE (the
+ * stale sleep-node self-link unlink; decoded 2026-11-24, the S224
+ * wait-retry-churn lane).
+ *
+ * THE DECODE (Observed: l73_census.py + the hotblocks aggregate on the
+ * l73-churn snapshot; Verified: ROM disasm): the L72 hand-off resumes
+ * the launcher as the CURRENT thread, but the L52-era stub insert left
+ * its node on the SLEEP LIST forever — head [0x8867ef8c] == th AND
+ * [th+0x144] == th (the self-link; wake tick [th+0x1E8] = 0x6ffc,
+ * ancient) — the same insert artifact whose run-queue half was the
+ * L72 walk-spin engine. Every subsequent timed-wait submit
+ * (fn_90828164 -> fn_908263cc, the `while (KCall(PutThreadToSleep) ||
+ * GET_NEEDSLEEP)` loop face 0x908378ce) walks the sleep list to find
+ * the insert position; the walk's tick compare ([cand+0x1E8] <
+ * deadline) always advances to the candidate, L6440 sets cursor :=
+ * candidate and returns 1 (re-evaluate) — with the candidate's next
+ * pointing AT ITSELF the walk NEVER terminates: the launcher spins
+ * 1.65M walk iterations/s INSIDE a KCall that never completes, so the
+ * KCall tail / resched-now path is never reached — A SCHEDULER
+ * MONOPOLY (no other thread can run, interrupts tick CurMSec but
+ * bResched is only consumed at the KCall exit). The wait's deadline
+ * still expires (fn_90828164 returns 0 when now >= deadline — the
+ * observed ~2s re-poll cadence), so the livelock does not stop the
+ * poll loop itself; it burns the CPU and starves the world.
+ *
+ * THE FIX: unlink the impossible-stock state. A CURRENT thread cannot
+ * be a member of the sleep list (a sleeping thread is BLOCKED and off
+ * pCurTh). Gates: pCurTh == t (an arena TCB) && [0x8867ef8c] == t &&
+ * [t+0x144] == t && 2-cadence stability keyed {t, head, nxt}.
+ * Delivery: [t+0x144] := 0 and [0x8867ef8c] := 0 host-side. The next
+ * wait submit's walk then completes through 100% vendor code: the
+ * empty-list insert path (L6532/L6562) parks the thread properly
+ * (state16 := BLOCKED|0x20, [t+0x1E8] := deadline, dwReschedTime
+ * min-update), dwKCRes := 1 -> the KCall tail resched-now -> the
+ * switcher -> the world gets the CPU back. Env MMCS_L73EV (default
+ * OFF; MMCS_L73EV_MS cadence default 1000; MMCS_L73EV_MAX cap
+ * default 4). Needs MMCS_TICK. */
+static void mmcs_l73_scan(void)
+{
+    if (!mmcs_l73_armed || mmcs_l73_total >= mmcs_l73_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0, pick = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    if (pcur < 0x90680000 || pcur >= 0x90780000) {
+        return;                       /* not an arena thread */
+    }
+    uint32_t tpa = pcur - 0x80000000;
+    uint32_t kbase = 0, ksz = 0, klow = 0;
+    cpu_physical_memory_read(tpa + 0x20, &kbase, 4);
+    cpu_physical_memory_read(tpa + 0x24, &ksz, 4);
+    cpu_physical_memory_read(tpa + 0x2c, &klow, 4);
+    if (kbase < 0xD0000000 || kbase >= 0xDC000000
+        || ksz != 0x10000
+        || klow < 0xD0000000 || klow >= 0xDC000000) {
+        return;                       /* not a TCB shape */
+    }
+    uint32_t head = 0, nxt = 0;
+    cpu_physical_memory_read(0x0867EF8C, &head, 4);
+    cpu_physical_memory_read(tpa + 0x144, &nxt, 4);
+    if (head != pcur) {
+        mmcs_l73_key = 0;
+        mmcs_l73_stable = 0;
+        return;
+    }
+    /* THE UNIFIED STALE-NODE GATE (v4): the current thread is RUNNING
+     * ((st16&3)!=2) while its own node sits at the sleep-list head
+     * with an EXPIRED wake tick ([th+0x1E8] < CurMSec) — the node the
+     * vendor's tick-bottom-half expiry (the fn1/L38TIMER lane) should
+     * have reaped. Two live shapes: the L52-era SELF-LINK (nxt==th,
+     * the walk-spin engine) and the RESURRECTED clean node (nxt==0,
+     * re-created every poll cycle: the expired own node at the head
+     * makes each fresh walk's tick-compare advance the cursor onto
+     * it, and the r4!=0 insert path re-links th before itself).
+     * A future-tick head==pcur belongs to a live park — skip (the
+     * thread would be BLOCKED anyway). */
+    uint32_t st16 = 0, wtick = 0, now = 0;
+    cpu_physical_memory_read(tpa + 0xc, &st16, 4);
+    cpu_physical_memory_read(tpa + 0x1E8, &wtick, 4);
+    cpu_physical_memory_read(0x0867AAD0, &now, 4);
+    int self_link = (nxt == pcur);
+    if ((st16 & 3) == 2 || wtick >= now) {
+        /* parked with a live node — stock; reset */
+        mmcs_l73_key = 0;
+        mmcs_l73_stable = 0;
+        return;
+    }
+    uint32_t key = pcur ^ head ^ nxt;
+    if (mmcs_l73_key != key) {
+        mmcs_l73_key = key;
+        mmcs_l73_stable = 1;
+        fprintf(stderr, "MMCS-L73: t=%" PRId64 "ms stale sleep node seen: "
+                "th %08x *CUR* head %08x nxt %08x%s tick %08x now %08x "
+                "(stability %u/2)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), pcur, head, nxt,
+                self_link ? " [self-link]" : " [expired-own-node]",
+                wtick, now, mmcs_l73_stable);
+        return;
+    }
+    if (++mmcs_l73_stable < 2) {
+        return;
+    }
+    /* DELIVER v2: unlink the list cells AND the in-flight sleeper's
+     * walk cursor. (v1 lesson, live-caught in the first A/B: the list
+     * unlink alone is undone within ONE submit — the churn's last
+     * L6440 left [sleeper+0] == th (the cursor == the thread itself);
+     * the next submit's r4!=0 path (L651e -> L652e -> L6562) performs
+     * "insert before the cursor": [th+0x144] := pCurTh == th — the
+     * SELF-LINK RE-CREATED, then the walk spins against it again. The
+     * sleeper is the wait-face frame at [th+0xB0]+0x10 (Verified: the
+     * face 0x908378b0 prologue; live: sp 0xd00beaa4 -> sleeper
+     * 0xd00beab4); its +0 must equal th for the clear to be safe
+     * (self-evidencing gate — a cursor pointing anywhere else belongs
+     * to a different, legitimate walk). */
+    uint32_t ctxsp = 0, cursor = 0;
+    cpu_physical_memory_read(tpa + 0xb0, &ctxsp, 4);
+    int cursor_cleared = 0;
+    if (ctxsp >= 0xD0000000 && ctxsp < 0xDC000000) {
+        uint32_t spa = ctxsp - 0xC0000000 + 0x10;
+        cpu_physical_memory_read(spa, &cursor, 4);
+        if (cursor == pcur) {
+            cpu_physical_memory_write(spa, &(uint32_t){ 0 }, 4);
+            cpu_physical_memory_write(spa + 6, &(uint16_t){ 0 }, 2);
+            cursor_cleared = 1;
+        }
+    }
+    cpu_physical_memory_write(0x0867EF8C, &(uint32_t){ 0 }, 4);
+    cpu_physical_memory_write(tpa + 0x144, &(uint32_t){ 0 }, 4);
+    mmcs_l73_total++;
+    fprintf(stderr, "MMCS-L73: t=%" PRId64 "ms stale sleep-node unlinked "
+            "%u/%u: th %08x *CUR*%s ([0x8867ef8c] := 0, [th+0x144] := 0%s; "
+            "the next wait submit parks through vendor code)\n",
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), mmcs_l73_total,
+            mmcs_l73_max_deliv, pcur, self_link ? " [self-link]"
+            : " [expired-own-node reaped]",
+            cursor_cleared ? ", sleeper cursor+flag := 0" :
+            " (sleeper cursor not th — list-only)");
+}
+
 static void mmcs_l59_scan(void)
 {
     if (!mmcs_l59_armed || mmcs_l59_pulses >= 6) {
@@ -8987,6 +9144,22 @@ static void mmcs_l16_boot_parse(void)
                 "armed (cadence %ums, sustain 3, cap 4 dispatches; the "
                 "90822dbe-class spin routes into the vendor kill "
                 "continuation 9083be50)\n", mmcs_l42_cadence_ms);
+    }
+    /* L73: the churn livelock release — the stale sleep-node unlink */
+    if (getenv("MMCS_L73EV")) {
+        mmcs_l73_cadence_ms = atoi(getenv("MMCS_L73EV_MS") ? : "1000");
+        if (!mmcs_l73_cadence_ms) {
+            mmcs_l73_cadence_ms = 1000;
+        }
+        mmcs_l73_max_deliv = atoi(getenv("MMCS_L73EV_MAX") ? : "12");
+        if (!mmcs_l73_max_deliv) {
+            mmcs_l73_max_deliv = 4;
+        }
+        mmcs_l73_armed = 1;
+        fprintf(stderr, "MMCS-L73: churn livelock release armed (cadence "
+                "%ums, cap %u; the pCurTh self-linked-on-sleep-list class; "
+                "host-side unlink [0x8867ef8c]/[th+0x144])\n",
+                mmcs_l73_cadence_ms, mmcs_l73_max_deliv);
     }
     if (getenv("MMCS_L26EV")) {
         if (getenv("MMCS_L16EV")) {
