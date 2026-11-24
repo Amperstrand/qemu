@@ -151,6 +151,13 @@ static uint32_t mmcs_cowfix_next = 0x10710000;
  * loader's own P1 NOR reads); restored at the handoff FLROM retirement */
 extern int mmcs_p1_alias_enabled;
 
+/* MMCS fork (L75/S226): a kernel-RAM VA (the 0x88600000-0x90800000 window:
+ * KData, the heap, the thread arena — VA-0x80000000 == PA). */
+static inline int kpa(uint32_t va)
+{
+    return va >= 0x88600000u && va < 0x90800000u;
+}
+
 uint32_t mmcs_fv_va2pa(uint32_t va)
 {
     for (int i = 0; i < mmcs_nfvmap; i++) {
@@ -1957,6 +1964,118 @@ fileview_done:;
         env->pc = 0x9083BE50u;
         cs->exception_index = -1;
         return;
+    }
+
+    /* MMCS fork (L75/S226): MMCS_L75TX — THE DYING-THREAD FORWARD'S DEAD
+     * ADDRESS-SPACE EXIT. DECODE (live, the l75 census + -d int tape +
+     * the l75_bp SwitchProc probe + the l75_kill manual delivery, all on
+     * the l74-chain restore): the chain world's '['-marker loop is an
+     * exception-forward that cannot land. The servant 0x906a3c38 (the
+     * primary thread of process P = 0x90699d8c, hProc 0x00df0002) took the
+     * set-84 NULL-object fault at 0x90843258 (address 0x234); the kernel
+     * classified it a stack overflow (0x234 within 4K above the record's
+     * zero limit -> STATUS_STACK_OVERFLOW), found no handler and ran the
+     * vendor forward FUN_9082546c: mark DYING (state16 |= 8), switch to
+     * the OWNER ([th+0x10] := [th+0x14]), ctx.pc := the USER twin
+     * [0x8867ebb8] = 0x4002cb50 (ThreadExceptionExit), SR.MD := 0. P's
+     * directory (0x90552000) carries only an EMPTY coredll-window L2 table
+     * (0x90555000: zero valid PTEs — the process's address space is gone)
+     * -> the fetch at the twin is an unresolvable ITLB miss -> the same
+     * forward again, ~945x/s, each pass re-printing the exception report
+     * through g_pOemGlobal->WriteDebugString until the SRD ring
+     * overflows ("\r\n[...*ALERT* buffer overflowed"). The KERNEL twin is
+     * no exit either: [0x8867e75c] (its call gateway) reads 0.
+     *
+     * On HW the vendor NEVER runs a forward whose target page is absent
+     * from the owner's directory (every live process maps the coredll
+     * window); the vendor's own response to a dead thread is the kill
+     * continuation (the S131 decode, the L39/L42 precedent): pc =
+     * KillThread 0x9083be50 on the KILLSTK page. DELIVERED HERE, at the
+     * exception boundary of that very fetch miss, when: the thread is a
+     * DYING arena thread switched to a NON-kernel owner, and the twin's
+     * page has no valid PTE in the owner's directory. The death is
+     * COMPLETED, not suppressed.
+     *
+     * (b) The kill path's BROKEN WAIT CHAIN: the next dying thread's
+     * KillThread walks its wait-block list (fn_90827bfc); a block whose
+     * next pointer is NULL (impossible-stock: the lists are circular)
+     * stores through it at 0x90827c12 (a write miss at address 8 -> the
+     * kernel forward cascade 0xc004dba2 -> the pc=0 park). Fix-up: take
+     * the vendor's OWN single-block branch ([th+8] := 0, resume at
+     * 0x90827c1c; r7 is already 0 from the shared delay slot).
+     *
+     * Env MMCS_L75TX (default off); MMCS_L75TX_MAX = per-class delivery
+     * cap (default 8). */
+    if (do_exp && getenv("MMCS_L75TX")) {
+        static uint32_t nl75tx, nl75wc;
+        uint32_t nmax = 8;
+        const char *mv = getenv("MMCS_L75TX_MAX");
+
+        if (mv && *mv) {
+            nmax = strtoul(mv, NULL, 0);
+        }
+        if (cs->exception_index == 0x040
+            && !(env->sr & (1u << SR_MD)) && nl75tx < nmax) {
+            uint32_t twin = 0, pth = 0, kproc = 0, t[3] = {0};
+            int unmappable = 0;
+
+            cpu_physical_memory_read(0x0867ebb8, &twin, 4);
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            cpu_physical_memory_read(0x0867aa00, &kproc, 4);
+            if (twin >= 0x40000000u && twin < 0x48000000u
+                && (env->pc ^ twin) < 0x1000u
+                && pth >= 0x90680000u && pth < 0x90780000u) {
+                cpu_physical_memory_read(pth - 0x80000000u + 0x0C, &t[0], 4);
+                cpu_physical_memory_read(pth - 0x80000000u + 0x10, &t[1], 4);
+                cpu_physical_memory_read(pth - 0x80000000u + 0x14, &t[2], 4);
+                unmappable = 1;
+                if ((t[0] & 8u) && t[1] == t[2] && t[2] != kproc && kpa(t[2])) {
+                    uint32_t dir = 0, l1 = 0, pte = 0;
+
+                    cpu_physical_memory_read(t[2] - 0x80000000u + 0x2C, &dir, 4);
+                    if (kpa(dir)) {
+                        cpu_physical_memory_read(dir - 0x80000000u
+                                                 + ((twin >> 22) & 0x3FF) * 4, &l1, 4);
+                        if (kpa(l1)) {
+                            cpu_physical_memory_read(l1 - 0x80000000u
+                                                     + ((twin >> 12) & 0x3FF) * 4, &pte, 4);
+                            unmappable = !(pte & 0x100u);
+                        }
+                    }
+                    if (unmappable) {
+                        nl75tx++;
+                        fprintf(stderr, "MMCS-L75TX: dying-thread "
+                                "forward cannot land: th %08x st16 %08x owner %08x "
+                                "twin %08x (dir %08x l1 %08x pte %08x) -> vendor "
+                                "kill continuation 9083be50 (%u/%u)\n",
+                                pth, t[0], t[2], twin, dir, l1, pte, nl75tx, nmax);
+                        env->sr |= (1u << SR_MD) | 0xF0u;
+                        env->sr &= ~((1u << SR_BL) | (1u << SR_RB));
+                        env->gregs[4] = 1;      /* the exit code (the kernel twin's) */
+                        env->gregs[15] = 0xBF00FF00u;
+                        env->pc = 0x9083BE50u;
+                        cs->exception_index = -1;
+                        return;
+                    }
+                }
+            }
+        }
+        if (cs->exception_index == 0x060 && (env->sr & (1u << SR_MD))
+            && env->pc == 0x90827C12u && env->gregs[2] == 0
+            && env->gregs[3] != 0 && nl75wc < nmax
+            && env->gregs[4] >= 0x90680000u && env->gregs[4] < 0x90780000u) {
+            uint32_t zero = 0;
+
+            cpu_physical_memory_write(env->gregs[4] - 0x80000000u + 8, &zero, 4);
+            nl75wc++;
+            fprintf(stderr, "MMCS-L75TX: broken wait chain in the "
+                    "kill path: th %08x blk %08x next NULL -> the vendor single-"
+                    "block branch 90827c1c (%u/%u)\n",
+                    env->gregs[4], env->gregs[3], nl75wc, nmax);
+            env->pc = 0x90827C1Cu;
+            cs->exception_index = -1;
+            return;
+        }
     }
 
     if (env->mmcs_kslot_active && do_exp

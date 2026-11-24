@@ -2595,6 +2595,7 @@ static uint64_t mmcs_tick_l73;
 static uint64_t mmcs_tick_l74;
 static uint64_t mmcs_tick_l74cr;
 static uint64_t mmcs_tick_l74s4;
+static uint64_t mmcs_tick_l75ho;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2816,6 +2817,16 @@ static uint32_t mmcs_l72_max_deliv = 2;
 static uint32_t mmcs_l72_total;
 static uint32_t mmcs_l72_key;        /* stability key {thread,ctxpc} */
 static uint32_t mmcs_l72_stable;     /* consecutive matching scans */
+/* L75: the post-kill orphan hand-off (the MMCS_L75TX daemon half; full
+ * block + decode below) — needs the L72 hand-off daemon (same stub, same
+ * slot) to deliver once pCurTh names the orphan */
+static void mmcs_l75ho_scan(void);
+static int mmcs_l75ho_armed;
+static uint32_t mmcs_l75ho_cadence_ms = 500;
+static uint32_t mmcs_l75ho_max_deliv = 4;
+static uint32_t mmcs_l75ho_total;
+static uint32_t mmcs_l75ho_key;      /* stability key {thread,ctxpc} */
+static uint32_t mmcs_l75ho_stable;   /* consecutive matching scans */
 /* L73 (S224): the churn livelock release — the stale sleep-node
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
@@ -3371,6 +3382,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l72_armed && ++mmcs_tick_l72 >= mmcs_l72_cadence_ms) {
             mmcs_tick_l72 = 0;
             mmcs_l72_scan();
+        }
+        /* L75: the post-kill orphan hand-off (S226 — restores the L72
+         * gate (pCurTh == the orphan) behind a killed zombie; runs right
+         * AFTER the L72 scan so the next L72 cadence delivers) */
+        if (mmcs_l75ho_armed && ++mmcs_tick_l75ho >= mmcs_l75ho_cadence_ms) {
+            mmcs_tick_l75ho = 0;
+            mmcs_l75ho_scan();
         }
         /* L73: the churn livelock release (S224 — the stale sleep-node
          * self-link unlink; runs after the L72 hand-off per the
@@ -7954,6 +7972,108 @@ static void mmcs_l72_scan(void)
     mmcs_l72_stable = 0;
 }
 
+/* MMCS fork (L75/S226): the POST-KILL ORPHAN HAND-OFF — the daemon half
+ * of MMCS_L75TX (the exception-boundary half lives in target/sh4/helper.c:
+ * the dying-thread forward's dead address-space exit). DECODE (live, the
+ * l75_census2 + l75_ho tapes on the l74-chain restore + MMCS_L75TX): the
+ * kill lands and the scheduler IDLES (pc 0x908089fe, CurMSec ~960/s) with
+ * pick == 0, pRunnable == 0, sleepHead == 0 — an EMPTY world. pCurTh is
+ * the killed ZOMBIE (st16 02000018, ctxpc 0x9083c102 = KillThread's tail,
+ * ctxsp on the KILLSTK page: the stock switcher's idle path never touches
+ * pCurTh) and the launcher 0x906ca240 is an ORPHANED BLOCKED thread — the
+ * L52/L54/L72 class (st16 020000e2, ctxpc 0x908378d8 = the wait-eval
+ * tail, the consumed completion {f1f8 0, f1fc 0x1000}, in NO list: slnk 0,
+ * wobj 0), byte-identical to its l74-chain cells: the L74CR wake stub took
+ * the CPU from the launcher mid sleep-insert (the evt-0x320 interrupt
+ * hit it at spc 0x908263e6 inside the insert walk) and its node was never
+ * linked. The standing MMCS_L72EV hand-off is gated on tva == pCurTh —
+ * behind a zombie it can never fire. DELIVERED HERE: when the world is
+ * the dead-idle zombie shape and exactly this orphan park shape stands
+ * (2-cadence stability), pCurTh := the orphan (ONE host write to
+ * [0x88679894]) and the standing L72 daemon delivers its own hand-off on
+ * its next cadence (the L72 stub/recipe verbatim — nothing new runs).
+ * Env MMCS_L75TX (default off; needs MMCS_L72EV with budget —
+ * MMCS_L72EV_MAX); MMCS_L75HO_MS cadence default 500, MMCS_L75HO_MAX cap
+ * default 4. */
+static void mmcs_l75ho_scan(void)
+{
+    if (!mmcs_l75ho_armed || mmcs_l75ho_total >= mmcs_l75ho_max_deliv
+        || !mmcs_l72_armed) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    /* the dead-idle world: nothing queued, nothing picked */
+    if (prun != 0 || pick != 0
+        || pcur < 0x90680000 || pcur >= 0x90680000 + sizeof arena - 0x220) {
+        return;
+    }
+    /* pCurTh must be the killed zombie: DYING (0x18) with its context
+     * parked on the KILLSTK page (the kill continuation's stack) */
+    uint32_t po = pcur - 0x90680000;
+    uint32_t zst = 0, zsp = 0;
+    memcpy(&zst, arena + po + 0xc, 4);
+    memcpy(&zsp, arena + po + 0xb0, 4);
+    if ((zst & 0x18) != 0x18 || zsp < 0xBF000000 || zsp >= 0xBF010000) {
+        return;
+    }
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t kbase, ksz, klow, st16, ctxpc, f1f8, t1fc, slnk, wobj;
+        memcpy(&kbase, arena + o + 0x20, 4);
+        memcpy(&ksz, arena + o + 0x24, 4);
+        memcpy(&klow, arena + o + 0x2c, 4);
+        memcpy(&st16, arena + o + 0xc, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&f1f8, arena + o + 0x1f8, 4);
+        memcpy(&t1fc, arena + o + 0x1fc, 4);
+        memcpy(&slnk, arena + o + 0x144, 4);
+        memcpy(&wobj, arena + o + 0x14c, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (kbase < 0xD0000000 || kbase >= 0xDC000000
+            || ksz != 0x10000
+            || klow < 0xD0000000 || klow >= 0xDC000000
+            || tva == pcur
+            || (st16 & 3) != 2                 /* BLOCKED */
+            || f1f8 != 0                       /* entry consumed */
+            || t1fc != 0x1000                  /* cached completion */
+            || ctxpc < 0x90837800              /* the wait-eval tail */
+            || ctxpc >= 0x90838000             /* window (the L72 pair) */
+            || slnk != 0                       /* in no sleep list */
+            || wobj != 0) {                   /* no wait object */
+            continue;
+        }
+        /* 2-cadence stability keyed {thread,ctxpc} */
+        uint32_t key = tva ^ ctxpc;
+        if (mmcs_l75ho_key != key) {
+            mmcs_l75ho_key = key;
+            mmcs_l75ho_stable = 1;
+            fprintf(stderr, "MMCS-L75TX: post-kill orphan shape seen: th %08x "
+                    "BLOCKED st16=%08x ctxpc=%08x behind zombie pCurTh %08x "
+                    "(stability %u/2)\n", tva, st16, ctxpc, pcur,
+                    mmcs_l75ho_stable);
+            return;
+        }
+        if (++mmcs_l75ho_stable < 2) {
+            return;
+        }
+        /* DELIVER — one write: pCurTh := the orphan; the standing L72
+         * daemon (same tick chain, after this scan) does the rest */
+        cpu_physical_memory_write(0x08679894, &tva, 4);
+        mmcs_l75ho_total++;
+        fprintf(stderr, "MMCS-L75TX: post-kill orphan hand-off %u/%u: pCurTh "
+                "%08x (killed zombie) := %08x (the orphaned launcher park "
+                "ctxpc=%08x); the MMCS_L72EV daemon delivers next cadence\n",
+                mmcs_l75ho_total, mmcs_l75ho_max_deliv, pcur, tva, ctxpc);
+        return;
+    }
+    mmcs_l75ho_key = 0;
+    mmcs_l75ho_stable = 0;
+}
+
 /* MMCS fork (L73/S224): MMCS_L73EV — THE CHURN LIVELOCK RELEASE (the
  * stale sleep-node self-link unlink; decoded 2026-11-24, the S224
  * wait-retry-churn lane).
@@ -9561,6 +9681,22 @@ static void mmcs_l16_boot_parse(void)
                     mmcs_l72_cadence_ms, mmcs_l72_max_deliv,
                     MMCS_L72_STUB_VA);
         }
+    }
+    if (getenv("MMCS_L75TX") && !getenv("MMCS_L16EV")) {
+        mmcs_l75ho_cadence_ms = atoi(getenv("MMCS_L75HO_MS") ? : "500");
+        if (!mmcs_l75ho_cadence_ms) {
+            mmcs_l75ho_cadence_ms = 500;
+        }
+        mmcs_l75ho_max_deliv = atoi(getenv("MMCS_L75HO_MAX") ? : "4");
+        if (!mmcs_l75ho_max_deliv) {
+            mmcs_l75ho_max_deliv = 4;
+        }
+        mmcs_l75ho_armed = 1;
+        fprintf(stderr, "MMCS-L75TX: post-kill orphan hand-off armed "
+                "(cadence %ums, cap %u; pCurTh := the orphan behind a killed "
+                "zombie, then the standing MMCS_L72EV daemon delivers — needs "
+                "MMCS_L72EV budget)\n",
+                mmcs_l75ho_cadence_ms, mmcs_l75ho_max_deliv);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
