@@ -194,6 +194,9 @@ bool mmcs_ilkfix_user_seen;
 
 /* MMCS fork (L68/S219): the live KData user page (MMCS_L68KD). */
 int mmcs_l68_kd_on(void);
+
+/* MMCS fork (L69/S220): the appverifier registry short-circuit. */
+int mmcs_l69ap_on(void);
 uint32_t mmcs_l68_kdata_page_pa(void);
 /* MMCS fork (L66/S218): the low-arena stocker — hw/sh4/mmcs.c owns
  * the stock _InterlockedAPIs block + the per-granule zero/poison
@@ -415,6 +418,52 @@ void superh_cpu_do_interrupt(CPUState *cs)
         /* fall through: the guards failed (a pending continuation
          * exists, or the kstack frame is not a ThreadStart launch) —
          * the vendor dispatch proceeds untouched */
+    }
+
+    /* MMCS fork: MMCS_L69AP (L69/S220) — the appverifier registry
+     * short-circuit (see hw/sh4/mmcs.c for the full decode). The
+     * set-84 method-23 slot (0xffff55d3, the filesys registry API
+     * set's RegOpenKeyExW) never completes through the vendor
+     * dispatch in our world (the PerformCallBack/[pTh+0x1C] class)
+     * and re-faults forever — the L68 shell-park spin that blocks
+     * every user process's coredll init before main(). Deliver the
+     * stock retail outcome at the trap boundary: consume the fetch
+     * exception, r0 := ERROR_FILE_NOT_FOUND (2), resume the user
+     * thread at pr (the jsr's own return site). Guards: USER mode,
+     * the exact slot decode (set 84, method 23), the surgical arg
+     * fingerprint (r4 = HKEY_LOCAL_MACHINE 0x80000002, r7 =
+     * KEY_ALL_ACCESS 0x000f003f, pr in the user coredll window
+     * 0x40011000..0x40080000). Cap: MMCS_L69AP_MAX (default 8). */
+    if (mmcs_l69ap_on() && do_exp
+        && cs->exception_index == 0x0e0
+        && !(env->sr & (1u << SR_MD))
+        && env->pc < 0xfffffe01u && env->pc >= 0xffff0001u
+        && (env->pc & 1u)) {
+        uint32_t idx = (0xfffffe01u - env->pc) >> 1;
+        if (((idx >> 8) & 0x7f) == 84 && (idx & 0xff) == 23
+            && env->gregs[4] == 0x80000002u
+            && env->gregs[7] == 0x000f003fu
+            && env->pr >= 0x40011000u && env->pr < 0x40080000u) {
+            static uint32_t nap, maxap;
+            if (!maxap) {
+                maxap = 8;
+                const char *m = getenv("MMCS_L69AP_MAX");
+                if (m) {
+                    maxap = (uint32_t)atoi(m) ? : 1;
+                }
+            }
+            if (nap < maxap) {
+                nap++;
+                fprintf(stderr, "MMCS: L69AP appverifier RegOpenKeyExW "
+                        "stock outcome (r0=2 ERROR_FILE_NOT_FOUND) th "
+                        "pc=%08x -> pr=%08x (delivery %u/%u)\n",
+                        env->pc, env->pr, nap, maxap);
+                env->gregs[0] = 2;
+                env->pc = env->pr;
+                cs->exception_index = -1;
+                return;
+            }
+        }
     }
 
     /* (MMCS_APIRET deleted 2026-11-19, retirement lane S173: the

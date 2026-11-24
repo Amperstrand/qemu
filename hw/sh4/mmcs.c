@@ -2510,6 +2510,8 @@ static uint32_t mmcs_l26_cadence_ms = 2000;
 int mmcs_l68_kd_on(void);
 uint32_t mmcs_l68_kdata_page_pa(void);
 void mmcs_l68_repin_kdata_page(void);
+/* L69/S220: the appverifier registry short-circuit (block below) */
+int mmcs_l69ap_on(void);
 static uint32_t mmcs_l32_stack_pa(uint32_t va);  /* L40: the L26M guard */
 static uint32_t mmcs_l26_max_deliv = 64;
 /* L36: the post-exit requeue daemon (full block + decode below) */
@@ -9504,6 +9506,42 @@ void mmcs_l68_repin_kdata_page(void)
         fprintf(stderr, " %02x", cur[j]);
     }
     fprintf(stderr, "\n");
+}
+
+/* MMCS fork (L69/S220): MMCS_L69AP — THE APPVERIFIER REGISTRY
+ * SHORT-CIRCUIT (env-gated, default off). THE DECODE (L69, ROM disasm
+ * + the CE6 mirror + the live SYSTRACE tape): the new user process's
+ * coredll init calls, as its LAST gate before main(), the appverifier
+ * check (PRIVATE/WINCEOS/COREOS/CORE/DLL/appverifier.cpp
+ * IsAppVerifierEnabled): WaitForAPIReady(84) (the runtime-registered
+ * filesys registry API set — returns 0 = READY in the K world) then
+ * RegOpenKeyExW(HKEY_LOCAL_MACHINE=0x80000002, L"ShimEngine", 0,
+ * KEY_ALL_ACCESS=0x000F003F) through the user PSL trampoline — slot
+ * 0xffff55d3 = set 84 method 23 (the ksshx.h arithmetic: index
+ * (0xFFFFFE01-pc)/2 = 0x5417, set 0x54, method 0x17). In our world the
+ * set-84 dispatch never completes (the PerformCallBack continuation
+ * class, [pTh+0x1C]==0 — the CBRET family): the slot fetch re-faults
+ * 6.5M times (the L68 "shell-park spin", hot pc 0x40023156 = the
+ * trampoline itself), blocking EVERY user process at init. THE STOCK
+ * OUTCOME (the retail hive carries no HKLM\ShimEngine key — corpus
+ * default.reg, Verified negative): RegOpenKeyExW returns
+ * ERROR_FILE_NOT_FOUND (2), the wrapper's `tst r0,r0; bf' skips to
+ * its common return with appverif_enabled left FALSE (the appverifier
+ * .cpp else-path byte-matched at ROM 0x9089cdca-0x9089cdf4), coredll
+ * init completes, main() runs. DELIVERY (the CBRET class — consume
+ * the trap at the boundary): at the 0x0e0 slot fetch in USER mode
+ * with the set-84/method-23 decode AND the surgical arg fingerprint
+ * (r4 == HKEY_LOCAL_MACHINE, r7 == KEY_ALL_ACCESS, pr in the user
+ * coredll window), consume the exception, r0 := 2, pc := pr (the jsr
+ * site's own return address — live-verified pr=0x4005adc8 = ROM
+ * 0x9089cdc8). Capped: MMCS_L69AP_MAX deliveries (default 8). */
+int mmcs_l69ap_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("MMCS_L69AP") != NULL;
+    }
+    return on;
 }
 
 static int mmcs_machine_post_load(void *opaque, int version_id)
