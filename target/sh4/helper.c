@@ -3376,6 +3376,83 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         }
     }
 
+    /* MMCS fork (L71/S222): MMCS_L71IT — the stale-ITLB kernel-data
+     * refill (the L70KS live-page family). THE DECODE (this lane,
+     * register-level): the L70KS world's standing death is NOT the
+     * ring-writer unbound-cell call (the null rung killed that
+     * premise: [0x88602d30] IS stocked = 0x8862ada0 by
+     * OEMInitDebugSerial's tail, the ring indices advance live) but
+     * the kernel MODULE-WINDOW data miss: the 64-entry guest UTLB
+     * churns (the healthy/death dumps show the C0-window entries
+     * cycling v=0/gone), while the ITLB keeps its stale-but-valid
+     * copy of the same guest-installed mapping (SH4 never invalidates
+     * ITLB copies on UTLB replacement) — so the code keeps EXECUTING
+     * (fetch path: ITLB hit / cached TBs) while a literal-pool DATA
+     * read of the same page (the SHC `mov.l Lpool,r3; mov.l @r3`
+     * idiom — observed live: evt=040 pc=c00cbe44 tea=c00cbe44
+     * r3=c00cbe44, the launcher's post-hand-off filesys continuation)
+     * misses the UTLB. On HW the kernel-mode TLB-miss vector refills
+     * from the page tables (the mapping is live — the entry was
+     * installed by the vendor loader); in our world the vendor
+     * exception path declares the kernel data miss FATAL (the stock
+     * CE6 kernel-pages-resident contract) -> the report -> the
+     * nested cascade -> the scheduler parks in OEMIdle with SR.BL=1
+     * (the permanent freeze; pc 0x908089fe = OEMIdle's post-sleep
+     * reload loop, sp = the KData exception stack 0x886797b4).
+     * FIX: a KERNEL-mode DTLB read miss whose page holds a VALID
+     * stale ITLB entry = the last-known-good GUEST-installed mapping:
+     * serve the access (and the page's exec) from the ITLB entry's
+     * own ppn — exactly the refill the stock handler would perform,
+     * delivered host-side through the L70KS discipline. Stores and
+     * fetches are NOT served (the decoded domino is a read; fetch
+     * misses imply no ITLB copy exists). Env MMCS_L71IT (default
+     * off). A file-static arm only (the L61 vmstate law). */
+    static int mmcs_l71it_armed = -1;
+    if (mmcs_l71it_armed < 0) {
+        mmcs_l71it_armed = getenv("MMCS_L71IT") != NULL;
+    }
+    if (mmcs_l71it_armed && ret == MMU_DTLB_MISS_READ
+        && mmu_idx != MMU_USER_IDX) {
+        int hit = -1;
+        for (int i = 0; i < ITLB_SIZE; i++) {
+            const tlb_t *e = &env->itlb[i];
+            if (!e->v) {
+                continue;
+            }
+            uint32_t start = (e->vpn << 10) & ~(e->size - 1);
+            if ((uint32_t)address >= start
+                && (uint32_t)address < start + e->size) {
+                hit = i;
+                break;
+            }
+        }
+        static int n71hit, n71miss;
+        if (hit >= 0) {
+            const tlb_t *e = &env->itlb[hit];
+            uint32_t pa = (((e->ppn << 10) & ~(e->size - 1))
+                           | ((uint32_t)address & (e->size - 1)));
+            int p71 = PAGE_READ | PAGE_EXEC;
+            if ((e->pr & 1) && e->d) {
+                p71 |= PAGE_WRITE;
+            }
+            uint32_t pa32 = pa & TARGET_PAGE_MASK;
+            p71 = mmcs_pgown_fill(env, (uint32_t)address & TARGET_PAGE_MASK,
+                                  &pa32, p71, false);
+            if (n71hit++ < 24) {
+                fprintf(stderr, "MMCS-L71IT: stale-ITLB kernel-data refill "
+                        "va=%08x -> pa=%08x (itlb %d pr=%u d=%u) (%d)\n",
+                        (uint32_t)address, pa32, hit, e->pr, e->d, n71hit);
+            }
+            tlb_set_page(cs, (uint32_t)address & TARGET_PAGE_MASK, pa32,
+                         p71, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        } else if (n71miss++ < 24) {
+            fprintf(stderr, "MMCS-L71IT: kernel data miss, no ITLB copy "
+                    "(va=%08x pr=%08x) (%d)\n",
+                    (uint32_t)address, env->pr, n71miss);
+        }
+    }
+
     if (ret == MMU_OK) {
         address &= TARGET_PAGE_MASK;
         physical &= TARGET_PAGE_MASK;
