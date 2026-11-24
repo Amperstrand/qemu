@@ -197,6 +197,7 @@ int mmcs_l68_kd_on(void);
 
 /* MMCS fork (L69/S220): the appverifier registry short-circuit. */
 int mmcs_l69ap_on(void);
+int mmcs_l70ks_on(void);
 uint32_t mmcs_l68_kdata_page_pa(void);
 /* MMCS fork (L66/S218): the low-arena stocker — hw/sh4/mmcs.c owns
  * the stock _InterlockedAPIs block + the per-granule zero/poison
@@ -3331,6 +3332,47 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                     (uint32_t)env->sr, (int)mmcs_ilkfix_user_seen,
                     (int)env->mmcs_srvpg_active, (int)mmcs_iatfix_on,
                     (int)mmcs_c0arm, env->pr);
+        }
+    }
+
+    /* MMCS fork (L70/S221): MMCS_L70KS — the kernel kstack-arena P3
+     * window refill (the full decode in hw/sh4/mmcs.c). A KERNEL-mode
+     * data load/store miss in the D0 window [0xd0000000, top) — the
+     * vendor's own top-of-RAM kstack/block arena (VA = PA + 0xC0000000
+     * over the RAM top; window top derived from the vendor's own
+     * OEMGLOBAL dwMainMemoryEndAddress cell at run time) = a straggler
+     * walk over a FREED kstack window whose backing RAM still holds
+     * the vendor's stale data. Refill the identity PA and let the
+     * vendor code read its own arena. Fetches are NOT served. */
+    if (ret != MMU_OK && mmcs_l70ks_on()
+        && mmu_idx != MMU_USER_IDX
+        && (uint32_t)address >= 0xD0000000u
+        && (access_type == MMU_DATA_LOAD
+            || access_type == MMU_DATA_STORE)) {
+        static uint32_t ks_top;
+        if (!ks_top) {
+            uint32_t mea = 0;
+            cpu_physical_memory_read(0x086025e4, &mea, 4);   /* OEMGLOBAL
+                                             * +0x64 dwMainMemoryEnd */
+            if (mea < 0x90600000u || mea >= 0x92000000u) {
+                mea = 0x90700000u;   /* the observed live value */
+            }
+            ks_top = 0xC0000000u + (mea - 0x80000000u);
+        }
+        if ((uint32_t)address < ks_top) {
+            uint32_t pa = (uint32_t)address - 0xC0000000u;
+            static int nks;
+            if (nks++ < 24) {
+                fprintf(stderr, "MMCS-L70KS: kstack-arena window refill "
+                        "va=%08x -> pa=%08x acc=%d (%d)\n",
+                        (uint32_t)address, pa, (int)access_type, nks);
+            }
+            int kprot = mmcs_pgown_fill(env, (uint32_t)address, &pa,
+                                        PAGE_READ | PAGE_WRITE,
+                                        access_type == MMU_DATA_STORE);
+            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa,
+                         kprot, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
         }
     }
 

@@ -2512,6 +2512,7 @@ uint32_t mmcs_l68_kdata_page_pa(void);
 void mmcs_l68_repin_kdata_page(void);
 /* L69/S220: the appverifier registry short-circuit (block below) */
 int mmcs_l69ap_on(void);
+int mmcs_l70ks_on(void);
 static uint32_t mmcs_l32_stack_pa(uint32_t va);  /* L40: the L26M guard */
 static uint32_t mmcs_l26_max_deliv = 64;
 /* L36: the post-exit requeue daemon (full block + decode below) */
@@ -9540,6 +9541,56 @@ int mmcs_l69ap_on(void)
     static int on = -1;
     if (on < 0) {
         on = getenv("MMCS_L69AP") != NULL;
+    }
+    return on;
+}
+
+/* MMCS fork (L70/S221): MMCS_L70KS — the kernel kstack-arena P3
+ * window refill (env MMCS_L70KS, default off).
+ *
+ * THE ASCII-DISPATCH DEATH ROOT (tape-verified this session, the
+ * l70_firstexc TH-EXC tape + cellwatch): the launcher's wait-cleanup
+ * block-chain walk (0x90837d38 `mov.l @(4,r12),r8`, the L51/L53
+ * block-walk family) follows a stale link into the FREED kstack P3
+ * window of an exited sibling thread (TEA 0xd007fd70, the kbase
+ * d0070000 TCB census row) — the kernel dropped the UTLB entry at
+ * thread exit, the straggler load DTLB-read-misses (MMU_DTLB_MISS_
+ * READ = evt 0x040 in this fork's raise table), and the vendor
+ * exception path declares it FATAL: the exception report
+ * (OEMWriteDebugString = OEMGLOBAL+0x10 = 0x90807364, called via the
+ * formatter 0x908320f0) runs with sp in the kernel STATIC POOL
+ * (0x886026d8, the stack region 0x886025b0..0x886028d0 under the OAL
+ * tables), its copy loop stores the "Exception %03x Thread=%08x
+ * PC=%08x" string at r14+8 = 0x886025b8 — DIRECTLY OVER the tail of
+ * the OEM function table (g_pOemGlobal = *[0x8867f03c] = 0x88602580:
+ +0x38 pfnGetTickCount, +0x44 pfnNotifyReschedule, +0x4C pfnUpdate-
+ * ReschedTime). The ASCII makes [+0x4C] nonzero, so every later
+ * GETCURRTICK (drain2 0x90827158: `[+0x4C] ? fn_0x90823964() :
+ * CurMSec`) dispatches fn_90823964 = `jmp @[[0x8867f03c]+0x38]` =
+ * "Exce" as code (pc 0x65637845) — the L69/S220 blocker — and the
+ * report tail's ring-writer call with r4 = [0x88602d30] = 0xeb41
+ * (the unbound OAL cell) faults at 0x90807562 nesting into the
+ * BL=1 ring freeze.
+ *
+ * THE FIX (the L68KD live-page family): the D0 kstack window IS the
+ * vendor's own top-of-RAM arena — VA = PA + 0xC0000000 over the RAM
+ * top region (dwMainMemoryEndAddress 0x90700000 -> PA 0x10700000;
+ * observed kbases d0010000..d0280000, 0x10000 pages, kstacks AND the
+ * wait-block arena share the window — the blocks d00bf3xx live on
+ * the waiting thread's own kstack page). A kernel-mode data miss in
+ * the window = a straggler walk over a FREED window whose backing
+ * RAM still holds the vendor's own stale data: refill PA = VA -
+ * 0xC0000000 and let the vendor code read its own arena (stock-
+ * faithful: the page is real, the vendor's own allocator state, and
+ * the stock cleanup dispatches stale blocks harmlessly — the L53
+ * early-return class). Fetches are NOT served (executing stack data
+ * stays a real bug); the window top derives from the vendor's own
+ * OEMGLOBAL cell at run time. */
+int mmcs_l70ks_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("MMCS_L70KS") != NULL;
     }
     return on;
 }
