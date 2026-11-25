@@ -2599,6 +2599,7 @@ static uint64_t mmcs_tick_l75ho;
 static uint64_t mmcs_tick_l76;
 static uint64_t mmcs_tick_l77;
 static uint64_t mmcs_tick_l78;
+static uint64_t mmcs_tick_l79;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2852,6 +2853,7 @@ static uint32_t mmcs_l76_stable;     /* consecutive matching scans */
  * ever satisfy in the post-server-death world */
 static void mmcs_l77_scan(void);
 static void mmcs_l78_scan(void);
+static void mmcs_l79_scan(void);
 static int mmcs_l77_armed;
 static uint32_t mmcs_l77_cadence_ms = 500;
 static uint32_t mmcs_l77_max_deliv = 4;
@@ -2864,6 +2866,12 @@ static uint32_t mmcs_l78_max_deliv = 4;
 static uint32_t mmcs_l78_total;
 static uint32_t mmcs_l78_key;        /* stability key {candidate} */
 static uint32_t mmcs_l78_stable;     /* consecutive matching scans */
+static int mmcs_l79_armed;
+static uint32_t mmcs_l79_cadence_ms = 500;
+static uint32_t mmcs_l79_max_deliv = 4;
+static uint32_t mmcs_l79_total;
+static uint32_t mmcs_l79_key;        /* stability key {runner} */
+static uint32_t mmcs_l79_stable;     /* consecutive matching scans */
 /* L73 (S224): the churn livelock release — the stale sleep-node
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
@@ -3475,6 +3483,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l78_armed && ++mmcs_tick_l78 >= mmcs_l78_cadence_ms) {
             mmcs_tick_l78 = 0;
             mmcs_l78_scan();
+        }
+        /* L79: the termination walker's dead-owner loop-exit (S230 —
+         * the KData wait-node owner word + the requeue; after the L78
+         * family so the parked-pair world is the one it serves) */
+        if (mmcs_l79_armed && ++mmcs_tick_l79 >= mmcs_l79_cadence_ms) {
+            mmcs_tick_l79 = 0;
+            mmcs_l79_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -8493,6 +8508,186 @@ static void mmcs_l78_scan(void)
     mmcs_l78_stable = 0;
 }
 
+/* MMCS fork (L79/S230): MMCS_L79EV — THE TERMINATION WALKER'S
+ * DEAD-OWNER LOOP-EXIT (the sibling's crit-face completion; decoded
+ * 2026-11-25, the crit-face lane).
+ *
+ * THE DECODE (Observed: l79_probe1..6 on the l78-parkedpair restore;
+ * Verified: ROM disasm of the walker FUN_90840754): the sibling
+ * 0x906dc000 (BLOCKED + DYING, st16 0x0200004a) parks at the crit face
+ * 0x90840814 INSIDE the PROCESS-TERMINATION WALKER FUN_90840754 (its
+ * ONLY caller FUN_908383c8 = the kill-everything continuation; the
+ * entry gate [param_1+0x98] == param_2). The walker walks the thread
+ * list terminating threads and its loop tail (0x9084084a-62) compares
+ * [param_2+4] (the wait-node's OWNER HANDLE) against [KData+8]
+ * (hCurTh, the switcher-stocked current-thread handle) — the loop
+ * exits only when the CURRENT thread's handle equals the node's
+ * owner. THE REGISTER MAPPING (live-proven, probe5 — the rung-4 note
+ * RETRACTED: its save-block words were the CALLEE's registers):
+ * r8 = param_1 = 0x906ff75c (the arena thread-proxy object), r10 =
+ * param_2 = 0x8867eaa0 = THE KDATA WAIT-NODE GLOBAL {+0 count,
+ * +4 owner hTh, +8 obj, ...} — the same object the S127/L8 pool
+ * decode found (0x90836014 -> 0x8867eaa0, the 0x908383c8
+ * creation/kill family's param_2).
+ *
+ * THE STALL: the node's owner cell reads 0xe80002 = THE PARKED DBG
+ * THREAD's hTh (the L78 parked pair's other half — BLOCKED at its own
+ * wait-eval tail, never becoming current), while the walk runs ON THE
+ * SIBLING: on every wake the sibling executes the tail with hCurTh =
+ * 0x4e0002 != 0xe80002 = the compare NEVER matches and the loop
+ * re-enters the blocking KCall — the walker churns at KCall rate
+ * (probe5's pc/ctxpc census: the tail's queue-unlink 0x90827964, the
+ * wait-submit 0x90828784, the case-1 calls 0x9083d358/0x90828924)
+ * with ctxpc pinned at the face. In stock the OWNER thread runs its
+ * own walk and the compare matches first-past; our post-kill world
+ * shuffled the walk onto the sibling's context (the L75-class
+ * ownership divergence).
+ *
+ * THE DELIVERY (live-proven, probe6): ONE WORD — [0x8867eaa0+4] :=
+ * the runner's own hTh — plus the L78-style requeue (the st16
+ * RUNNABLE re-mark + band head + pRunnable + dwKCRes). The vendor
+ * machinery then does everything: the pick scan switches to the
+ * runner (hCurTh := its hTh), the resumed walk executes the tail, the
+ * compare MATCHES, the exit call (pool 0x908408b8 = 0x90827b94) runs,
+ * the node's owner cell CLEARS ITSELF (the stock wait-node teardown
+ * consuming the match — live-caught: 0x4e0002 -> 0), and the
+ * termination completes: THE GRAVE 0x9083c102 (st16 0x02000058, sp
+ * unwound, no fault, no serial) in ~2 s.
+ *
+ * GATE (2-cadence stable): the stale-pCurTh world (pCurTh an arena
+ * TCB; pRunnable == 0 and pick in {0, pCurTh}) + the self-witnessed
+ * node ([0x8867EAA0+8] = an arena object whose [+0x98] ==
+ * 0x8867EAA0 — the entry-gate relation) + the owner [0x8867EAA0+4] =
+ * the hTh of a PARKED arena thread (found by scan, (st16&3)==2, NOT
+ * pCurTh — the owner cannot become current) + a RUNNER arena TCB
+ * (scan, first match) with ctxpc in the walker window [0x90840754,
+ * 0x90840880), (st16&3)==2 BLOCKED at the walker's blocking KCall,
+ * the DYING mark (st16 bit 0x08), a sane prio byte, and its own band
+ * head cell 0.
+ *
+ * Env MMCS_L79EV (default off); MMCS_L79EV_MS cadence default 500,
+ * MMCS_L79EV_MAX cap default 4. */
+static void mmcs_l79_scan(void)
+{
+    if (!mmcs_l79_armed || mmcs_l79_total >= mmcs_l79_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    if (pcur < 0x90680000 || pcur >= 0x90780000
+        || prun != 0 || (pick != 0 && pick != pcur)) {
+        mmcs_l79_key = 0;
+        mmcs_l79_stable = 0;
+        return;
+    }
+    /* the self-witnessed KData wait-node */
+    uint32_t node = 0x8867EAA0u;
+    uint32_t obj = 0, gate = 0, owner = 0;
+    cpu_physical_memory_read(node - 0x80000000 + 8, &obj, 4);
+    if (obj < 0x90680000 || obj >= 0x90780000) {
+        mmcs_l79_key = 0;
+        mmcs_l79_stable = 0;
+        return;
+    }
+    cpu_physical_memory_read(obj - 0x80000000 + 0x98, &gate, 4);
+    cpu_physical_memory_read(node - 0x80000000 + 4, &owner, 4);
+    if (gate != node || owner == 0) {
+        mmcs_l79_key = 0;
+        mmcs_l79_stable = 0;
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    /* the owner: a PARKED arena thread (BLOCKED — it cannot execute the
+     * walk even when it is the STALE pCurTh, the parked-pair world's
+     * exact shape: the DBG parked BLOCKED as the current thread) */
+    int owner_parked = 0;
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t h, st;
+        memcpy(&h, arena + o + 0x3c, 4);
+        memcpy(&st, arena + o + 0x0c, 4);
+        if (h == owner && (st & 3) == 2) {
+            owner_parked = 1;
+            break;
+        }
+    }
+    if (!owner_parked) {
+        mmcs_l79_key = 0;
+        mmcs_l79_stable = 0;
+        return;
+    }
+    /* the runner: BLOCKED + DYING at the walker face, off-queue */
+    uint32_t runner = 0, rst16 = 0, rprio = 0, rhth = 0;
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t st16, ctxpc, hth, l154, l158;
+        memcpy(&st16, arena + o + 0x0c, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&hth, arena + o + 0x3c, 4);
+        memcpy(&l154, arena + o + 0x154, 4);
+        memcpy(&l158, arena + o + 0x158, 4);
+        uint32_t tva = 0x90680000 + o;
+        uint8_t prio = arena[o + 0x41];
+        if ((st16 & 3) != 2                       /* BLOCKED */
+            || !(st16 & 0x08)                     /* DYING */
+            || tva == pcur
+            || hth == owner                       /* not the owner */
+            || ctxpc < 0x90840754                 /* the walker window */
+            || ctxpc >= 0x90840880
+            || prio == 0
+            || l154 != tva || l158 != tva) {      /* self-linked residue */
+            continue;
+        }
+        uint32_t bh = 0;
+        cpu_physical_memory_read(0x0867EFA8 + 4 * (prio >> 3), &bh, 4);
+        if (bh != 0) {
+            continue;
+        }
+        runner = tva;
+        rst16 = st16;
+        rprio = prio;
+        rhth = hth;
+        break;
+    }
+    if (!runner) {
+        mmcs_l79_key = 0;
+        mmcs_l79_stable = 0;
+        return;
+    }
+    if (mmcs_l79_key != runner) {
+        mmcs_l79_key = runner;
+        mmcs_l79_stable = 1;
+        fprintf(stderr, "MMCS-L79: walker dead-owner shape seen: runner "
+                "%08x (st16 %08x, prio %02x, hTh %08x) at the face, node "
+                "%08x owner %08x (a parked thread) (stability %u/2)\n",
+                runner, rst16, rprio, rhth, node, owner, mmcs_l79_stable);
+        return;
+    }
+    if (++mmcs_l79_stable < 2) {
+        return;
+    }
+    /* DELIVER — the loop-exit word + the L78-style requeue */
+    uint32_t zero = 0, one = 1;
+    uint32_t runnable = (rst16 & 0xFFFF0000) | ((rst16 & 0xFFFC) | 1);
+    cpu_physical_memory_write(node - 0x80000000 + 4, &rhth, 4);
+    cpu_physical_memory_write(runner - 0x80000000 + 0x0C, &runnable, 4);
+    cpu_physical_memory_write(runner - 0x80000000 + 0x148, &zero, 4);
+    cpu_physical_memory_write(0x0867EFA8 + 4 * (rprio >> 3), &runner, 4);
+    cpu_physical_memory_write(0x0867EFA0, &runner, 4);
+    cpu_physical_memory_write(0x08679888, &one, 4);
+    mmcs_l79_total++;
+    fprintf(stderr, "MMCS-L79: walker dead-owner loop-exit %u/%u: "
+            "[node %08x +4] := %08x (the runner's hTh) + the requeue "
+            "(st16 %08x -> RUNNABLE, band %u head, pRunnable, dwKCRes) — "
+            "the vendor tail compare matches, the exit call runs, the "
+            "node owner self-clears, the death lands at the grave\n",
+            mmcs_l79_total, mmcs_l79_max_deliv, node, rhth, rst16,
+            rprio >> 3);
+    mmcs_l79_key = 0;
+    mmcs_l79_stable = 0;
+}
+
 /* MMCS fork (L73/S224): MMCS_L73EV — THE CHURN LIVELOCK RELEASE (the
  * stale sleep-node self-link unlink; decoded 2026-11-24, the S224
  * wait-retry-churn lane).
@@ -10167,6 +10362,24 @@ static void mmcs_l16_boot_parse(void)
                 "self-linked off-queue wait-face thread — the vendor idle-"
                 "drain pick scan and switcher resume do the rest)\n",
                 mmcs_l78_cadence_ms, mmcs_l78_max_deliv);
+    }
+    if (getenv("MMCS_L79EV") && !getenv("MMCS_L16EV")) {
+        mmcs_l79_cadence_ms = atoi(getenv("MMCS_L79EV_MS") ? : "500");
+        if (!mmcs_l79_cadence_ms) {
+            mmcs_l79_cadence_ms = 500;
+        }
+        mmcs_l79_max_deliv = atoi(getenv("MMCS_L79EV_MAX") ? : "4");
+        if (!mmcs_l79_max_deliv) {
+            mmcs_l79_max_deliv = 4;
+        }
+        mmcs_l79_armed = 1;
+        fprintf(stderr, "MMCS-L79: walker dead-owner loop-exit armed "
+                "(cadence %ums, cap %u; the KData wait-node owner word "
+                "[0x8867eaa0+4] := the runner's hTh + the requeue when a "
+                "DYING BLOCKED runner sits at the termination-walker face "
+                "and the node's owner names a PARKED thread — the vendor "
+                "tail compare, exit call and node self-clear do the rest)\n",
+                mmcs_l79_cadence_ms, mmcs_l79_max_deliv);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");
