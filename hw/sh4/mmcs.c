@@ -2598,6 +2598,7 @@ static uint64_t mmcs_tick_l74s4;
 static uint64_t mmcs_tick_l75ho;
 static uint64_t mmcs_tick_l76;
 static uint64_t mmcs_tick_l77;
+static uint64_t mmcs_tick_l78;
 static uint64_t mmcs_tick_l54;
 static uint64_t mmcs_tick_l55;
 static uint64_t mmcs_tick_l58;
@@ -2850,12 +2851,19 @@ static uint32_t mmcs_l76_stable;     /* consecutive matching scans */
  * transfer condition (owner cell == hCurTh|1) no future acquirer can
  * ever satisfy in the post-server-death world */
 static void mmcs_l77_scan(void);
+static void mmcs_l78_scan(void);
 static int mmcs_l77_armed;
 static uint32_t mmcs_l77_cadence_ms = 500;
 static uint32_t mmcs_l77_max_deliv = 4;
 static uint32_t mmcs_l77_total;
 static uint32_t mmcs_l77_key;        /* stability key {pCurTh,crit} */
 static uint32_t mmcs_l77_stable;     /* consecutive matching scans */
+static int mmcs_l78_armed;
+static uint32_t mmcs_l78_cadence_ms = 500;
+static uint32_t mmcs_l78_max_deliv = 4;
+static uint32_t mmcs_l78_total;
+static uint32_t mmcs_l78_key;        /* stability key {candidate} */
+static uint32_t mmcs_l78_stable;     /* consecutive matching scans */
 /* L73 (S224): the churn livelock release — the stale sleep-node
  * self-link unlink (see mmcs_l73_scan) */
 static void mmcs_l73_scan(void);
@@ -3460,6 +3468,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l77_armed && ++mmcs_tick_l77 >= mmcs_l77_cadence_ms) {
             mmcs_tick_l77 = 0;
             mmcs_l77_scan();
+        }
+        /* L78: the lost-MakeRun requeue (S229 — the stock empty-queue
+         * head-path words for a RUNNABLE-marked off-queue thread; after
+         * the L77 death so the post-death world is the one it serves) */
+        if (mmcs_l78_armed && ++mmcs_tick_l78 >= mmcs_l78_cadence_ms) {
+            mmcs_tick_l78 = 0;
+            mmcs_l78_scan();
         }
         /* L42: the impossible-user-forward spin kill (host pc sample;
          * the deep-spin faults never reach the exception boundary) */
@@ -8360,6 +8375,124 @@ static void mmcs_l77_scan(void)
     mmcs_l77_stable = 0;
 }
 
+/* MMCS fork (L78/S229): MMCS_L78EV — THE LOST-MAKERUN REQUEUE (the
+ * stock empty-queue head-path delivery for a RUNNABLE-marked thread
+ * off the run queue; decoded 2026-11-25, the post-dead-world lane).
+ *
+ * THE DECODE (Observed: l78_census/probe1..3 on the l77-postdeath
+ * restore; Verified: ROM disasm of MakeRun 0x90825ee4 + the semantics
+ * map §3): the post-death world parks in the healthy tick-driven
+ * dead-idle with pCurTh = the zombie launcher, pick = 0 and pRunnable
+ * [0x8867efa0] = 0 — while the sibling 0x906dc000 (the KITL worker,
+ * start cell [th+0x150] = 0x90845b78 kitl.dll) sits RUNNABLE-marked
+ * (st16 low2 == 1) at the multi-wait face 0x90837cf6 (FUN_90837bcc),
+ * SELF-LINKED (+0x154/+0x158 == th — the insert's thread-side writes
+ * survived) but with EVERY band head cell 0: the second half of its
+ * MakeRun (the band-head + pRunnable writes) was lost in the kills'
+ * aftermath. The L76EV gate reads prun == 0 so it can never fire.
+ * THE STOCK SHAPE (MakeRun's empty-queue head fast path, disasm:
+ * [th+0x148] := 0; band_head[prio>>3] := th at 0x8867efa8+4*band;
+ * pRunnable := th; SetReschedule dwKCRes := 1 when pick == 0) —
+ * delivered, the idle drain's pick scan (FUN_90827148, walks the
+ * pRunnable +0x144 chain for the first RUNNABLE) computes pick := th
+ * and the switcher 0x90822b68 resumes it through 100% vendor code.
+ * LIVE-PROVEN (l78_probe2/3): the sibling runs its wait-return walk
+ * and EXITS CLEANLY (the grave 0x9083c102, death code [th+0x38] = 0,
+ * no fault, no serial, sp unwound past the kitl start frame, the
+ * world stays in the healthy dead-idle).
+ *
+ * GATE (2-cadence stable): the dead-idle world (pRunnable == 0 and
+ * pick in {0, pCurTh}) + an arena TCB, NOT pCurTh, RUNNABLE-marked
+ * (st16 low2 == 1), self-linked +0x154/+0x158, its band head cell 0,
+ * a sane prio byte — and (the absent-counterparty honesty) the wait
+ * face ctxpc in FUN_90837bcc's window [0x90837c00, 0x9083800) with
+ * the verdict cell [th+0x74] == 0 (a satisfied/cached wait verdict —
+ * the resume is the vendor's own wait-return path). Arena scan
+ * 0x90680000..0x90700000, first match.
+ *
+ * Env MMCS_L78EV (default off); MMCS_L78EV_MS cadence default 500,
+ * MMCS_L78EV_MAX cap default 4. */
+static void mmcs_l78_scan(void)
+{
+    if (!mmcs_l78_armed || mmcs_l78_total >= mmcs_l78_max_deliv) {
+        return;
+    }
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    /* the dead-idle world: nobody queued, nothing picked */
+    if (prun != 0 || (pick != 0 && pick != pcur)) {
+        mmcs_l78_key = 0;
+        mmcs_l78_stable = 0;
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t cand = 0, cst16 = 0, cprio = 0;
+    for (uint32_t o = 0; o + 0x220 <= sizeof arena; o += 4) {
+        uint32_t st16, ctxpc, w74, l154, l158;
+        memcpy(&st16, arena + o + 0x0c, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&w74, arena + o + 0x74, 4);
+        memcpy(&l154, arena + o + 0x154, 4);
+        memcpy(&l158, arena + o + 0x158, 4);
+        uint32_t tva = 0x90680000 + o;
+        uint8_t prio = arena[o + 0x41];
+        if ((st16 & 3) != 1                       /* RUNNABLE-marked */
+            || tva == pcur                        /* not the current */
+            || l154 != tva || l158 != tva         /* self-linked */
+            || prio == 0                          /* sane prio byte */
+            || ctxpc < 0x90837C00                 /* the wait face */
+            || ctxpc >= 0x90838000
+            || w74 != 0) {                        /* satisfied verdict */
+            continue;
+        }
+        uint32_t bh = 0;
+        cpu_physical_memory_read(0x0867EFA8 + 4 * (prio >> 3), &bh, 4);
+        if (bh != 0) {
+            continue;                             /* band occupied */
+        }
+        cand = tva;
+        cst16 = st16;
+        cprio = prio;
+        break;
+    }
+    if (!cand) {
+        mmcs_l78_key = 0;
+        mmcs_l78_stable = 0;
+        return;
+    }
+    if (mmcs_l78_key != cand) {
+        mmcs_l78_key = cand;
+        mmcs_l78_stable = 1;
+        fprintf(stderr, "MMCS-L78: lost-MakeRun shape seen: candidate "
+                "%08x (st16 %08x, prio %02x, band %u head 0, pRunnable "
+                "0, pick %08x) (stability %u/2)\n",
+                cand, cst16, cprio, cprio >> 3, pick, mmcs_l78_stable);
+        return;
+    }
+    if (++mmcs_l78_stable < 2) {
+        return;
+    }
+    /* DELIVER — the stock MakeRun empty-queue head fast path: the
+     * thread-side self-links and the RUNNABLE mark are already in
+     * place; the missing words are the queue-side ones */
+    uint32_t zero = 0, one = 1;
+    cpu_physical_memory_write(cand - 0x80000000 + 0x148, &zero, 4);
+    cpu_physical_memory_write(0x0867EFA8 + 4 * (cprio >> 3), &cand, 4);
+    cpu_physical_memory_write(0x0867EFA0, &cand, 4);
+    cpu_physical_memory_write(0x08679888, &one, 4);
+    mmcs_l78_total++;
+    fprintf(stderr, "MMCS-L78: lost-MakeRun requeue %u/%u: [band%u head] "
+            ":= %08x, [pRunnable] := %08x, dwKCRes := 1 (st16 %08x prio "
+            "%02x) — the vendor idle-drain pick scan + switcher resume\n",
+            mmcs_l78_total, mmcs_l78_max_deliv, cprio >> 3, cand, cand,
+            cst16, cprio);
+    mmcs_l78_key = 0;
+    mmcs_l78_stable = 0;
+}
+
 /* MMCS fork (L73/S224): MMCS_L73EV — THE CHURN LIVELOCK RELEASE (the
  * stale sleep-node self-link unlink; decoded 2026-11-24, the S224
  * wait-retry-churn lane).
@@ -10017,6 +10150,23 @@ static void mmcs_l16_boot_parse(void)
                 "holds a crit whose transfer condition stands false — the "
                 "vendor zero-path exit completes the death)\n",
                 mmcs_l77_cadence_ms, mmcs_l77_max_deliv);
+    }
+    if (getenv("MMCS_L78EV") && !getenv("MMCS_L16EV")) {
+        mmcs_l78_cadence_ms = atoi(getenv("MMCS_L78EV_MS") ? : "500");
+        if (!mmcs_l78_cadence_ms) {
+            mmcs_l78_cadence_ms = 500;
+        }
+        mmcs_l78_max_deliv = atoi(getenv("MMCS_L78EV_MAX") ? : "4");
+        if (!mmcs_l78_max_deliv) {
+            mmcs_l78_max_deliv = 4;
+        }
+        mmcs_l78_armed = 1;
+        fprintf(stderr, "MMCS-L78: lost-MakeRun requeue armed "
+                "(cadence %ums, cap %u; the stock empty-queue head-path "
+                "words {band head, pRunnable, dwKCRes} for a RUNNABLE-marked "
+                "self-linked off-queue wait-face thread — the vendor idle-"
+                "drain pick scan and switcher resume do the rest)\n",
+                mmcs_l78_cadence_ms, mmcs_l78_max_deliv);
     }
     if (getenv("MMCS_L42KILL")) {
         mmcs_l42_cadence_ms = atoi(getenv("MMCS_L42KILL_MS") ? : "500");

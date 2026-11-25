@@ -2078,6 +2078,98 @@ fileview_done:;
         }
     }
 
+    /* MMCS fork (L78/S229): MMCS_L78TX — THE DYING THREAD'S UNLANDABLE
+     * KSLOT-RAISE DEATH-CASCADE COMPLETION (the debugger-thread death
+     * quietus; decoded 2026-11-25, the post-dead-world lane).
+     *
+     * THE DECODE (Observed: l78_probe4/5/6 — the gate-(ii) MakeRun-shape
+     * resume of the debugger thread 0x906a3c38 on the l77-postdeath
+     * restore, + the -d int tape; the pc=0xfffffdc7 identity per the
+     * fork's own L44 static decode): the thread parked at the
+     * exception-entry prologue 0x908232f0 is an impossible-stock
+     * artifact (a thread preempted BEFORE its exception entry could
+     * save EXPEVT — stock masks interrupts through the entry; the
+     * recycled-TCB world broke that law). Resuming it there (the stock
+     * preempt-path shape: MakeRun + pick + the switcher resume)
+     * executes the entry with a STALE EXPEVT: the dispatch classifies
+     * 0xC000001D, the no-handler death path runs, the vendor forward
+     * FUN_9082546c targets the USER twin 0x4002cb50 whose page is
+     * absent from Q's directory — the L75TX router lands the kill
+     * continuation and Q's exit code is written (0x103 -> 1) — and
+     * then the death's user-teardown leg CASCADES through the recycled
+     * kstack's corrupted frames: the frame chain keeps invoking the
+     * KSLOT RaiseException trampoline (evt 0x180 at pc 0xfffffdc7,
+     * r4 = 0xC00000FD — the old servant's parked death code read back
+     * from the recycled frame residue) — each raise runs the full
+     * kernel dispatch and re-prints the exception report through the
+     * OAL writer until a self-faulting TLB miss in the writer parks
+     * the whole world at pc 0 WITH THE TICK DEAD (CurMSec frozen).
+     *
+     * On HW the recycled-frame cascade cannot occur (the teardown's
+     * frame chain is intact and a dying thread's user leg runs the
+     * twin, not a stale KSLOT raise); the vendor's own response to a
+     * dead thread is the kill continuation (the L39/L42/L75
+     * precedent). DELIVERED HERE, at the kslot-raise boundary, when:
+     * the fetch is in the P4 slot window (pc >= 0xFFFF0000) with r4 =
+     * a 0xC000xxxx NTSTATUS, the current thread is a DYING (st16 bit
+     * 0x08) arena thread with a death/exit code present ([th+0x38] !=
+     * 0), and its process exit cell ([[proc+8]+0x14]) is already
+     * written (!= 0x103 STILL_ACTIVE — the termination has landed;
+     * this only completes the thread's own quietus). The delivery is
+     * the L75TX shape: kernel SR + IMASK 0xF, r4 := the exit code,
+     * r15 := the KILLSTK page, pc := 0x9083BE50.
+     *
+     * Env MMCS_L78TX (default off); MMCS_L78TX_MAX cap default 4. */
+    if (do_exp && getenv("MMCS_L78TX")) {
+        static uint32_t nl78tx;
+        uint32_t n78max = 4;
+        const char *mv78 = getenv("MMCS_L78TX_MAX");
+
+        if (mv78 && *mv78) {
+            n78max = strtoul(mv78, NULL, 0);
+        }
+        if (cs->exception_index == 0x180
+            && env->pc >= 0xFFFF0000u && nl78tx < n78max
+            && (env->gregs[4] & 0xF0000000u) == 0xC0000000u) {
+            uint32_t pth = 0, st16 = 0, code = 0, exitc = 0;
+
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            if (pth >= 0x90680000u && pth < 0x90780000u) {
+                cpu_physical_memory_read(pth - 0x80000000u + 0x0C, &st16, 4);
+                cpu_physical_memory_read(pth - 0x80000000u + 0x38, &code, 4);
+                uint32_t proc = 0, exitblk = 0;
+
+                cpu_physical_memory_read(pth - 0x80000000u + 0x10, &proc, 4);
+                if (proc >= 0x90680000u && proc < 0x90780000u) {
+                    cpu_physical_memory_read(proc - 0x80000000u + 8,
+                                             &exitblk, 4);
+                }
+                if ((st16 & 8u) && code != 0
+                    && exitblk >= 0x90680000u && exitblk < 0x90780000u) {
+                    cpu_physical_memory_read(exitblk - 0x80000000u + 0x14,
+                                             &exitc, 4);
+                }
+                if ((st16 & 8u) && code != 0 && exitc != 0
+                    && exitc != 0x103u) {
+                    nl78tx++;
+                    fprintf(stderr, "MMCS-L78TX: dying thread's unlandable "
+                            "kslot-raise cascade: th %08x (st16 %08x, code "
+                            "%08x, exit cell %08x, raise %08x) pc=%08x -> "
+                            "vendor kill continuation 9083be50 (%u/%u)\n",
+                            pth, st16, code, exitc, env->gregs[4], env->pc,
+                            nl78tx, n78max);
+                    env->sr |= (1u << SR_MD) | 0xF0u;
+                    env->sr &= ~((1u << SR_BL) | (1u << SR_RB));
+                    env->gregs[4] = exitc & 0xFFFFFFFFu;
+                    env->gregs[15] = 0xBF00FF00u;
+                    env->pc = 0x9083BE50u;
+                    cs->exception_index = -1;
+                    return;
+                }
+            }
+        }
+    }
+
     if (env->mmcs_kslot_active && do_exp
         && (cs->exception_index == 0x180 || cs->exception_index == 0x1a0)
         && (env->sr & (1u << SR_MD))
