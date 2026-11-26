@@ -5925,78 +5925,113 @@ static void mmcs_l84cr_scan(void)
     if (prun != 0) {
         return;                       /* only a BUSY run queue blocks */
     }
-    for (uint32_t o = 0x4; o + 0x200 <= sizeof arena; o += 4) {
-        uint32_t st16, ctxpc, sp;
+    /* THE V4 SCAN (the static4 child's design: the tightened L26
+     * shape + the epoch gate). THE 4-BYTE STRIDE LAW applies. */
+    for (uint32_t o = 0x4; o + 0x210 <= sizeof arena; o += 4) {
+        uint32_t st16, ctxpc, sp, bf, rec, w1f8;
         memcpy(&st16, arena + o + 0x0c, 4);
         memcpy(&ctxpc, arena + o + 0xb4, 4);
         memcpy(&sp, arena + o + 0xb0, 4);
+        uint8_t bf_b = arena[o + 0xF];
+        bf = bf_b;
+        memcpy(&rec, arena + o + 0x14c, 4);
+        memcpy(&w1f8, arena + o + 0x1f8, 4);
         uint32_t tva = 0x90680000 + o;
-        if (ctxpc != 0x90837cf6 || (st16 & 3) != 2
+        if (ctxpc != 0x90837cf6 || (st16 & 3) != 2 || bf != 2
+            || w1f8 != 0
             || sp < 0xD0000000u || sp >= 0xD1000000u
             || tva == pcur) {
             continue;
         }
-        /* THE NODE RESOLVE: scan the sp-adjacent region (the wait
-         * frame) for the on-stack node — a word that is ITSELF a
-         * plausible object (the 0x9060-0x9077 arena) OR points at
-         * one; the node's [node+0] = the object pointer. */
-        /* THE WINDOW LAW (v2's lesson: the L26's own live data — the
-         * wait-node at sp+0x18 for the sp=d01cfae0 waiter — sits JUST
-         * past the [sp-0x40, sp+0x10] probe): cover [sp-0x40, sp+0x40). */
-        uint32_t pa_sp = sp - 0xC0000000u;
-        uint32_t frame[32] = {0};
-        cpu_physical_memory_read(pa_sp - 0x40, frame, 128);
-        uint32_t obj = 0;
-        for (int i = 0; i < 32; i++) {
-            uint32_t w = frame[i];
-            /* THE NODE INDIRECTION: a 0xD0-range word = the ON-STACK
-             * wait node (the L26 class) — its first word = the object
-             * pointer (the wait-block {obj,next,prev,..,pTh} layout) */
-            if (w >= 0xD0000000u && w < 0xD1000000u && (w & 3) == 0) {
-                uint32_t nodeword[1] = {0};
-                cpu_physical_memory_read(w - 0xC0000000u,
-                                         (uint8_t *)nodeword, 4);
-                w = nodeword[0];
-            }
-            if (w >= 0x90600000u && w < 0x90780000u && (w & 3) == 0) {
-                /* THE EVNT GATE (v1's lesson: the pTh self-reference
-                 * matched the TCBs; v2's: the CINFO trailer ID) */
-                uint32_t cinfo = 0;
-                cpu_physical_memory_read(0x10000000 + (w - 0x90600000u)
-                                         + 0x90, (uint8_t *)&cinfo, 4);
-                if (cinfo == 0x90822040u) {
-                    obj = w;
-                    break;
-                }
-            }
-        }
-        if (!obj) {
-            static int nno;
-            if (nno++ < 12) {
-                fprintf(stderr, "MMCS-L84CR(no-obj): t=%" PRId64 "ms th "
-                        "%08x sp %08x - no EVNT candidate in the frame\n",
-                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, sp);
-            }
+        /* THE RECORD-POSITION LAW: [th+0x14C] == sp+0x18 */
+        if (rec != sp + 0x18) {
             continue;
         }
-        /* THE GATED WRITE: the stock SET byte */
-        uint8_t sig = 0;
-        cpu_physical_memory_read(0x10000000 + (obj - 0x90680000u) + 0x8D,
-                                 &sig, 1);
-        if (sig & 1) {
-            continue;                 /* already SET — the eval owns it */
+        /* THE WB RESOLUTION: wb = [th+0x34]; fallback sp+0x28 */
+        uint32_t wb = 0;
+        memcpy(&wb, arena + o + 0x34, 4);
+        if (wb < sp + 0x28 || wb >= sp + 0xB8) {
+            wb = sp + 0x28;
         }
-        uint8_t one = 1;
-        cpu_physical_memory_write(0x10000000 + (obj - 0x90680000u) + 0x8D,
-                                  &one, 1);
+        /* THE OWNERSHIP WITNESS: [wb+0x1C] == the TCB (the kstack PA
+         * read: the wb is a D0 VA) */
+        uint32_t owner = 0;
+        cpu_physical_memory_read(wb - 0xC0000000u + 0x1C,
+                                 (uint8_t *)&owner, 4);
+        if (owner != tva) {
+            continue;
+        }
+        /* THE EPOCH GATE: word[wb+0x1A] == word[th+0x42] (the
+         * stale-guard + the idempotence) */
+        uint16_t wb_epoch = 0, th_epoch = 0;
+        cpu_physical_memory_read(wb - 0xC0000000u + 0x1A,
+                                 (uint8_t *)&wb_epoch, 2);
+        memcpy(&th_epoch, arena + o + 0x42, 2);
+        if (wb_epoch != th_epoch) {
+            continue;
+        }
+        /* THE V4 WRITE SET (the 0x90827bfc BLOCKED-arm set, stock
+         * order; all waiter-side — NO object writes) */
+        uint32_t pa_th = 0x10000000 + o;
+        uint32_t pa_wb = wb - 0xC0000000u;
+        uint32_t pa_rec = rec - 0xC0000000u;
+        uint32_t lp34 = 0;
+        memcpy(&lp34, arena + o + 0x34, 4);
+        /* 1. [wb+0xC] := 0 (the unlink mark) */
+        cpu_physical_memory_write(pa_wb + 0xC, &(uint32_t){ 0u }, 4);
+        /* 2. [record+4] := [th+0x34] (the lpProxy captured) */
+        cpu_physical_memory_write(pa_rec + 4, &lp34, 4);
+        /* 3. [record+8] := [th+0x1F8] (0) */
+        cpu_physical_memory_write(pa_rec + 8, &(uint32_t){ 0u }, 4);
+        /* 4. [th+0x34] := 0 (the drain) */
+        cpu_physical_memory_write(pa_th + 0x34, &(uint32_t){ 0u }, 4);
+        /* 5. word[th+0x42]++ (the epoch bump) */
+        uint32_t wc = 0;
+        memcpy(&wc, arena + o + 0x42, 4);
+        wc++;
+        cpu_physical_memory_write(pa_th + 0x42, &wc, 4);
+        /* 6. [th+0x74] := 0x1000 (THE VERDICT) */
+        cpu_physical_memory_write(pa_th + 0x74,
+                                  &(uint32_t){ 0x1000u }, 4);
+        /* 7. st16 := (st16 & ~3) | 3 (NEEDSRUN; the wake overwrites) */
+        uint32_t st_new = (st16 & ~3u) | 3u;
+        cpu_physical_memory_write(pa_th + 0x0C, &st_new, 4);
+        /* THE WAKE (the L62/L54 recipe: the stub + the L16-ent) */
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA && slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L84CR: slot busy (%08x) - retry\n",
+                    slot_cur);
+            return;
+        }
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        cpu_physical_memory_write(0x1F00E6F0,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            cpu_physical_memory_write(MMCS_L54_SLOT_PA,
+                                      &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
         mmcs_l84cr_total++;
-        fprintf(stderr, "MMCS-L84CR: t=%" PRId64 "ms dead-child release "
-                "%u/%u: waiter %08x obj %08x [obj+0x8D]:=1 (the stock "
-                "failure-path SET the dying child owed; the live eval "
-                "consumes it)\n",
+        fprintf(stderr, "MMCS-L84CR: t=%" PRId64 "ms V4 KCall-satisfy "
+                "%u/%u: waiter %08x (sp %08x wb %08x rec %08x epoch %u) "
+                "- the 0x90827bfc write set + the v9 wake\n",
                 qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
-                mmcs_l84cr_total, mmcs_l84cr_max_deliv, tva, obj);
-        return;                       /* one pulse per cadence */
+                mmcs_l84cr_total, mmcs_l84cr_max_deliv,
+                tva, sp, wb, rec, wb_epoch);
+        return;                       /* one delivery per cadence */
     }
 }
 
