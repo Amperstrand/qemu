@@ -5,7 +5,7 @@ sh4_ss.add(files(
   'sh7750_regnames.c',
 ))
 sh4_ss.add(when: 'CONFIG_R2D', if_true: files('r2d.c'))
-sh4_ss.add(when: 'CONFIG_MMCS', if_true: files('mmcs.c', 'mmcs-sdhi.c', 'mmcs-input.c', 'mmcs-2dg.c', 'mmcs-regvt.c', 'mmcs-vintc.c', 'mmcs-pollsys.c', 'mmcs-chanflash.c', 'mmcs-fb.c'))
+sh4_ss.add(when: 'CONFIG_MMCS', if_true: files('mmcs.c', 'mmcs-sdhi.c', 'mmcs-input.c', 'mmcs-2dg.c', 'mmcs-regvt.c', 'mmcs-vintc.c', 'mmcs-pollsys.c', 'mmcs-chanflash.c', 'mmcs-fb.c', 'mmcs-usb.c', 'mmcs-handoff.c'))
 sh4_ss.add(when: 'CONFIG_SHIX', if_true: files('shix.c'))
 
 hw_arch += {'sh4': sh4_ss}

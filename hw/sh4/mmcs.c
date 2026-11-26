@@ -25,6 +25,8 @@
 #include "hw/sh4/mmcs-vintc.h"
 #include "hw/sh4/mmcs-pollsys.h"
 #include "hw/sh4/mmcs-fb.h"
+#include "hw/sh4/mmcs-usb.h"
+#include "hw/sh4/mmcs-handoff.h"
 #include "hw/sh4/sh7777.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
@@ -44,7 +46,6 @@
 
 #define MMCS_FLASH_BASE 0x10800000
 #define MMCS_FLASH_SIZE (128 * MiB)
-#define MMCS_ENTRY      0x908066b0   /* kernel entry from image first record */
 
 /* L18 vendor-INTC access census (defined near the vintc ops below) */
 
@@ -9632,59 +9633,6 @@ static void mmcs_l16_boot_parse(void)
     }
 }
 
-/* USB OHCI at the SH7777's on-chip base (S70 register map, env-gated
- * via MMCS_USB for A/B testing). qemu's stock sysbus-ohci model provides
- * real OHCI register semantics for MLSIDK USB driver development. Called
- * from BOTH boot paths (full OS boot and MMCS_MLD payload mode). */
-static void mmcs_usb_setup(void)
-{
-    if (!getenv("MMCS_USB")) {
-        return;
-    }
-    DeviceState *ohci = qdev_new("sysbus-ohci");
-    qdev_prop_set_uint32(ohci, "num-ports", 2);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(ohci), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(ohci), 0, 0xFFE70400);
-    /* IRQ: the SH7777 OHCI sysintr 53-class mapping is Unknown; route to a
-     * sink IRQ for now (polling driver, no guest IRQ needed yet). */
-    qemu_irq ohci_irq = qemu_allocate_irq(
-        (void (*)(void *, int, int))qemu_set_irq, NULL, 0);
-    sysbus_connect_irq(SYS_BUS_DEVICE(ohci), 0, ohci_irq);
-    fprintf(stderr, "MMCS: USB OHCI at 0xFFE70400 (env-gated)\n");
-
-    /* Optional attached device for enumeration testing: the OHCI's USB bus
-     * is created here (machine init), too late for -device CLI resolution,
-     * so attach programmatically. MMCS_USB_DEV names the guest-visible USB
-     * device (default: usb-storage). */
-    const char *usb_dev = getenv("MMCS_USB_DEV");
-    if (!usb_dev) {
-        usb_dev = "usb-kbd";   /* self-contained HID: no drive/net backend */
-    }
-    /* the OHCI's USB bus is a child bus of the controller device (the
-     * controller itself is NOT a USBDevice — do not USB_DEVICE() cast it) */
-    BusState *usb_bus = qdev_get_child_bus(ohci, "usb-bus");
-    if (!usb_bus) {
-        /* fall back to the first child bus if unnamed */
-        usb_bus = QLIST_FIRST(&ohci->child_bus);
-    }
-    assert(usb_bus);
-    /* usb-cdc-acm takes a "chardev" property; the backend is created via
-     * CLI: -chardev socket,id=mlsdkusb,path=...,server=on,wait=off and
-     * looked up by that fixed id. */
-    DeviceState *udev = qdev_new(usb_dev);
-    if (strcmp(usb_dev, "usb-cdc-acm") == 0 || strcmp(usb_dev, "usb-serial") == 0) {
-        Chardev *chr = qemu_chr_find("mlsdkusb");
-        if (chr) {
-            qdev_prop_set_chr(udev, "chardev", chr);
-        } else {
-            fprintf(stderr, "MMCS: usb-cdc-acm: no chardev id 'mlsdkusb' "
-                    "(-chardev socket,id=mlsdkusb,...)\n");
-        }
-    }
-    qdev_realize_and_unref(udev, usb_bus, &error_fatal);
-    fprintf(stderr, "MMCS: USB device '%s' attached to port 1\n", usb_dev);
-}
-
 /* MMCS fork (S159, MLD-HANDOFF): the loader no-update path -> the OS launch,
  * one continuous boot. DECODE (this lane; mld-mem pseudo-c + disasm + the
  * live park serial): the v2.21 M-Loader's post-splash decision tree is
@@ -9709,134 +9657,8 @@ static void mmcs_usb_setup(void)
  * 0x88947840 off the loaded B000FF image) — on real HW this binary never
  * runs cold without media (the J-11 capture launches it only after a
  * checksummed SD load); the RESIDENT NOR first stage (bytes absent) owns
- * the no-card boot. HANDOFF: our boot stub IS the resident-stage stand-in
- * — once the loader has CONCLUDED its scan (the park windows below,
- * debounced), regain control and drive the loader's OWN launcher
- * (pc := 0x88935590, r4 := MMCS_ENTRY): the serial seam is the real
- * ' <Launch> 0x908066b0' print and the jump runs the loader's own
- * trampoline. The trampoline's CFI reset polls for 9/9 at NOR+0x1C000
- * (RAM read-back never leaves status mode) — pre-seed the two words so it
- * takes its skip branch (the real flash sits in the array state). SDRAM
- * residue: the loader image at 0x08900000 etc is LEFT IN PLACE (on HW the
- * kernel boots FROM the loader's jump with the loader resident inside the
- * kernel pool 0x08600000-0x10700000) — jump for real; the one NOT
- * tolerated shape is retired at the seam (the FLROM window, see the
- * launch fn). Env MMCS_HANDOFF=1 (needs MMCS_MLD + MMCS_FLROM + -bios),
- * default off. */
-static SuperHCPU *mmcs_handoff_cpu;
-static QEMUTimer *mmcs_handoff_timer;
-static QEMUTimer *mmcs_handoff_retire_timer;
-static int mmcs_handoff_hits;
-static int mmcs_handoff_fired;
-/* the FLROM MR (retired at the seam unless MMCS_HANDOFF_KEEPFLROM=1) */
-static MemoryRegion *mmcs_handoff_flrom_mr;
-static MemoryRegion *mmcs_handoff_sysmem;
-
-/* S159: the L26 P1 servant-alias hook (target/sh4/helper.c) claims
- * kernel-mode P1 [0x80000000,0x81000000) = phys [0,16MB) — exactly the
- * NOR FLROM window in MLD mode. In the default boot that phys space is
- * unassigned so the hook only ever served the C0 servants; with the
- * FLROM mapped the loader's own P1 NOR reads (the Opening BMP at
- * 0x80100000) get hijacked to manifest scratch (live: DispLoadBitmap
- * 'bfType = 0' with SRVPGTAB+IATFIX+C0ARM armed). Cleared while the
- * FLROM is mapped (MLD modes), restored at the seam-time FLROM
- * retirement. */
-int mmcs_p1_alias_enabled = 1;
-
-static void mmcs_handoff_retire_flrom(void *opaque)
-{
-    if (mmcs_handoff_flrom_mr && mmcs_handoff_sysmem) {
-        memory_region_del_subregion(mmcs_handoff_sysmem,
-                                    mmcs_handoff_flrom_mr);
-        mmcs_p1_alias_enabled = 1;
-        fprintf(stderr, "MMCS: HANDOFF FLROM window retired — phys "
-                "[0,16MB) back to the WinCE-mode (unassigned) shape; "
-                "SDRAM loader residue left in place\n");
-    }
-}
-
-static bool mmcs_handoff_park_pc(uint32_t pc)
-{
-    /* the no-update terminal park: the subcpu receive-error loop (live
-     * samples; the cycle alternates between the SCIF wait at 0x8893bd1a
-     * and the HALFCHECK driver at 0x88935f88-0x88936020) */
-    return (pc >= 0x88935f80u && pc < 0x88936030u) ||
-           (pc >= 0x8893bd00u && pc < 0x8893bd30u);
-}
-
-static void mmcs_handoff_launch(CPUState *cs, run_on_cpu_data data)
-{
-    SuperHCPU *cpu = SUPERH_CPU(cs);
-    CPUSH4State *env = &cpu->env;
-
-    if (mmcs_handoff_fired) {
-        return;
-    }
-    mmcs_handoff_fired = 1;
-    /* THE RESIDUE RECONCILIATION (verified by A/B this lane): the kernel's
-     * FIRST USER PROCESS runs its initial thread with the user stack in
-     * the LOW identity window (live evidence: child sp r15=0x0002fd90,
-     * spc=0x40021784) — under the default WinCE boot phys 0x2fd90 is
-     * UNASSIGNED (reads 0, writes dropped) and the child completes its
-     * startup; with the 16 MB FLROM MR present the stack reads the NOR
-     * seed bytes (LOADING.KWI garbage) and the child dies before its
-     * first callback return — the create-completion interlock breaks and
-     * the launch loop degenerates into a user slot-call retry storm
-     * (pc=ffff55d3 x5.1M/110s). On real HW phys [0,16MB) is the NOR the
-     * kernel never stacks into; the default-mode unassigned window is
-     * the kernel-tolerated shape, so at the seam we retire the FLROM
-     * window (the loader is done with the NOR; its post-boot reader, the
-     * DRF flash driver, is fail-soft on reads-0 exactly as the default
-     * boot). Retired 100 ms after the poke (the trampoline's CFI reset
-     * runs in that window against the still-mapped NOR). The L26 P1
-     * servant-alias hook re-arms with it. MMCS_HANDOFF_KEEPFLROM=1
-     * disables the retirement for A/B. */
-    if (mmcs_handoff_flrom_mr && !getenv("MMCS_HANDOFF_KEEPFLROM")) {
-        timer_mod(mmcs_handoff_retire_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-    }
-    /* the CFI skip-branch pre-seed (see the block comment) — MUST precede
-     * the FLROM retirement (the trampoline's CFI window leaves with it) */
-    uint16_t nine = 9;
-    cpu_physical_memory_write(0x001C000, &nine, 2);
-    cpu_physical_memory_write(0x001C002, &nine, 2);
-    fprintf(stderr, "MMCS: HANDOFF seam — loader scan concluded (park pc "
-            "%08x, %d poll hits); driving the loader's own launcher "
-            "0x88935590(r4=%08x): serial ' <Launch> 0x%x' + trampoline "
-            "0x88935be8 jmp; SDRAM residue left in place\n",
-            env->pc, mmcs_handoff_hits, MMCS_ENTRY, MMCS_ENTRY);
-    /* r4 is a BANKED register (r0-r7, SR.RB=1 in the loader: gregs index
-     * XOR 0x10 per target/sh4/translate.c REG(x); the bank bit comes from
-     * env->sr, not env->flags) — the launcher moves it to r8 (unbanked)
-     * and back before the trampoline jmp @r4 */
-    unsigned bank = (env->sr & (1u << SR_RB)) ? 0x10u : 0u;
-    env->gregs[4 ^ bank] = MMCS_ENTRY;
-    env->pc = 0x88935590u;      /* the loader's launcher (own print) */
-    env->pr = 0;
-    env->in_sleep = 0;
-    env->flags &= ~TB_FLAG_DELAY_SLOT_MASK;
-}
-
-static void mmcs_handoff_poll(void *opaque)
-{
-    if (mmcs_handoff_fired || !mmcs_handoff_cpu) {
-        return;
-    }
-    /* benign u32 sample of the live pc (the established daemon pattern);
-     * the mutation itself runs in vCPU context via run_on_cpu */
-    uint32_t pc = mmcs_handoff_cpu->env.pc;
-    if (mmcs_handoff_park_pc(pc)) {
-        if (++mmcs_handoff_hits >= 8) {
-            run_on_cpu(CPU(mmcs_handoff_cpu), mmcs_handoff_launch,
-                       RUN_ON_CPU_NULL);
-            return;             /* one-shot; timer not rearmed */
-        }
-    } else {
-        mmcs_handoff_hits = 0;
-    }
-    timer_mod(mmcs_handoff_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
-}
+ * the no-card boot. (The HANDOFF decode moved with the family to
+ * hw/sh4/mmcs-handoff.c.) */
 
 /* ===================== savestate (snapshot lane) =====================
  * MMCS fork (savestate lane): vmstate for the machine's host-side
@@ -10822,8 +10644,7 @@ static void mmcs_init(MachineState *machine)
              * seam-time retirement (handoff mode) */
             mmcs_p1_alias_enabled = 0;
             if (mld_handoff) {
-                mmcs_handoff_flrom_mr = fr;
-                mmcs_handoff_sysmem = get_system_memory();
+                mmcs_handoff_set_flrom(fr);
             }
             /* write through the RAM pointer (the L27/L14 lesson: ROM
              * blobs apply at reset AFTER machine init and would stomp
@@ -10937,14 +10758,7 @@ static void mmcs_init(MachineState *machine)
              * every env-gated service + INTC/tick daemons) so the machine
              * is simultaneously the loader's world and the kernel's world */
             mmcs_handoff_cpu = cpu;
-            mmcs_handoff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                              mmcs_handoff_poll, NULL);
-            timer_mod(mmcs_handoff_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
-                      + atoi(getenv("MMCS_HANDOFF_MIN") ? : "3000"));
-            mmcs_handoff_retire_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                                    mmcs_handoff_retire_flrom,
-                                                    NULL);
+            mmcs_handoff_arm(cpu);
             fprintf(stderr, "MMCS: HANDOFF armed — the loader's no-update "
                     "park (pc windows 88935f80/8893bd00, 8x250ms debounce) "
                     "launches the OS through the loader's own 0x88935590 "
