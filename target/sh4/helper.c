@@ -2170,6 +2170,83 @@ fileview_done:;
         }
     }
 
+    /* MMCS fork (L80/S232): MMCS_L80TX — THE DYING THREAD'S
+     * KSLOT-RAISE SKIP (the failed-call synthesis; the cold-boot
+     * crash fix; decoded 2026-11-25, the era-replay lane).
+     *
+     * THE DECODE (Observed: the l80_probe5..7 spiral tapes on
+     * l79-grave + the l81-era cold boots under the full accumulated
+     * stack): the recycled-frame KSLOT RaiseException legs
+     * (evt 0x180 at pc 0xfffffdc7, r4 = 0xC000xxxx — the old
+     * servant's parked death codes read back from the recycled
+     * stack residue) fire whenever a death path walks the corrupted
+     * frames. TWO world classes hit it:
+     * (a) the l79-grave parked pair: the L78TX route restarts the
+     *     kill continuation at its top, which re-enters the wait =
+     *     THE CLOSED-LOOP SPIRAL (the l80_probe7 full-budget tape:
+     *     156 routes, the death never completes);
+     * (b) THE COLD BOOT under the full accumulated stack (the
+     *     era-replay experiment): the early-world death chains run
+     *     the SAME cascade class with the process exit cell NOT yet
+     *     written (the L78TX gate does not match) — the cascade
+     *     marches the exception stack down (r15 0x8862f5dc ->
+     *     0x8862ac04 at ~0x4B0/raise) until QEMU ITSELF ABORTS
+     *     (SIGABRT, exit -6, silent; serial frozen at 723 B = the
+     *     wfc-era boundary).
+     * THE STOCK SHAPE for both: the raise is a CALL (the
+     * c0036xxx-wrapper family's call into RaiseException whose pr =
+     * the wrapper's own return point — the L44 static decode); the
+     * KAPIFIX-1b philosophy applies: synthesize the FAILED CALL —
+     * r0 := 0 (the callers ignore the return; L3-proven), resume at
+     * pr — the death path CONTINUES PAST the raise instead of
+     * looping/restarting.
+     *
+     * GATE: evt 0x180, pc in the P4 slot window (>= 0xFFFF0000),
+     * r4 a 0xC000xxxx NTSTATUS, pCurTh a DYING (st16 bit 0x08)
+     * arena thread with a death/exit code present ([th+0x38] != 0),
+     * AND pr plausible guest code (mmcs_plausible_code — never
+     * synthesize a return to garbage callers). Sits AFTER the
+     * L78TX block: the L78TX gate (exit-cell-written) keeps the
+     * parked-pair route; this covers the legs L78TX cannot match
+     * (the cold-boot class, the exit-cell-not-yet-written deaths)
+     * — a probe isolates them by env.
+     *
+     * Env MMCS_L80TX (default off); MMCS_L80TX_MAX cap default 8. */
+    if (do_exp && getenv("MMCS_L80TX")) {
+        static uint32_t nl80tx;
+        uint32_t n80max = 8;
+        const char *mv80 = getenv("MMCS_L80TX_MAX");
+
+        if (mv80 && *mv80) {
+            n80max = strtoul(mv80, NULL, 0);
+        }
+        if (cs->exception_index == 0x180
+            && env->pc >= 0xFFFF0000u && nl80tx < n80max
+            && (env->gregs[4] & 0xF0000000u) == 0xC0000000u
+            && mmcs_plausible_code(env->pr)) {
+            uint32_t pth = 0, st16 = 0, code = 0;
+
+            cpu_physical_memory_read(0x08679894, &pth, 4);
+            if (pth >= 0x90680000u && pth < 0x90780000u) {
+                cpu_physical_memory_read(pth - 0x80000000u + 0x0C, &st16, 4);
+                cpu_physical_memory_read(pth - 0x80000000u + 0x38, &code, 4);
+                if ((st16 & 8u) && code != 0) {
+                    nl80tx++;
+                    fprintf(stderr, "MMCS-L80TX: dying thread's kslot-raise "
+                            "SKIP: th %08x (st16 %08x, code %08x, raise %08x) "
+                            "pc=%08x pr=%08x -> r0 := 0, resume at pr (the "
+                            "failed-call synthesis, %u/%u)\n",
+                            pth, st16, code, env->gregs[4], env->pc, env->pr,
+                            nl80tx, n80max);
+                    env->gregs[0] = 0;
+                    env->pc = env->pr;
+                    cs->exception_index = -1;
+                    return;
+                }
+            }
+        }
+    }
+
     if (env->mmcs_kslot_active && do_exp
         && (cs->exception_index == 0x180 || cs->exception_index == 0x1a0)
         && (env->sr & (1u << SR_MD))
