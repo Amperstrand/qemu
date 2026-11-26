@@ -254,13 +254,29 @@ void superh_cpu_do_interrupt(CPUState *cs)
     if (do_exp && getenv("MMCS_EXCTRACE")) {
         static int mmcs_exctrace_n;
         uint32_t expevt_v = cs->exception_index & 0xfff;
-        int is_trapa = (expevt_v == 0x160);
+        int is_trapa = (expevt_v == 0x180);
         int all = getenv("MMCS_EXCTRACE_ALL") != NULL;
         if (all || (expevt_v >= 0x040 && !is_trapa)) {
             if (mmcs_exctrace_n < 4000) {
-                fprintf(stderr, "MMCS-EXCTRACE[%d] spc=%08x expevt=%03x pc=%08x sr=%08x%s\n",
-                        mmcs_exctrace_n, env->spc, expevt_v, env->pc, env->sr,
-                        (env->sr & (1u << 29)) ? " MD" : " UM");
+                int real_fault = (expevt_v == 0x0e0 || expevt_v == 0x060
+                                  || expevt_v == 0x0c0 || expevt_v == 0x100
+                                  || expevt_v == 0x120);
+                fprintf(stderr, "MMCS-EXCTRACE[%d] spc=%08x expevt=%03x pc=%08x tea=%08x sr=%08x%s\n",
+                        mmcs_exctrace_n, env->spc, expevt_v, env->pc, env->tea, env->sr,
+                        (env->sr & (1u << 30)) ? " MD" : " UM");
+                if (real_fault && getenv("MMCS_EXCCTX")) {
+                    /* the fault-context dump: the register file + pr (the
+                     * caller) — decodes the failing API chain directly */
+                    fprintf(stderr, "MMCS-EXCCTX spc=%08x tea=%08x pr=%08x "
+                            "r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x "
+                            "r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x "
+                            "r14=%08x r15=%08x\n",
+                            env->spc, env->tea, env->pr,
+                            env->gregs[0], env->gregs[1], env->gregs[2], env->gregs[3],
+                            env->gregs[4], env->gregs[5], env->gregs[6], env->gregs[7],
+                            env->gregs[8], env->gregs[9], env->gregs[10], env->gregs[11],
+                            env->gregs[14], env->gregs[15]);
+                }
             }
             mmcs_exctrace_n++;
         }
@@ -3143,6 +3159,32 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     ret = get_physical_address(env, &physical, &prot, address, access_type);
 
+    /* MMCS fork (L82): MMCS_TLBTRACE — the fill-flow visibility knob
+     * (the L82UM non-firing debug): every tlb_fill with {va, acc, idx,
+     * ret} so the refill-block reachability is observable. */
+    if (getenv("MMCS_TLBTRACE")) {
+        static int nfill;
+        static int ndwin;
+        if ((uint32_t)address >= 0xD0000000u) {
+            /* d-window fills: UNCAPPED (the L82UM debug) + the knob state */
+            static int l82um_dbg;
+            if (!l82um_dbg) {
+                l82um_dbg = 1;
+                fprintf(stderr, "MMCS-L82UM-DBG knob=%d\n",
+                        !!getenv("MMCS_L82UM"));
+            }
+            if (ndwin++ < 200) {
+                fprintf(stderr, "MMCS-TLBFILL-DWIN[%d] va=%08x acc=%d "
+                        "idx=%d ret=%d\n", ndwin, (uint32_t)address,
+                        (int)access_type, mmu_idx, ret);
+            }
+        } else if (nfill++ < 3000 && getenv("MMCS_TLBTRACE_ALL")) {
+            fprintf(stderr, "MMCS-TLBFILL[%d] va=%08x acc=%d idx=%d "
+                    "ret=%d\n", nfill, (uint32_t)address,
+                    (int)access_type, mmu_idx, ret);
+        }
+    }
+
     /* MMCS fork (L26): P1 KERNEL-ALIAS of the C0 servant window.
      *
      * Decoded 2026-11-17 (L26 park walk): this image's own pre-bound
@@ -3690,6 +3732,54 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         }
     }
 
+    /* MMCS fork (L82/S235): MMCS_L82UM — the USER-mode d-window data
+     * refill (the S234 census root). THE DECODE (L82 probe5/6, the
+     * EXCTRACE/EXCCTX census): the fresh full-family boot's REAL fault
+     * classes are USER-mode (UM, sr=00008000) d-window data misses:
+     * the filesys region walk (c0034854: the 64KB-region header read
+     * [base+0x34], r1=0x10000, pr=c0034914 — walking the arena the
+     * stock VirtualAlloc would have mapped) and the kernel-stack
+     * allocator's user-side commits (9083197a/908318c0: r4=region,
+     * r1=0x20000000 RESERVE, r5=0x10000 COMMIT, the first touch at
+     * [page+...]). The stock: the kernel's VirtualAlloc populates the
+     * per-process UTLB; in emulation the commit's UTLB update doesn't
+     * happen (the page-table path is incomplete), so every walk/commit
+     * first-touch takes 0x040/0x0e0 and the child dies. FIX: the same
+     * stock-faithful identity refill as L70KS (PA = VA - 0xC0000000 —
+     * the page IS the real RAM arena backing; the vendor's own data),
+     * served for the USER-mode data miss. Gated on MMCS_L82UM (default
+     * off) AND the L70KS window logic (the shared top derivation).
+     * Fetches are NOT served (executing stack data stays a real bug). */
+    if (ret != MMU_OK && getenv("MMCS_L82UM")
+        && (uint32_t)address >= 0xD0000000u
+        && (access_type == MMU_DATA_LOAD
+            || access_type == MMU_DATA_STORE)) {
+        static uint32_t um_top;
+        if (!um_top) {
+            uint32_t mea = 0;
+            cpu_physical_memory_read(0x086025e4, &mea, 4);
+            if (mea < 0x90600000u || mea >= 0x92000000u) {
+                mea = 0x90700000u;
+            }
+            um_top = 0xC0000000u + (mea - 0x80000000u);
+        }
+        if ((uint32_t)address < um_top) {
+            uint32_t pa = (uint32_t)address - 0xC0000000u;
+            static int num;
+            if (num++ < 24) {
+                fprintf(stderr, "MMCS-L82UM: user d-window refill "
+                        "va=%08x -> pa=%08x acc=%d (%d)\n",
+                        (uint32_t)address, pa, (int)access_type, num);
+            }
+            int uprot = mmcs_pgown_fill(env, (uint32_t)address, &pa,
+                                        PAGE_READ | PAGE_WRITE,
+                                        access_type == MMU_DATA_STORE);
+            tlb_set_page(cs, (uint32_t)address & 0xFFFFF000u, pa,
+                         uprot, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
+    }
+
     /* MMCS fork (L71/S222): MMCS_L71IT — the stale-ITLB kernel-data
      * refill (the L70KS live-page family). THE DECODE (this lane,
      * register-level): the L70KS world's standing death is NOT the
@@ -3787,6 +3877,18 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     }
     if (probe) {
         return false;
+    }
+
+    /* MMCS fork (L82): the RAISING-fill trace — every fill that FAILS
+     * through to the exception tail (no block claimed it): the exact
+     * {va, acc, idx, ret} at the raise. The L82UM non-firing debug. */
+    if (getenv("MMCS_TLBTRACE")) {
+        static int nraise;
+        if (nraise++ < 400) {
+            fprintf(stderr, "MMCS-TLBRAISE[%d] va=%08x acc=%d idx=%d "
+                    "ret=%d\n", nraise, (uint32_t)address,
+                    (int)access_type, mmu_idx, ret);
+        }
     }
 
     if (ret != MMU_DTLB_MULTIPLE && ret != MMU_ITLB_MULTIPLE) {
