@@ -12,4 +12,7 @@ void mmcs_sdhi_init(void);
 /* MMCS fork (input lane, 2026-11-19): the SCIF1 Micon injector
  * (hw/sh4/mmcs-input.c; env MMCS_INPUT, default off) */
 void mmcs_input_init(void);
+
+/* trace helper (MMCS fork; used by mmcs-chanflash.c too) */
+int sh7777_trace(void);
 #endif
