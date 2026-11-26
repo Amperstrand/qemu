@@ -2497,6 +2497,50 @@ fileview_done:;
             env->pc = env->vbr + 0x100;
             break;
         }
+        /* MMCS fork (L82/S236): MMCS_L82ZOM — the repeated-fault reaper
+         * (the TAIL form: the head-block TCB surgery was overwritten by
+         * the live handler's retry decision every cycle — the L78 law
+         * only held from the PARKED state). At the Nth identical 0x0e0
+         * user-fetch fault (the zombie whose marshalled death never
+         * completes), redirect the CPU itself: pc := the vendor's kill
+         * continuation 0x9083BE50, BL cleared, sp := the thread's own
+         * kstack ([TCB+0xB0]) — the vendor's own kill machinery then
+         * processes the thread from its own entry. */
+        if (getenv("MMCS_L82ZOM") && cs->exception_index == 0x0e0) {
+            static uint32_t zom_key, zom_key2;
+            static int zom_count, zom_kills;
+            uint32_t k1 = env->spc, k2 = env->pc;
+            if (k1 == zom_key && k2 == zom_key2) {
+                zom_count++;
+            } else {
+                zom_key = k1; zom_key2 = k2; zom_count = 1;
+            }
+            int n_kill = 32;
+            const char *zk = getenv("MMCS_L82ZOM_N");
+            if (zk && *zk) {
+                n_kill = atoi(zk);
+            }
+            if (zom_count >= n_kill && zom_kills < 16) {
+                uint32_t pth = 0, ksp = 0;
+                cpu_physical_memory_read(0x08679894, &pth, 4);
+                if (pth >= 0x90680000u && pth < 0x90700000u) {
+                    cpu_physical_memory_read(
+                        0x10000000u + (pth - 0x90680000u) + 0xB0,
+                        (uint8_t *)&ksp, 4);
+                }
+                if (ksp >= 0xd0000000u && ksp < 0xd0800000u) {
+                    env->gregs[15] = ksp;
+                }
+                env->pc = 0x9083BE50;
+                env->sr &= ~(1u << SR_BL);
+                zom_kills++;
+                zom_count = 0;
+                fprintf(stderr, "MMCS-L82ZOM: TAIL redirect TCB %08x "
+                        "(spc=%08x pc=%08x) -> kill continuation "
+                        "0x9083BE50, sp=%08x (kill %d)\n",
+                        pth, k1, k2, env->gregs[15], zom_kills);
+            }
+        }
         return;
     }
 

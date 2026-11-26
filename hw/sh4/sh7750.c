@@ -745,7 +745,19 @@ static uint64_t sh7750_mmct_read(void *opaque, hwaddr addr,
 static void invalid_write(void *opaque, hwaddr addr,
                           uint64_t mem_value)
 {
-    abort();
+    /* MMCS fork (L82/S236): the L70KS+L82UM world's zombie threads
+     * write garbage bytes (the exception-report 'E' class) through
+     * corrupted pointers into unimplemented MMIO — the stock abort()
+     * killed the whole emulator at ~90-240s (the core dump, the
+     * snapshot banks failing). A guest-side corrupted write must not
+     * be a host-side fatal: log (capped) + drop. The world continues;
+     * the census/snapshot paths unblock. */
+    static int niow;
+    if (niow++ < 64) {
+        fprintf(stderr, "MMCS-NOIOW: dropped guest write %llx -> %llx "
+                "(%d)\n", (unsigned long long)mem_value,
+                (unsigned long long)addr, niow);
+    }
 }
 
 static void sh7750_mmct_write(void *opaque, hwaddr addr,
