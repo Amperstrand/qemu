@@ -240,6 +240,32 @@ void superh_cpu_do_interrupt(CPUState *cs)
     do_exp = cs->exception_index != -1;
     do_irq = do_irq && (cs->exception_index == -1);
 
+    /* MMCS fork (L82/S234): MMCS_EXCTRACE — the exception census knob
+     * (the workflow fix for the self-loop trap: the exception ENTRY is
+     * the vector target, so any software breakpoint there re-vectors
+     * into itself and pollutes the census with its own trap — the
+     * 299-hit "storm" artifact, L82 probe3/4). This knob prints every
+     * guest exception from the CPU side with ZERO guest interference:
+     * {spc, expevt, pc, sr} + the mode decode. Default scope = the
+     * FAULT classes only (expevt >= 0x040 AND != 0x160-trapa: address
+     * errors, TLB violations, illegal instructions, the FPU class) —
+     * the trapa/KCALL flood stays off; MMCS_EXCTRACE_ALL=1 adds it.
+     * Env MMCS_EXCTRACE (default off). */
+    if (do_exp && getenv("MMCS_EXCTRACE")) {
+        static int mmcs_exctrace_n;
+        uint32_t expevt_v = cs->exception_index & 0xfff;
+        int is_trapa = (expevt_v == 0x160);
+        int all = getenv("MMCS_EXCTRACE_ALL") != NULL;
+        if (all || (expevt_v >= 0x040 && !is_trapa)) {
+            if (mmcs_exctrace_n < 4000) {
+                fprintf(stderr, "MMCS-EXCTRACE[%d] spc=%08x expevt=%03x pc=%08x sr=%08x%s\n",
+                        mmcs_exctrace_n, env->spc, expevt_v, env->pc, env->sr,
+                        (env->sr & (1u << 29)) ? " MD" : " UM");
+            }
+            mmcs_exctrace_n++;
+        }
+    }
+
     if (env->sr & (1u << SR_BL)) {
         if (do_exp && cs->exception_index != 0x1e0) {
             /* In theory a masked exception generates a reset exception,
