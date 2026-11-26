@@ -1696,6 +1696,26 @@ static uint32_t mmcs_l58_done[8];
  * (ents[7]). Env MMCS_L62EV (default OFF; MMCS_L62EV_MS cadence
  * default 2000; MMCS_L62EV_MAX cap default 2; MMCS_L62EV_DIAG=1
  * diagnose-only). Needs MMCS_TICK. */
+/* MMCS fork (L84/S244): MMCS_L84SR — THE RESUME-FRAME SYNTHESIS (the
+ * stack-reconstruction lane; the design = work/l82-static3-resume-frame.md
+ * Part 5 Variant A, the child's frame-layout table). THE S243 VERDICT: the
+ * fresh world's waiters (MAIN-class, ctxpc=0x90837cf6 the DoWait face)
+ * park with their kstacks ENTIRELY ZEROED — even a woken+linked waiter
+ * would resume over garbage and re-die. THE FIX: synthesize the minimal
+ * frame (the child's word set: [sp+0xB8]:=0x90837f70 the park fn's pr,
+ * [sp+0xE4]:=[th+0x144] the locked handle, [sp+0xE8]:=the caller return)
+ * + the TCB ctx preloads (r8=TCB, r0=0x1000 the verdict, r9/r11/r12/r13
+ * the face's expected regs, the wInfo NEEDSLEEP clear, the aftermath pair)
+ * + the v9 wake (the L54 stub + the L16-ent injection — the L62 recipe
+ * verbatim). NO object writes (Variant A: the eval never re-runs). */
+static void mmcs_l84sr_scan(void);
+static int mmcs_l84sr_armed;
+static uint32_t mmcs_l84sr_cadence_ms = 2000;
+static uint32_t mmcs_l84sr_max_deliv = 4;
+static uint32_t mmcs_l84sr_total;
+static uint32_t mmcs_l84sr_key;
+static uint32_t mmcs_l84sr_stable;
+
 static void mmcs_l62_scan(void);
 static int mmcs_l62_armed;
 static int mmcs_l62_diag;
@@ -2312,6 +2332,13 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l36_armed && ++mmcs_tick_l36 >= mmcs_l36_cadence_ms) {
             mmcs_tick_l36 = 0;
             mmcs_l36_scan();
+        }
+        /* L84: the resume-frame synthesis daemon (the stack
+         * reconstruction; the S243 destroyed-resume-path class) */
+        static uint64_t mmcs_tick_l84sr;
+        if (mmcs_l84sr_armed && ++mmcs_tick_l84sr >= mmcs_l84sr_cadence_ms) {
+            mmcs_tick_l84sr = 0;
+            mmcs_l84sr_scan();
         }
         /* L37: the KCall-exit lost-preempt class daemon (same class) */
         if (mmcs_l37_armed && ++mmcs_tick_l37 >= mmcs_l37_cadence_ms) {
@@ -6074,6 +6101,201 @@ static void mmcs_l58_scan(void)
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, pcur, f1f8);
 }
 
+static void mmcs_l84sr_scan(void)
+{
+    if (!mmcs_l84sr_armed || mmcs_l84sr_total >= mmcs_l84sr_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, pick = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA4, &pick, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    if (prun != 0) {
+        return;   /* L84: only a BUSY run queue blocks the recovery; the
+                   * S244 terminal (pick = the arena base, prun = 0) is
+                   * exactly the world this knob exists to repair */
+    }
+    (void)pick;
+    (void)pcur;
+    /* THE STRIDE LAW (rev2's lesson: ZERO miss-prints = the scan never
+     * saw the waiters): the arena's TCBs are 4-byte-scattered
+     * (0x...24/0x...0c/0x...18 — heap-style allocation, NO 0x40
+     * alignment). Iterate at 4; the shape gates filter. */
+    static int ncad;
+    if (ncad++ < 10) {
+        /* rev3's lesson: STILL zero hits AND zero misses — census the
+         * arena's BLOCKED population at the scan time: what ctxpcs the
+         * waiters actually sit at in the FRESH-run world (the snapshot
+         * showed 0x90837cf6; the run may differ) */
+        int nface = 0, nblocked = 0;
+        uint32_t first3[3] = {0, 0, 0};
+        for (uint32_t o = 0x4; o + 0x200 <= sizeof arena; o += 4) {
+            uint32_t st, pc;
+            memcpy(&st, arena + o + 0x0c, 4);
+            memcpy(&pc, arena + o + 0xb4, 4);
+            if ((st & 3) == 2 && st != 0x2 && pc >= 0x90800000u
+                && pc < 0x908C0000u) {
+                nblocked++;
+                if (pc == 0x90837cf6) {
+                    nface++;
+                }
+                for (int k = 0; k < 3; k++) {
+                    if (!first3[k]) { first3[k] = pc; break; }
+                }
+            }
+        }
+        fprintf(stderr, "MMCS-L84SR(census): t=%" PRId64 "ms arena "
+                "BLOCKED(kernel-pc)=%d at-face=%d first-pcs "
+                "{%08x %08x %08x}\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                nblocked, nface, first3[0], first3[1], first3[2]);
+    }
+    int nface_visit = 0;
+    for (uint32_t o = 0x4; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t st16, ctxpc, sp, wobj;
+        memcpy(&st16, arena + o + 0x0c, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&sp, arena + o + 0xb0, 4);
+        memcpy(&wobj, arena + o + 0x148, 4);
+        uint32_t tva = 0x90680000 + o;
+        /* the waiter shape: BLOCKED at the DoWait face, the D0 kstack,
+         * the wait-object linked, NOT the current thread */
+        uint32_t w144 = 0;
+        memcpy(&w144, arena + o + 0x144, 4);
+        /* THE COUNT-DIAG VERDICT (rev4): the fresh world's face-waiters
+         * carry EMPTY wait quads (w144/w148 = 0 — the wait state lives
+         * on-stack, the L26's node class) and MAIN's object at
+         * 0x9060f000 (BELOW the old 0x9066 gate). VARIANT A NEEDS NO
+         * OBJECT (no object writes!) — the wait-res gate DROPS; the
+         * handle = the w144 (whatever it holds, incl. 0 = the benign
+         * unlock arg). THE SHAPE = {face, BLOCKED, D0-sp, != pcur}. */
+        if (ctxpc != 0x90837cf6 || (st16 & 3) != 2
+            || sp < 0xD0000000u || sp >= 0xD1000000u
+            || tva == pcur) {
+            if (ctxpc == 0x90837cf6 && (st16 & 3) == 2) {
+                nface_visit++;
+                if (nface_visit <= 6) {
+                    fprintf(stderr, "MMCS-L84SR(miss): t=%" PRId64 "ms th "
+                            "%08x SHAPE {sp %08x wobj %08x w144 %08x} "
+                            "- sp/pcur gate\n",
+                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva,
+                            sp, wobj, w144);
+                }
+            }
+            continue;
+        }
+        if (wobj < 0x90600000u || wobj >= 0x90780000u) {
+            wobj = w144;   /* the empty/low-arena class: the handle cell */
+        }
+        /* THE WITNESS LAW (rev6): the zero zone = BELOW the sp (the
+         * S243 census: [sp-0x30..sp+0x30] zeroed — the wait-frame
+         * region); the +0x30 probe hit the intact CALLER frames and
+         * rejected every waiter. Probe [sp-0x20..sp+0x10). */
+        uint32_t pa_sp = sp - 0xC0000000u;
+        uint32_t probe[8] = {0};
+        cpu_physical_memory_read(pa_sp - 0x20, probe, 32);
+        uint32_t nz = 0;
+        for (int i = 0; i < 8; i++) {
+            if (probe[i]) { nz++; }
+        }
+        if (nz != 0) {
+            continue;                 /* not the zeroed-frame class */
+        }
+        /* THE STABILITY LAW (rev5): the pcur ROTATION makes each scan's
+         * qualifying waiter DIFFER (the cycling scheduler) — the
+         * 2-cadence keyed-single-thread never accumulates. The shape
+         * gates ({face, BLOCKED, D0-sp, !=pcur} + the zeroed witness)
+         * are the guard; deliver on the first stable sighting. */
+        if (mmcs_l84sr_key == tva) {
+            mmcs_l84sr_stable++;
+        } else {
+            mmcs_l84sr_key = tva;
+            mmcs_l84sr_stable = 1;
+        }
+        (void)mmcs_l84sr_stable;
+        /* THE CALLER RETURN (the per-waiter class): the start cell
+         * [th+0x84]-based fallback; the RunApps/FS family default */
+        uint32_t start = 0;
+        memcpy(&start, arena + o + 0x84, 4);
+        uint32_t caller_ret = 0x9083e250;   /* the RunApps/FS class */
+        if (start >= 0x9083e100u && start < 0x9083e900u) {
+            caller_ret = 0x9083e250;
+        }
+        /* VARIANT A — the kstack words */
+        cpu_physical_memory_write(pa_sp + 0xB8,
+                                  &(uint32_t){ 0x90837f70u }, 4);
+        cpu_physical_memory_write(pa_sp + 0xE4, &wobj, 4);
+        cpu_physical_memory_write(pa_sp + 0xE8, &caller_ret, 4);
+        /* the TCB ctx preloads (the v8/v9 family) */
+        cpu_physical_memory_write(0x10000000 + o + 0x94, &tva, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0x74,
+                                  &(uint32_t){ 0x1000u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0x98,
+                                  &(uint32_t){ sp + 0x28u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0xA0,
+                                  &(uint32_t){ 0x908230e6u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0xA4,
+                                  &(uint32_t){ sp + 0x18u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0xB8,
+                                  &(uint32_t){ 0x40008000u }, 4);
+        /* the wInfo NEEDSLEEP clear + the aftermath pair */
+        uint16_t wi = 0;
+        memcpy(&wi, arena + o + 0x0c, 2);
+        wi &= ~(1u << 14);
+        cpu_physical_memory_write(0x10000000 + o + 0x0C, &wi, 2);
+        cpu_physical_memory_write(0x10000000 + o + 0x1F8,
+                                  &(uint32_t){ 0u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0x1FC,
+                                  &(uint32_t){ 0x1000u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0x34,
+                                  &(uint32_t){ 0u }, 4);
+        cpu_physical_memory_write(0x10000000 + o + 0xF,
+                                  &(uint32_t){ 0u }, 1);
+        /* THE v9 WAKE (the L62 recipe verbatim: the L54 stub + the slot
+         * + the L16-ent injection) */
+        uint32_t slot_cur = 0;
+        cpu_physical_memory_read(MMCS_L54_SLOT_PA, &slot_cur, 4);
+        if (slot_cur != MMCS_L54_STUB_VA && slot_cur != 0x90822e40) {
+            fprintf(stderr, "MMCS-L84SR: slot evt 0x320 busy (%08x)"
+                    " - retry next cadence\n", slot_cur);
+            return;
+        }
+        cpu_physical_memory_write(0x1F00E600, mmcs_l54_stub,
+                                  sizeof mmcs_l54_stub);
+        cpu_physical_memory_write(0x1F00E600 + 0x88, &tva, 4);
+        cpu_physical_memory_write(0x1F00E600 + 0x84,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        cpu_physical_memory_write(0x1F00E6F0,
+                                  &(uint32_t){ MMCS_L54_STUB_VA + 0xf0 },
+                                  4);
+        if (slot_cur != MMCS_L54_STUB_VA) {
+            cpu_physical_memory_write(MMCS_L54_SLOT_PA,
+                                      &(uint32_t){ MMCS_L54_STUB_VA }, 4);
+        }
+        struct mmcs_l16_ent *e = &mmcs_l16_ents[7];
+        e->evt_va = tva;
+        e->stub_va = MMCS_L54_STUB_VA;
+        e->evt_code = 0x320;
+        e->slot_pa = MMCS_L54_SLOT_PA;
+        e->daemon = 1;
+        e->pending = 1;
+        mmcs_l84sr_total++;
+        mmcs_l84sr_stable = 0;
+        fprintf(stderr, "MMCS-L84SR: t=%" PRId64 "ms resume-frame "
+                "synthesis %u/%u: waiter %08x (sp %08x obj %08x, the "
+                "zeroed frame rebuilt: pr=%08x handle=%08x ret=%08x; "
+                "ctx preloaded; the v9 wake armed) face-visits %d\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                mmcs_l84sr_total, mmcs_l84sr_max_deliv,
+                tva, sp, wobj, 0x90837f70u, wobj, caller_ret,
+                nface_visit);
+        return;                       /* one delivery per cadence */
+    }
+}
+
 static void mmcs_l62_scan(void)
 {
     if (!mmcs_l62_armed || mmcs_l62_total >= mmcs_l62_max_deliv) {
@@ -9181,6 +9403,16 @@ static void mmcs_l16_boot_parse(void)
             atoi(getenv("MMCS_L62EV_MS") ? : "2000");
         if (!mmcs_l62_cadence_ms) {
             mmcs_l62_cadence_ms = 2000;
+        }
+        if (getenv("MMCS_L84SR")) {
+            /* Arm the L84 resume-frame synthesis (the S243 class: the
+             * zeroed-stack waiters at the DoWait face; the synthesis
+             * design = the static3 child's Variant A). */
+            mmcs_l84sr_armed = 1;
+            fprintf(stderr, "MMCS-L84SR: resume-frame synthesis armed "
+                    "(cadence %ums, cap %u; the zeroed-frame waiters "
+                    "at the DoWait face)\n",
+                    mmcs_l84sr_cadence_ms, mmcs_l84sr_max_deliv);
         }
         mmcs_l62_max_deliv =
             atoi(getenv("MMCS_L62EV_MAX") ? : "2");
