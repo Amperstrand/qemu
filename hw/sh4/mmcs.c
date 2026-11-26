@@ -1708,6 +1708,27 @@ static uint32_t mmcs_l58_done[8];
  * the face's expected regs, the wInfo NEEDSLEEP clear, the aftermath pair)
  * + the v9 wake (the L54 stub + the L16-ent injection — the L62 recipe
  * verbatim). NO object writes (Variant A: the eval never re-runs). */
+/* MMCS fork (L84/S245): MMCS_L84CR — THE G4b CREATE-RELEASE (the
+ * dead-child release; the static2 child's design, the minimal cut).
+ * THE S244 REFRAME: the fresh-run face-waiters park MID-WAIT (the
+ * frames intact, the notify ABSENT) — the blocker = the missing SET.
+ * THE STOCK LAW (S191): the kernel signals the create-interlock even
+ * on a create's FAILURE path; the fresh world's children die before
+ * either tail runs. THE FIX (the L59-pulse class): resolve the
+ * waiter's object through the sp-adjacent on-stack node (the L26's
+ * live pattern: the node's [node+0x00] = the object pointer, the
+ * wait-block {obj,next,prev,..,pTh} layout), then ONE WORD:
+ * [obj+0x8D] |= 1 (the stock EventModify-SET byte — the write the
+ * dead child's 0x90835fda tail owed). The LIVE waiter's own eval
+ * loop consumes it (no wake needed — the L59 cycling-eval class).
+ * The L84SR lessons baked in: the 4-byte stride, the pcur rotation
+ * (deliver-on-sighting), the world gate = prun only. */
+static void mmcs_l84cr_scan(void);
+static int mmcs_l84cr_armed;
+static uint32_t mmcs_l84cr_cadence_ms = 2000;
+static uint32_t mmcs_l84cr_max_deliv = 12;
+static uint32_t mmcs_l84cr_total;
+
 static void mmcs_l84sr_scan(void);
 static int mmcs_l84sr_armed;
 static uint32_t mmcs_l84sr_cadence_ms = 2000;
@@ -2339,6 +2360,12 @@ static void mmcs_tick_deliver(void *opaque)
         if (mmcs_l84sr_armed && ++mmcs_tick_l84sr >= mmcs_l84sr_cadence_ms) {
             mmcs_tick_l84sr = 0;
             mmcs_l84sr_scan();
+        }
+        /* L84: the G4b create-release pulse (the dead-child SET) */
+        static uint64_t mmcs_tick_l84cr;
+        if (mmcs_l84cr_armed && ++mmcs_tick_l84cr >= mmcs_l84cr_cadence_ms) {
+            mmcs_tick_l84cr = 0;
+            mmcs_l84cr_scan();
         }
         /* L37: the KCall-exit lost-preempt class daemon (same class) */
         if (mmcs_l37_armed && ++mmcs_tick_l37 >= mmcs_l37_cadence_ms) {
@@ -6101,6 +6128,94 @@ static void mmcs_l58_scan(void)
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, pcur, f1f8);
 }
 
+static void mmcs_l84cr_scan(void)
+{
+    if (!mmcs_l84cr_armed || mmcs_l84cr_total >= mmcs_l84cr_max_deliv) {
+        return;
+    }
+    static uint8_t arena[0x80000];
+    cpu_physical_memory_read(0x10680000, arena, sizeof arena);
+    uint32_t pcur = 0, prun = 0;
+    cpu_physical_memory_read(0x08679894, &pcur, 4);
+    cpu_physical_memory_read(0x0867EFA0, &prun, 4);
+    if (prun != 0) {
+        return;                       /* only a BUSY run queue blocks */
+    }
+    for (uint32_t o = 0x4; o + 0x200 <= sizeof arena; o += 4) {
+        uint32_t st16, ctxpc, sp;
+        memcpy(&st16, arena + o + 0x0c, 4);
+        memcpy(&ctxpc, arena + o + 0xb4, 4);
+        memcpy(&sp, arena + o + 0xb0, 4);
+        uint32_t tva = 0x90680000 + o;
+        if (ctxpc != 0x90837cf6 || (st16 & 3) != 2
+            || sp < 0xD0000000u || sp >= 0xD1000000u
+            || tva == pcur) {
+            continue;
+        }
+        /* THE NODE RESOLVE: scan the sp-adjacent region (the wait
+         * frame) for the on-stack node — a word that is ITSELF a
+         * plausible object (the 0x9060-0x9077 arena) OR points at
+         * one; the node's [node+0] = the object pointer. */
+        /* THE WINDOW LAW (v2's lesson: the L26's own live data — the
+         * wait-node at sp+0x18 for the sp=d01cfae0 waiter — sits JUST
+         * past the [sp-0x40, sp+0x10] probe): cover [sp-0x40, sp+0x40). */
+        uint32_t pa_sp = sp - 0xC0000000u;
+        uint32_t frame[32] = {0};
+        cpu_physical_memory_read(pa_sp - 0x40, frame, 128);
+        uint32_t obj = 0;
+        for (int i = 0; i < 32; i++) {
+            uint32_t w = frame[i];
+            /* THE NODE INDIRECTION: a 0xD0-range word = the ON-STACK
+             * wait node (the L26 class) — its first word = the object
+             * pointer (the wait-block {obj,next,prev,..,pTh} layout) */
+            if (w >= 0xD0000000u && w < 0xD1000000u && (w & 3) == 0) {
+                uint32_t nodeword[1] = {0};
+                cpu_physical_memory_read(w - 0xC0000000u,
+                                         (uint8_t *)nodeword, 4);
+                w = nodeword[0];
+            }
+            if (w >= 0x90600000u && w < 0x90780000u && (w & 3) == 0) {
+                /* THE EVNT GATE (v1's lesson: the pTh self-reference
+                 * matched the TCBs; v2's: the CINFO trailer ID) */
+                uint32_t cinfo = 0;
+                cpu_physical_memory_read(0x10000000 + (w - 0x90600000u)
+                                         + 0x90, (uint8_t *)&cinfo, 4);
+                if (cinfo == 0x90822040u) {
+                    obj = w;
+                    break;
+                }
+            }
+        }
+        if (!obj) {
+            static int nno;
+            if (nno++ < 12) {
+                fprintf(stderr, "MMCS-L84CR(no-obj): t=%" PRId64 "ms th "
+                        "%08x sp %08x - no EVNT candidate in the frame\n",
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), tva, sp);
+            }
+            continue;
+        }
+        /* THE GATED WRITE: the stock SET byte */
+        uint8_t sig = 0;
+        cpu_physical_memory_read(0x10000000 + (obj - 0x90680000u) + 0x8D,
+                                 &sig, 1);
+        if (sig & 1) {
+            continue;                 /* already SET — the eval owns it */
+        }
+        uint8_t one = 1;
+        cpu_physical_memory_write(0x10000000 + (obj - 0x90680000u) + 0x8D,
+                                  &one, 1);
+        mmcs_l84cr_total++;
+        fprintf(stderr, "MMCS-L84CR: t=%" PRId64 "ms dead-child release "
+                "%u/%u: waiter %08x obj %08x [obj+0x8D]:=1 (the stock "
+                "failure-path SET the dying child owed; the live eval "
+                "consumes it)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                mmcs_l84cr_total, mmcs_l84cr_max_deliv, tva, obj);
+        return;                       /* one pulse per cadence */
+    }
+}
+
 static void mmcs_l84sr_scan(void)
 {
     if (!mmcs_l84sr_armed || mmcs_l84sr_total >= mmcs_l84sr_max_deliv) {
@@ -9403,6 +9518,12 @@ static void mmcs_l16_boot_parse(void)
             atoi(getenv("MMCS_L62EV_MS") ? : "2000");
         if (!mmcs_l62_cadence_ms) {
             mmcs_l62_cadence_ms = 2000;
+        }
+        if (getenv("MMCS_L84CR")) {
+            mmcs_l84cr_armed = 1;
+            fprintf(stderr, "MMCS-L84CR: G4b create-release armed "
+                    "(cadence %ums, cap %u; the dead-child SET pulse)\n",
+                    mmcs_l84cr_cadence_ms, mmcs_l84cr_max_deliv);
         }
         if (getenv("MMCS_L84SR")) {
             /* Arm the L84 resume-frame synthesis (the S243 class: the
