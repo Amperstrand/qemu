@@ -33,7 +33,7 @@ struct Mmcs2dgState {
 extern struct Mmcs2dgState mmcs_2dg;
 extern hwaddr mmcs_2dg_last;
 extern MemoryRegion *mmcs_sdram_mr;   /* assigned by mmcs.c's mmcs_init */
-extern QemuConsole *mmcs_con;         /* owned by mmcs.c's FBCON block */
+/* mmcs_con: declared in hw/sh4/mmcs-fb.h (the FBCON block's home) */
 
 void mmcs_2dg_present_console(hwaddr pa);
 void mmcs_2dg_carve(void);            /* the MMCS_2DG machine-init carve */

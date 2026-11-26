@@ -13,6 +13,7 @@
  */
 #include "qemu/osdep.h"
 #include "hw/sh4/mmcs-2dg.h"
+#include "hw/sh4/mmcs-fb.h"
 #include "exec/address-spaces.h"
 #include "exec/cpu-common.h"
 
