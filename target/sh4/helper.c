@@ -2507,14 +2507,29 @@ fileview_done:;
          * kstack ([TCB+0xB0]) — the vendor's own kill machinery then
          * processes the thread from its own entry. */
         if (getenv("MMCS_L82ZOM") && cs->exception_index == 0x0e0) {
-            static uint32_t zom_key, zom_key2;
-            static int zom_count, zom_kills;
+            /* L82/S254: THE PER-KEY TALLY TABLE (the v2 bug: the single
+             * (key,key2) pair reset on every interleaved 0x0e0 class —
+             * the zombie's 3866x never accumulated 32 consecutive; now
+             * 8 per-key slots accumulate independently) */
+            static uint32_t zom_keys[8][2];
+            static int zom_counts[8];
+            static int zom_kills, zom_next;
             uint32_t k1 = env->spc, k2 = env->pc;
-            if (k1 == zom_key && k2 == zom_key2) {
-                zom_count++;
-            } else {
-                zom_key = k1; zom_key2 = k2; zom_count = 1;
+            int slot = -1;
+            for (int i = 0; i < 8; i++) {
+                if (zom_keys[i][0] == k1 && zom_keys[i][1] == k2) {
+                    slot = i;
+                    break;
+                }
             }
+            if (slot < 0) {
+                slot = zom_next++ & 7;
+                zom_keys[slot][0] = k1;
+                zom_keys[slot][1] = k2;
+                zom_counts[slot] = 0;
+            }
+            zom_counts[slot]++;
+            int zom_count = zom_counts[slot];
             int n_kill = 32;
             const char *zk = getenv("MMCS_L82ZOM_N");
             if (zk && *zk) {
