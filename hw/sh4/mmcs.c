@@ -10693,6 +10693,29 @@ static void mmcs_init(MachineState *machine)
      * The cpu breakpoint at the tail-read makes the hook REACHABLE: the
      * BP raises when the pc arrives (any thread's execution of the site)
      * -> do_interrupt -> the existing L86SR repair hook fires.) */
+    /* L82/S290: MMCS_FSREADBACK — the readback matrix (the static10's
+     * rung 1): the BPs at the FSReady chain's exact sites (the event
+     * create, the open, THE SET, the boot-sync wait) — each BP raise
+     * is the direct observation (the do_interrupt hook sees the pc).
+     */
+    if (getenv("MMCS_FSREADBACK")) {
+        static const uint32_t sites[] = {
+            0x9083e220,   /* RunApps: the event create */
+            0x9083e248,   /* the park */
+            0x9083e24e,   /* the resume */
+            0xc00bb4e0,   /* FileSysMain */
+            0xc00bb514,   /* FileSysMain's engine call */
+            0xc00bb5ee,   /* the signaler call site */
+            0xc00baffe,   /* OpenEventW(SYSTEM/FSReady) */
+            0xc00bb00c,   /* THE SET (EventModify 3) */
+            0x9094c016,   /* the boot-sync wait */
+        };
+        for (unsigned i = 0; i < sizeof sites / sizeof sites[0]; i++) {
+            cpu_breakpoint_insert(CPU(cpu), sites[i], BP_GDB, NULL);
+        }
+        fprintf(stderr, "MMCS-FSREADBACK: %zu BP arms (the FSReady "
+                "chain)\n", sizeof sites / sizeof sites[0]);
+    }
     if (getenv("MMCS_L86SR")) {
         cpu_breakpoint_insert(CPU(cpu), 0x90835fc2u, BP_GDB, NULL);
         cpu_breakpoint_insert(CPU(cpu), 0x90835e22u, BP_GDB, NULL);

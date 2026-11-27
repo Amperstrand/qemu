@@ -2506,6 +2506,31 @@ fileview_done:;
          * continuation 0x9083BE50, BL cleared, sp := the thread's own
          * kstack ([TCB+0xB0]) — the vendor's own kill machinery then
          * processes the thread from its own entry. */
+        /* L82/S290: MMCS_FSREADBACK — the observation print (the BP's
+         * raise routes here; name which chain site fired) */
+        if (getenv("MMCS_FSREADBACK")) {
+            static const struct { uint32_t pc; const char *nm; } fss[] = {
+                { 0x9083e220, "RunApps:CreateEvent" },
+                { 0x9083e248, "RunApps:park" },
+                { 0x9083e24e, "RunApps:resume" },
+                { 0xc00bb4e0, "FileSysMain" },
+            { 0x908066b0, "BootLoader_Launch" },
+            { 0x90835f14, "ThreadStart" },
+            { 0x9082cbf4, "SC_CreateProc" },
+                { 0xc00bb514, "FileSysMain:engine" },
+                { 0xc00bb5ee, "FileSysMain:signaler" },
+                { 0xc00baffe, "OpenEventW(FSReady)" },
+                { 0xc00bb00c, "THE SET" },
+                { 0x9094c016, "boot-sync wait" },
+            };
+            for (unsigned i = 0; i < sizeof fss / sizeof fss[0]; i++) {
+                if (env->pc == fss[i].pc) {
+                    fprintf(stderr, "MMCS-FSR: %s REACHED (pc=%08x)\n",
+                            fss[i].nm, env->pc);
+                    break;
+                }
+            }
+        }
         /* L82/S284: MMCS_L86SR — THE SPLIT REPAIR (the static8b child's
          * design): at the child's tail-read (pc == 0x90835fc2, the G4b
          * producer's eval of [pOwnProc+8]), if the cell reads 0 (the

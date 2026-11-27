@@ -457,7 +457,41 @@ static const struct SysemuCPUOps sh4_sysemu_ops = {
 
 #include "hw/core/tcg-cpu-ops.h"
 
+/* L82/S290: the fork's debug handler — the BP observation route
+ * (cpu-exec.c's cpu_handle_debug_exception calls this for EVERY
+ * EXCP_DEBUG: the breakpoints route HERE, not through
+ * superh_cpu_do_interrupt — the S290 validator proved it). */
+static void mmcs_debug_excp_handler(CPUState *cs)
+{
+    SuperHCPU *cpu = SUPERH_CPU(cs);
+    CPUSH4State *env = &cpu->env;
+    if (getenv("MMCS_FSREADBACK")) {
+        static const struct { uint32_t pc; const char *nm; } fss[] = {
+            { 0x908066b0, "BootLoader_Launch" },
+            { 0x90835f14, "ThreadStart" },
+            { 0x9082cbf4, "SC_CreateProc" },
+            { 0xc00bb4e0, "FileSysMain" },
+            { 0x9083e220, "RunApps:CreateEvent" },
+            { 0x9083e248, "RunApps:park" },
+            { 0x9083e24e, "RunApps:resume" },
+            { 0xc00bb514, "FileSysMain:engine" },
+            { 0xc00bb5ee, "FileSysMain:signaler" },
+            { 0xc00baffe, "OpenEventW(FSReady)" },
+            { 0xc00bb00c, "THE SET" },
+            { 0x9094c016, "boot-sync wait" },
+        };
+        for (unsigned i = 0; i < sizeof fss / sizeof fss[0]; i++) {
+            if (env->pc == fss[i].pc) {
+                fprintf(stderr, "MMCS-FSR: %s REACHED (pc=%08x)\n",
+                        fss[i].nm, env->pc);
+                break;
+            }
+        }
+    }
+}
+
 static const struct TCGCPUOps superh_tcg_ops = {
+    .debug_excp_handler = mmcs_debug_excp_handler,
     .initialize = sh4_translate_init,
     .synchronize_from_tb = superh_cpu_synchronize_from_tb,
     .restore_state_to_opc = superh_restore_state_to_opc,
