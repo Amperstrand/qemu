@@ -10687,6 +10687,18 @@ static void mmcs_init(MachineState *machine)
     if (getenv("MMCS_KSLOT")) {
         cpu->env.mmcs_kslot_active = 1;
     }
+    /* L82/S286: MMCS_L86SR — the BP instrument (the static9 child's fix:
+     * the S284 zero-fire was an artifact — the do_interrupt hook only saw
+     * exception moments; the tail's read is straight-line kernel data.
+     * The cpu breakpoint at the tail-read makes the hook REACHABLE: the
+     * BP raises when the pc arrives (any thread's execution of the site)
+     * -> do_interrupt -> the existing L86SR repair hook fires.) */
+    if (getenv("MMCS_L86SR")) {
+        cpu_breakpoint_insert(CPU(cpu), 0x90835fc2u, BP_GDB, NULL);
+        cpu_breakpoint_insert(CPU(cpu), 0x90835e22u, BP_GDB, NULL);
+        fprintf(stderr, "MMCS-L86SR: BP arms @ 90835fc2 + 90835e22\n");
+    }
+
     if (getenv("MMCS_L39KILL")) {
         cpu->env.mmcs_l39kill_active = 1;
     }
