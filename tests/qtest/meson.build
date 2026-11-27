@@ -173,7 +173,7 @@ qtests_ppc64 = \
 qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) + \
   ['mmcs-chanflash-test', 'mmcs-sdhi-test', 'mmcs-input-test',
    'mmcs-2dg-test', 'mmcs-vintc-test', 'mmcs-l7xev-test',
-   'mmcs-fb-test']
+   'mmcs-fb-test', 'mmcs-ram4-test']
 qtests_sh4eb = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])
 
 qtests_sparc = ['prom-env-test', 'm48t59-test', 'boot-serial-test'] + \
