@@ -3844,6 +3844,21 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         return true;
     }
 
+    /* L82/S257: THE P3 WINDOW (the filesys/swapserver .text fetch
+     * misses) — the everything.env world's user phase: the low-count
+     * c00xxxxx classes (the P3 = TLB-mapped; the guest's own entries
+     * absent for the loaded server .text). The guest's intent: the
+     * P3 va c00xxxxx maps the SDRAM copy (1:1 va-0x40000000). The
+     * same fill-service class as P0RING, default-off knob. */
+    if (ret != MMU_OK && (uint32_t)address >= 0xC0000000u
+        && (uint32_t)address < 0xC0200000u
+        && getenv("MMCS_P3WIN")) {
+        tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                     (address & TARGET_PAGE_MASK) - 0x40000000u,
+                     PAGE_READ | PAGE_EXEC, mmu_idx, TARGET_PAGE_SIZE);
+        return true;
+    }
+
     /* L82/S250: THE ENTRY-PRINT — every FAILING fill's {addr, ret,
      * acc, idx} (the L82UM zero-fire mystery) */
     if (ret != MMU_OK && getenv("MMCS_L82UM")) {
