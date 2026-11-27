@@ -10403,6 +10403,25 @@ static void mmcs_init(MachineState *machine)
         }
     }
 
+    /* L82/S252: THE P1 BANK (ram4) — the ring-writer's byte-stores land
+     * at P1-identity VA 0x010f3471 (tea of the 2044x expevt=060 at
+     * spc 0x908075b8/0x90807622): the vendor's second SDRAM bank as the
+     * guest sees it through P1 (0x01000000-0x01FFFFFF). The fork's map
+     * had no region there — every store was an unassigned write raising
+     * the guest exception. Same pattern as ram2/ram3, env-tunable
+     * (MMCS_RAM4_MB, default 16, 0 disables). */
+    {
+        const char *mb4 = getenv("MMCS_RAM4_MB");
+        unsigned n4 = mb4 ? (unsigned)atoi(mb4) : 16;
+        if (n4) {
+            MemoryRegion *ram4 = g_new(MemoryRegion, 1);
+            memory_region_init_ram(ram4, NULL, "mmcs.ram4",
+                                   (uint64_t)n4 * MiB, &error_fatal);
+            memory_region_add_subregion(get_system_memory(),
+                                        0x01000000, ram4);
+        }
+    }
+
     /* MMCS_FILEVIEW: scratch RAM (64 MB) at phys 0x20000000 backing the
      * launched servers' user heap-arena write misses below 0x40000000
      * (the 0x18NN0036-class per-launch coredll heap-grow faults — see

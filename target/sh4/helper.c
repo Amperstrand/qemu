@@ -3451,8 +3451,18 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         }
         int kdprot = mmcs_pgown_fill(env, 0x5000, &kdpa,
                                      PAGE_READ | PAGE_WRITE | PAGE_EXEC, 0);
-        tlb_set_page(cs, 0x5000, kdpa, kdprot, mmu_idx,
-                     TARGET_PAGE_SIZE);
+        /* L82/S252: THE 2-ENTRY SPLIT — the pgown's clean-pin strips
+         * the write for BOTH modes; the stock serves the KERNEL an RW
+         * view (the vendor's 0x5bd0-class per-thread context writes
+         * run kernel-mode; the entry-print census: ret=-1 write
+         * violations at 0x5bd0, 2700x at the ring-writer spc). */
+        if (mmu_idx == MMU_USER_IDX) {
+            tlb_set_page(cs, 0x5000, kdpa, kdprot, mmu_idx,
+                         TARGET_PAGE_SIZE);
+        } else {
+            tlb_set_page(cs, 0x5000, kdpa, kdprot | PAGE_WRITE, mmu_idx,
+                         TARGET_PAGE_SIZE);
+        }
         return true;
     }
 
@@ -3466,9 +3476,17 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         && getenv("MMCS_LOWSLOT")) {
         physical = address;               /* 1:1 to the rts page region */
         prot = PAGE_READ | PAGE_EXEC;
+        /* L82/S251: THE WRITABLE SENTINEL — the entry-print census
+         * (2700x write violations at the 0x5bd0-class): the stock's
+         * low-slot page carries the vendor's per-thread context
+         * structures (the ring-writer's [r2+4] stores); serving it
+         * RO makes every context write a ret=-1 violation loop. The
+         * stock page is RW (the rts stub sits at the page HEAD; the
+         * 0x5bd0-class tails are scratch). */
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      address & TARGET_PAGE_MASK,
-                     PAGE_READ | PAGE_EXEC, mmu_idx, TARGET_PAGE_SIZE);
+                     PAGE_READ | PAGE_WRITE | PAGE_EXEC, mmu_idx,
+                     TARGET_PAGE_SIZE);
         return true;
     }
 
@@ -3794,6 +3812,33 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
      * served for the USER-mode data miss. Gated on MMCS_L82UM (default
      * off) AND the L70KS window logic (the shared top derivation).
      * Fetches are NOT served (executing stack data stays a real bug). */
+    /* L82/S252: THE P0 RING-BANK WINDOW — the ring-writer's stores at
+     * VA 0x010f3471 (P0 = TLB-mapped, NOT the P1 identity!) fault as
+     * DTLB write misses (2044x+3360x): the guest's own page-table
+     * entry for the vendor's ring bank is absent in the fresh world.
+     * Serve the fill directly: 1:1 to the ram4 bank (16MB @ phys
+     * 0x01000000), RW — the vendor's ring/context bank. */
+    if (ret != MMU_OK && (uint32_t)address >= 0x01000000u
+        && (uint32_t)address < 0x02000000u
+        && getenv("MMCS_P0RING")
+        && (access_type == MMU_DATA_LOAD
+            || access_type == MMU_DATA_STORE)) {
+        tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                     address & TARGET_PAGE_MASK,
+                     PAGE_READ | PAGE_WRITE, mmu_idx, TARGET_PAGE_SIZE);
+        return true;
+    }
+
+    /* L82/S250: THE ENTRY-PRINT — every FAILING fill's {addr, ret,
+     * acc, idx} (the L82UM zero-fire mystery) */
+    if (ret != MMU_OK && getenv("MMCS_L82UM")) {
+        static int nent;
+        if (nent++ < 40) {
+            fprintf(stderr, "MMCS-L82ENT[%d] addr=%08x ret=%d acc=%d "
+                    "idx=%d\n", nent, (uint32_t)address, ret,
+                    (int)access_type, mmu_idx);
+        }
+    }
     if (ret != MMU_OK && getenv("MMCS_L82UM")
         && (uint32_t)address >= 0xD0000000u
         && (access_type == MMU_DATA_LOAD
