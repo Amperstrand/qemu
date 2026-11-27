@@ -5912,10 +5912,20 @@ static void mmcs_l58_scan(void)
             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), obj, pcur, f1f8);
 }
 
+static uint32_t mmcs_l84cr_rej[11];
 static void mmcs_l84cr_scan(void)
 {
     if (!mmcs_l84cr_armed || mmcs_l84cr_total >= mmcs_l84cr_max_deliv) {
         return;
+    }
+    static uint32_t cad;
+    if ((++cad & 0x1FF) == 0) {
+        fprintf(stderr, "MMCS-L84CR-REJ cad=%u nohrec=%u nocinfo=%u nomagic=%u "
+                "noht=%u norefs=%u noobj=%u xchk=%u signed=%u intr=%u notman=%u "
+                "linked=%u\n", cad, mmcs_l84cr_rej[0], mmcs_l84cr_rej[1],
+                mmcs_l84cr_rej[2], mmcs_l84cr_rej[3], mmcs_l84cr_rej[4],
+                mmcs_l84cr_rej[5], mmcs_l84cr_rej[6], mmcs_l84cr_rej[7],
+                mmcs_l84cr_rej[8], mmcs_l84cr_rej[9], mmcs_l84cr_rej[10]);
     }
     static uint8_t arena[0x80000];
     cpu_physical_memory_read(0x10680000, arena, sizeof arena);
@@ -5953,6 +5963,7 @@ static void mmcs_l84cr_scan(void)
         if (wb < sp + 0x28 || wb >= sp + 0xB8) {
             wb = sp + 0x28;
         }
+        uint32_t pa_wb_pre = wb - 0xC0000000u;
         /* THE OWNERSHIP WITNESS: [wb+0x1C] == the TCB (the kstack PA
          * read: the wb is a D0 VA) */
         uint32_t owner = 0;
@@ -5970,11 +5981,86 @@ static void mmcs_l84cr_scan(void)
         if (wb_epoch != th_epoch) {
             continue;
         }
+        /* THE V5 OBJECT LAYER (the static6 child's design — the
+         * handle-table entry resolution; the object side FIRST: the
+         * v4's re-wait cycle was the UNSIGNALED interlock) */
+        uint32_t hrec = 0;
+        /* probe the entry cells: [parksp+0xE4] (the single class),
+         * [parksp+0xF4] (the multi class, entry[0] — the create-lane) */
+        uint32_t pa_sp = sp - 0xC0000000u;
+        cpu_physical_memory_read(pa_sp + 0xE4, (uint8_t *)&hrec, 4);
+        if (!(hrec >= 0x90680000u && hrec < 0x90800000u)) {
+            cpu_physical_memory_read(pa_sp + 0xF4, (uint8_t *)&hrec, 4);
+        }
+        if (!(hrec >= 0x90680000u && hrec < 0x90800000u)) {
+            mmcs_l84cr_rej[0]++; continue;
+        }
+        uint32_t hrec_pa = 0x10000000u + (hrec - 0x90680000u);
+        uint32_t cinfo = 0;
+        cpu_physical_memory_read(hrec_pa + 8, (uint8_t *)&cinfo, 4);
+        if (!(cinfo >= 0x90820000u && cinfo < 0x90830000u)) {
+            mmcs_l84cr_rej[1]++; continue;
+        }
+        uint32_t magic = 0;
+        cpu_physical_memory_read(0x10000000u + (cinfo - 0x90600000u),
+                                 (uint8_t *)&magic, 4);
+        if (magic != 0x544E5645u) {
+            mmcs_l84cr_rej[2]++; continue;
+        }
+        uint8_t ht_class = 0;
+        cpu_physical_memory_read(0x10000000u + (cinfo - 0x90600000u) + 5,
+                                 &ht_class, 1);
+        if (ht_class != 4) {
+            mmcs_l84cr_rej[3]++; continue;
+        }
+        uint32_t refs = 0;
+        cpu_physical_memory_read(hrec_pa + 0x10, (uint8_t *)&refs, 4);
+        if (refs < 1) {
+            mmcs_l84cr_rej[4]++; continue;
+        }
+        uint32_t obj = 0;
+        cpu_physical_memory_read(hrec_pa + 0xC, (uint8_t *)&obj, 4);
+        if (!(obj >= 0x90680000u && obj < 0x90800000u)) {
+            mmcs_l84cr_rej[5]++; continue;
+        }
+        /* THE CROSS-CHECK: obj == [wb+0x14] (the park-time object cell) */
+        uint32_t wobj = 0;
+        cpu_physical_memory_read(pa_wb_pre + 0x14, (uint8_t *)&wobj, 4);
+        if (wobj != obj) {
+            mmcs_l84cr_rej[6]++; continue;
+        }
+        /* THE OWED-SET GATES */
+        uint32_t obj_pa = 0x10000000u + (obj - 0x90680000u);
+        uint8_t setb = 0, obj8e = 0;
+        uint32_t intr = 0, linked = 0;
+        cpu_physical_memory_read(obj_pa + 0x8D, &setb, 1);
+        cpu_physical_memory_read(obj_pa + 0x8E, &obj8e, 1);
+        cpu_physical_memory_read(obj_pa + 0x90, (uint8_t *)&intr, 4);
+        cpu_physical_memory_read(obj_pa + 8, (uint8_t *)&linked, 4);
+        if (setb != 0) {
+            mmcs_l84cr_rej[7]++; continue;
+        }
+        if (intr != 0) {
+            mmcs_l84cr_rej[8]++; continue;
+        }
+        if ((obj8e & 4) || !(obj8e & 1)) {
+            mmcs_l84cr_rej[9]++; continue;
+        }
+        if (linked != 0) {
+            mmcs_l84cr_rej[10]++; continue;
+        }
+        /* THE OBJECT WRITES (the stock order, the SET FIRST) */
+        cpu_physical_memory_write(obj_pa + 0x8D, &(uint8_t){ 1 }, 1);
+        uint8_t mark = 0;
+        cpu_physical_memory_read(0x0867ABB7, &mark, 1);
+        cpu_physical_memory_write(obj_pa + 0x8F, &mark, 1);
+
         /* THE V4 WRITE SET (the 0x90827bfc BLOCKED-arm set, stock
          * order; all waiter-side — NO object writes) */
         uint32_t pa_th = 0x10000000 + o;
         uint32_t pa_wb = wb - 0xC0000000u;
         uint32_t pa_rec = rec - 0xC0000000u;
+
         uint32_t lp34 = 0;
         memcpy(&lp34, arena + o + 0x34, 4);
         /* 1. [wb+0xC] := 0 (the unlink mark) */
