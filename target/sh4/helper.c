@@ -229,9 +229,11 @@ static bool mmcs_plausible_code(uint32_t va)
 }
 
 void mmcs_l86sr_repair(CPUSH4State *env);
-/* L82/S296: THE SPLIT REPAIR — called from the debug_excp_handler route
- * (cpu.c) at the tail-read pc (the BP's raise lands there). The static11
- * proof: the tail runs; the [proc+8] post-link loss is the one blocker. */
+/* L82/S297: THE SPLIT REPAIR v2 — called from the debug_excp_handler at
+ * the PRE-PARK VERIFY pc 0x9082ceac (the static12's redesign: the world's
+ * children LOAD SUCCESSFULLY — the stock producer is the loader's SUCCESS
+ * SET at 0x90835e22, PRE-user-phase; the relink must be live before it).
+ * The relink: [pOwnProc+8] := the waiter's HREC (the 0x9082c726 law). */
 void mmcs_l86sr_repair(CPUSH4State *env)
 {
     /* L82/S284: MMCS_L86SR — THE SPLIT REPAIR (the static8b child's

@@ -467,7 +467,7 @@ static void mmcs_debug_excp_handler(CPUState *cs)
 {
     SuperHCPU *cpu = SUPERH_CPU(cs);
     CPUSH4State *env = &cpu->env;
-    if (getenv("MMCS_L86SR") && env->pc == 0x90835fc2u) {
+    if (getenv("MMCS_L86SR") && env->pc == 0x9082ceacu) {
         mmcs_l86sr_repair(env);
     }
     if (getenv("MMCS_FSREADBACK")) {
@@ -479,6 +479,9 @@ static void mmcs_debug_excp_handler(CPUState *cs)
             { 0x9083e220, "RunApps:CreateEvent" },
             { 0x9083e248, "RunApps:park" },
             { 0x9083e24e, "RunApps:resume" },
+            { 0x90835e22, "ThreadStartSetup:SUCCESS_SET" },
+            { 0x90835fba, "TAIL:merge" },
+            { 0x9082ceac, "PreParkVerify" },
             { 0xc00bb514, "FileSysMain:engine" },
             { 0xc00bb5ee, "FileSysMain:signaler" },
             { 0xc00baffe, "OpenEventW(FSReady)" },

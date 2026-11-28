@@ -10717,9 +10717,10 @@ static void mmcs_init(MachineState *machine)
                 "chain)\n", sizeof sites / sizeof sites[0]);
     }
     if (getenv("MMCS_L86SR")) {
-        cpu_breakpoint_insert(CPU(cpu), 0x90835fc2u, BP_GDB, NULL);
+        cpu_breakpoint_insert(CPU(cpu), 0x9082ceacu, BP_GDB, NULL);
         cpu_breakpoint_insert(CPU(cpu), 0x90835e22u, BP_GDB, NULL);
-        fprintf(stderr, "MMCS-L86SR: BP arms @ 90835fc2 + 90835e22\n");
+        cpu_breakpoint_insert(CPU(cpu), 0x90835fc2u, BP_GDB, NULL);
+        fprintf(stderr, "MMCS-L86SR: BP arms @ 9082ceac + 90835e22 + 90835fc2\n");
     }
 
     if (getenv("MMCS_L39KILL")) {
