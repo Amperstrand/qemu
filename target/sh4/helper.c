@@ -4004,9 +4004,15 @@ bool superh_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         }
     }
     if (ret != MMU_OK && getenv("MMCS_L82UM")
-        && (uint32_t)address >= 0xD0000000u
+        && (uint32_t)address >= 0xC8000000u
         && (access_type == MMU_DATA_LOAD
             || access_type == MMU_DATA_STORE)) {
+        /* L82/S329: the bound widened 0xD0000000 -> 0xC8000000 (the
+         * filesys servant's heap window at 0xC8000000+ — the walk
+         * class: the servant marches its heap pages looking for a
+         * served window; every refusal (ret=-4/-5) faults and the
+         * walk retries — the 4000-fault storm. Same PA formula
+         * (address - 0xC0000000) + the pgown fill. */
         static uint32_t um_top;
         if (!um_top) {
             uint32_t mea = 0;
