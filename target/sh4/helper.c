@@ -1527,6 +1527,15 @@ void superh_cpu_do_interrupt(CPUState *cs)
         && (env->pc & ~7u) >= 0x5B80 && (env->pc & ~7u) <= 0x5BF8) {
         bool kern = (env->sr & (1u << SR_MD)) != 0;
         bool kern_arms = getenv("MMCS_KILK") || getenv("MMCS_L66STK");
+        /* L82/S326: MMCS_KILK pre-arms the user_seen latch (the explicit
+         * override). The latch's caution (hide the loader-data holes from
+         * the early IRQ-init walk) is moot under MMCS_L68KD: the live page
+         * serves the real content. Without this, the world deadlocks: the
+         * kernel-mode ops need the latch, the latch needs a user process,
+         * the user process needs the kernel's ops to survive its spawn. */
+        if (getenv("MMCS_KILK")) {
+            mmcs_ilkfix_user_seen = true;
+        }
         if (getenv("MMCS_L66DBG")) {
             static int nl66dbg;
             if (nl66dbg++ < 32) {
