@@ -2576,6 +2576,29 @@ fileview_done:;
     env->sgr = env->gregs[15];
     env->sr |= (1u << SR_BL) | (1u << SR_MD) | (1u << SR_RB);
     env->lock_addr = -1;
+    /* MMCS fork (L82/S334, THE ENTRY-MOMENT FORM): the first-level
+     * exception handler (VBR+0x400 = 0x90822f80) reads INTEVT via the
+     * banked r7: `mov.l @(40,r7),r6` expects 0xFF000000 (the P4
+     * register-page base). The world arrives with gregs[23] = 1 (the
+     * stale value) -> [1+0x28] = VA 0x29 -> the handler's own entry
+     * faults -> THE SELF-LOOP that blocks EVERY interrupt (CurMSec
+     * frozen = the world's time stopped, the S334 rate probe's
+     * verdict). The preload now runs at the GENERIC entry (all expevt
+     * classes — the 0x0e0 protection class vectors via the default
+     * case, which the case-0x040 placement never covered). Env-gated:
+     * MMCS_R7BANK (default off). */
+    if (getenv("MMCS_R7BANK")
+        && env->gregs[16 + 7] != 0xFF000000u
+        && env->gregs[16 + 7] < 0x80000000u) {
+        static int mmcs_r7bank_n;
+        if (mmcs_r7bank_n++ < 12) {
+            fprintf(stderr, "MMCS-R7BANK: preloading bank r7: "
+                    "%08x -> 0xFF000000 (the INTEVT base, the "
+                    "first-level handler's convention)\n",
+                    env->gregs[16 + 7]);
+        }
+        env->gregs[16 + 7] = 0xFF000000u;
+    }
 
     if (env->flags & TB_FLAG_DELAY_SLOT_MASK) {
         /* Branch instruction should be executed again before delay slot. */
@@ -2597,29 +2620,6 @@ fileview_done:;
         case 0x040:
         case 0x060:
             env->pc = env->vbr + 0x400;
-            /* MMCS fork (L82/S331, F1 from the static16b decode): the
-             * first-level exception handler (VBR+0x400 = 0x90822f80)
-             * reads INTEVT via r7_bank: `mov.l @(40,r7),r6` expects
-             * r7_bank = 0xFF000000 (the P4 register-page base, the
-             * kernel's convention). The fresh world arrives with
-             * r7_bank = 1 (a stale user-mode value) -> [1+0x28] = VA
-             * 0x29 -> the fault's own vector target IS the faulting
-             * instruction -> THE SELF-LOOP (the 3331x storm class).
-             * FIX: preload the kernel bank's r7 when the handler is
-             * about to run and the bank value is wrong. Env-gated:
-             * MMCS_R7BANK (default off). */
-            if (getenv("MMCS_R7BANK")
-                && env->gregs[16 + 7] != 0xFF000000u
-                && env->gregs[16 + 7] < 0x80000000u) {
-                static int mmcs_r7bank_n;
-                if (mmcs_r7bank_n++ < 12) {
-                    fprintf(stderr, "MMCS-R7BANK: preloading bank r7: "
-                            "%08x -> 0xFF000000 (the INTEVT base, the "
-                            "first-level handler's convention)\n",
-                            env->gregs[16 + 7]);
-                }
-                env->gregs[16 + 7] = 0xFF000000u;
-            }
             break;
         case 0x160:
             env->spc += 2; /* special case for TRAPA */
