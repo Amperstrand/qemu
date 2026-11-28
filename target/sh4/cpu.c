@@ -461,10 +461,15 @@ static const struct SysemuCPUOps sh4_sysemu_ops = {
  * (cpu-exec.c's cpu_handle_debug_exception calls this for EVERY
  * EXCP_DEBUG: the breakpoints route HERE, not through
  * superh_cpu_do_interrupt — the S290 validator proved it). */
+void mmcs_l86sr_repair(CPUSH4State *env);
+
 static void mmcs_debug_excp_handler(CPUState *cs)
 {
     SuperHCPU *cpu = SUPERH_CPU(cs);
     CPUSH4State *env = &cpu->env;
+    if (getenv("MMCS_L86SR") && env->pc == 0x90835fc2u) {
+        mmcs_l86sr_repair(env);
+    }
     if (getenv("MMCS_FSREADBACK")) {
         static const struct { uint32_t pc; const char *nm; } fss[] = {
             { 0x908066b0, "BootLoader_Launch" },

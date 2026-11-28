@@ -228,6 +228,103 @@ static bool mmcs_plausible_code(uint32_t va)
         || (va >= 0x90800000 && va < 0x97000000);
 }
 
+void mmcs_l86sr_repair(CPUSH4State *env);
+/* L82/S296: THE SPLIT REPAIR — called from the debug_excp_handler route
+ * (cpu.c) at the tail-read pc (the BP's raise lands there). The static11
+ * proof: the tail runs; the [proc+8] post-link loss is the one blocker. */
+void mmcs_l86sr_repair(CPUSH4State *env)
+{
+    /* L82/S284: MMCS_L86SR — THE SPLIT REPAIR (the static8b child's
+     * design): at the child's tail-read (pc == 0x90835fc2, the G4b
+     * producer's eval of [pOwnProc+8]), if the cell reads 0 (the
+     * post-link loss — the clearing site undecoded but not needed),
+     * re-link it: [pOwnProc+8] := the waiter's HREC (the exact
+     * 0x9082c726 stock law: ONE CELL, ONE OBJECT). Then the child's
+     * own 0x90835fda DoEventMod SET runs 100% vendor code and the
+     * interlock opens. The HREC: the waiter's parked frame's entry
+     * cell ([parksp+0xE4]/[+0xF4], the static6 v5 resolution) OR
+     * any arena HREC whose [hrec+0xC] object cross-checks.
+     */
+    if (1) {
+        static uint32_t l86_fixed_proc, l86_n;
+        uint32_t pcur = 0;
+        cpu_physical_memory_read(0x08679894, (uint8_t *)&pcur, 4);
+        /* pOwnProc: [pCurTh+0x14] (the static7 chain) */
+        uint32_t proc = 0;
+        if (pcur >= 0x90680000u && pcur < 0x90800000u) {
+            cpu_physical_memory_read(
+                0x10000000u + (pcur - 0x90680000u) + 0x14,
+                (uint8_t *)&proc, 4);
+        }
+        if (proc >= 0x90680000u && proc < 0x90800000u
+            && proc != l86_fixed_proc) {
+            uint32_t proc_pa = 0x10000000u + (proc - 0x90680000u);
+            uint32_t cell8 = 0;
+            cpu_physical_memory_read(proc_pa + 8, (uint8_t *)&cell8, 4);
+            if (cell8 == 0) {
+                /* the waiter's HREC: scan the arena for an EVNT-class
+                 * HREC ([hrec+8] the CINFO with the EVNT magic; the
+                 * manual-reset bit [obj+0x8E]&1) — the interlock's own
+                 * object (the create-lane's one event). */
+                static uint8_t arena6[0x80000];
+                cpu_physical_memory_read(0x10680000, arena6,
+                                         sizeof arena6);
+                uint32_t best = 0;
+                for (uint32_t o = 4; o + 0x100 <= sizeof arena6;
+                     o += 4) {
+                    uint32_t h = 0;
+                    memcpy(&h, arena6 + o, 4);
+                    if (!(h >= 0x90680000u && h < 0x90800000u)) {
+                        continue;   /* the CINFO pointer */
+                    }
+                    uint32_t cinfo = 0;
+                    cpu_physical_memory_read(
+                        0x10000000u + (h - 0x90680000u),
+                        (uint8_t *)&cinfo, 4);
+                    if (!(cinfo >= 0x90820000u && cinfo < 0x90830000u)) {
+                        continue;
+                    }
+                    uint32_t magic = 0;
+                    cpu_physical_memory_read(
+                        0x10000000u + (cinfo - 0x90600000u),
+                        (uint8_t *)&magic, 4);
+                    if (magic != 0x544E5645u) {
+                        continue;   /* not EVNT */
+                    }
+                    /* the object's manual-reset + unsignaled */
+                    uint32_t obj = 0;
+                    cpu_physical_memory_read(
+                        0x10000000u + (h - 0x90680000u) + 0xC,
+                        (uint8_t *)&obj, 4);
+                    if (!(obj >= 0x90680000u && obj < 0x90800000u)) {
+                        continue;
+                    }
+                    uint8_t obj8d = 0, obj8e = 0;
+                    uint32_t obj_pa = 0x10000000u
+                        + (obj - 0x90680000u);
+                    cpu_physical_memory_read(obj_pa + 0x8D, &obj8d, 1);
+                    cpu_physical_memory_read(obj_pa + 0x8E, &obj8e, 1);
+                    if (obj8d == 0 && (obj8e & 1)) {
+                        best = 0x90680000u + o;   /* the HREC VA */
+                        break;
+                    }
+                }
+                if (best) {
+                    cpu_physical_memory_write(proc_pa + 8, &best, 4);
+                    l86_fixed_proc = proc;
+                    l86_n++;
+                    if (l86_n <= 8) {
+                        fprintf(stderr, "MMCS-L86SR: "
+                                "SPLIT REPAIR proc %08x [proc+8] := "
+                                "HREC %08x (the 0x9082c726 law)\n",
+                                proc, best);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void superh_cpu_do_interrupt(CPUState *cs)
 {
     SuperHCPU *cpu = SUPERH_CPU(cs);
@@ -2531,95 +2628,7 @@ fileview_done:;
                 }
             }
         }
-        /* L82/S284: MMCS_L86SR — THE SPLIT REPAIR (the static8b child's
-         * design): at the child's tail-read (pc == 0x90835fc2, the G4b
-         * producer's eval of [pOwnProc+8]), if the cell reads 0 (the
-         * post-link loss — the clearing site undecoded but not needed),
-         * re-link it: [pOwnProc+8] := the waiter's HREC (the exact
-         * 0x9082c726 stock law: ONE CELL, ONE OBJECT). Then the child's
-         * own 0x90835fda DoEventMod SET runs 100% vendor code and the
-         * interlock opens. The HREC: the waiter's parked frame's entry
-         * cell ([parksp+0xE4]/[+0xF4], the static6 v5 resolution) OR
-         * any arena HREC whose [hrec+0xC] object cross-checks.
-         */
-        if (getenv("MMCS_L86SR") && env->pc == 0x90835fc2u) {
-            static uint32_t l86_fixed_proc, l86_n;
-            uint32_t pcur = 0;
-            cpu_physical_memory_read(0x08679894, (uint8_t *)&pcur, 4);
-            /* pOwnProc: [pCurTh+0x14] (the static7 chain) */
-            uint32_t proc = 0;
-            if (pcur >= 0x90680000u && pcur < 0x90800000u) {
-                cpu_physical_memory_read(
-                    0x10000000u + (pcur - 0x90680000u) + 0x14,
-                    (uint8_t *)&proc, 4);
-            }
-            if (proc >= 0x90680000u && proc < 0x90800000u
-                && proc != l86_fixed_proc) {
-                uint32_t proc_pa = 0x10000000u + (proc - 0x90680000u);
-                uint32_t cell8 = 0;
-                cpu_physical_memory_read(proc_pa + 8, (uint8_t *)&cell8, 4);
-                if (cell8 == 0) {
-                    /* the waiter's HREC: scan the arena for an EVNT-class
-                     * HREC ([hrec+8] the CINFO with the EVNT magic; the
-                     * manual-reset bit [obj+0x8E]&1) — the interlock's own
-                     * object (the create-lane's one event). */
-                    static uint8_t arena6[0x80000];
-                    cpu_physical_memory_read(0x10680000, arena6,
-                                             sizeof arena6);
-                    uint32_t best = 0;
-                    for (uint32_t o = 4; o + 0x100 <= sizeof arena6;
-                         o += 4) {
-                        uint32_t h = 0;
-                        memcpy(&h, arena6 + o, 4);
-                        if (!(h >= 0x90680000u && h < 0x90800000u)) {
-                            continue;   /* the CINFO pointer */
-                        }
-                        uint32_t cinfo = 0;
-                        cpu_physical_memory_read(
-                            0x10000000u + (h - 0x90680000u),
-                            (uint8_t *)&cinfo, 4);
-                        if (!(cinfo >= 0x90820000u && cinfo < 0x90830000u)) {
-                            continue;
-                        }
-                        uint32_t magic = 0;
-                        cpu_physical_memory_read(
-                            0x10000000u + (cinfo - 0x90600000u),
-                            (uint8_t *)&magic, 4);
-                        if (magic != 0x544E5645u) {
-                            continue;   /* not EVNT */
-                        }
-                        /* the object's manual-reset + unsignaled */
-                        uint32_t obj = 0;
-                        cpu_physical_memory_read(
-                            0x10000000u + (h - 0x90680000u) + 0xC,
-                            (uint8_t *)&obj, 4);
-                        if (!(obj >= 0x90680000u && obj < 0x90800000u)) {
-                            continue;
-                        }
-                        uint8_t obj8d = 0, obj8e = 0;
-                        uint32_t obj_pa = 0x10000000u
-                            + (obj - 0x90680000u);
-                        cpu_physical_memory_read(obj_pa + 0x8D, &obj8d, 1);
-                        cpu_physical_memory_read(obj_pa + 0x8E, &obj8e, 1);
-                        if (obj8d == 0 && (obj8e & 1)) {
-                            best = 0x90680000u + o;   /* the HREC VA */
-                            break;
-                        }
-                    }
-                    if (best) {
-                        cpu_physical_memory_write(proc_pa + 8, &best, 4);
-                        l86_fixed_proc = proc;
-                        l86_n++;
-                        if (l86_n <= 8) {
-                            fprintf(stderr, "MMCS-L86SR: "
-                                    "SPLIT REPAIR proc %08x [proc+8] := "
-                                    "HREC %08x (the 0x9082c726 law)\n",
-                                    proc, best);
-                        }
-                    }
-                }
-            }
-        }
+
         if (getenv("MMCS_L82ZOM") && cs->exception_index == 0x0e0) {
             /* L82/S254: THE PER-KEY TALLY TABLE (the v2 bug: the single
              * (key,key2) pair reset on every interleaved 0x0e0 class —
